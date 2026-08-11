@@ -198,6 +198,30 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             lanServer?.nudge()
             pushStateViaBle()
         }
+        // The laptop could not cast: say so. Without this the user taps, nothing
+        // appears, and the reason sits in a log on the other machine — which is
+        // exactly how "Extended display" failing on a non-GNOME desktop looked
+        // like the app doing nothing at all.
+        com.vortex.a3.core.mirror.LaptopMirror.onCastFailed = { reason ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                try {
+                    // English only: the app localizes through `ui/Strings.kt`,
+                    // whose `str()` is @Composable and so unavailable here, and a
+                    // service has no locale context to pick with. Worth moving
+                    // into the UI layer if this message becomes prominent.
+                    android.widget.Toast.makeText(
+                        ctx,
+                        "Can't show the laptop screen: $reason",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                } catch (t: Throwable) {
+                    // A toast is best-effort (blocked in the background on some
+                    // ROMs); the request is cleared either way, which is the part
+                    // that matters — the UI is usable again.
+                    Log.w(TAG, "cast-failure toast suppressed: ${t.message}")
+                }
+            }
+        }
 
         startLanServer(identity)              // mDNS + TCP IK + AppState sync
         return true

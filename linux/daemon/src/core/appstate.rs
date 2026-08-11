@@ -292,6 +292,15 @@ pub struct AppState {
     /// media key rides here under the Noise-sealed transport; never log it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub laptop_cast: Option<LaptopCast>,
+    /// Laptop→phone: why the last cast attempt failed, `None` when it didn't.
+    ///
+    /// Lets the phone stop asking and say something. Without it a request the
+    /// laptop cannot satisfy is re-asserted on every heartbeat forever, with the
+    /// reason only in the laptop's log — and since the phone's `requestView`
+    /// ignores a tap while a request is already active, its UI wedges. Optional
+    /// and skipped when absent, so older peers on both sides are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub laptop_cast_error: Option<String>,
     /// Laptop→phone: `true` while the user wants to use the phone's camera as a
     /// laptop webcam (phone-as-webcam). A level — the phone starts its camera
     /// on the false→true edge and stops on true→false. See [`camera_offer`].
@@ -427,6 +436,7 @@ impl AppState {
             laptop_mirror_req: false, // laptop is the caster, never the requester
             laptop_mirror_extend: None, // ditto — the phone picks the kind
             laptop_cast: None,        // filled while actively casting
+            laptop_cast_error: None,  // set only when an attempt fails
             camera_req: false,        // filled by the UI when webcam is wanted
             camera_facing: String::new(), // filled by the UI front/back toggle
             camera_offer: None,       // laptop never offers a camera
@@ -600,6 +610,7 @@ mod tests {
             laptop_mirror_req: false,
             laptop_mirror_extend: None,
             laptop_cast: None,
+            laptop_cast_error: None,
             camera_req: false,
             camera_facing: String::new(),
             camera_offer: None,

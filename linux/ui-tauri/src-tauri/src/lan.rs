@@ -385,6 +385,7 @@ pub(crate) async fn try_lan_reconnect(
     local_state.locked = vortex_l3_daemon::core::session_lock::locked_hint().await;
     // Laptop→phone screen-cast offer (where to dial + the key) while casting.
     local_state.laptop_cast = crate::laptop_cast::current_offer();
+    local_state.laptop_cast_error = crate::laptop_cast::current_error();
     // Continuity Camera: request the phone's camera as a laptop webcam.
     local_state.camera_req = crate::camera::camera_wanted();
     local_state.camera_facing = crate::camera::camera_facing();

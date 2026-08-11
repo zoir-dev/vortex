@@ -30,6 +30,13 @@ object LaptopMirror {
      *  confirmed "not casting" — well past any start-up race). */
     private const val MISS_LIMIT = 5
 
+    /** Heartbeats to wait for an offer before giving up on a request that has
+     *  produced neither a cast nor an error. Higher than [MISS_LIMIT]: the
+     *  laptop legitimately takes a moment here (screen-share consent, portal
+     *  session, encoder start), and giving up while the user is still reading
+     *  the consent dialog would be worse than waiting. */
+    private const val SILENT_LIMIT = 10
+
     /** True while the user wants to see the laptop screen. Read by the AppState
      *  builder → `laptopMirrorReq`; the laptop casts only while it's set. */
     @Volatile
@@ -107,6 +114,47 @@ object LaptopMirror {
         if (!requestActive) return
         requestActive = false
         Log.i(TAG, "viewer closed → cast request cleared")
+        onRequestChanged?.invoke()
+    }
+
+    /** The laptop reported that it CANNOT cast (AppState `laptop_cast_error`).
+     *
+     *  Clears the request, so we stop re-asserting something the laptop will
+     *  keep failing, and so [requestView] stops early-returning — its
+     *  `requestActive` guard is what made every further tap a no-op. Also hands
+     *  the reason to the UI: previously the user tapped, nothing happened, and
+     *  the explanation existed only in the laptop's log.
+     *
+     *  Idempotent: the laptop re-sends the same reason on every heartbeat until
+     *  it sees us stop asking, so only the first one does anything. */
+    fun onLaptopCastFailed(reason: String) {
+        if (!requestActive) return
+        requestActive = false
+        castMisses = 0
+        Log.w(TAG, "laptop cannot cast: $reason → request cleared")
+        onCastFailed?.invoke(reason)
+        viewerCloser?.invoke() // no-op when no viewer is up
+        onRequestChanged?.invoke() // tell the laptop at once, don't wait a heartbeat
+    }
+
+    /** Set by the UI to surface a cast failure (toast/dialog). */
+    @Volatile
+    var onCastFailed: ((String) -> Unit)? = null
+
+    /** A request that produced NO offer and NO error — the laptop never answered
+     *  at all (out of range, killed mid-request, an older build with no
+     *  `laptop_cast_error`). Give up after several heartbeats.
+     *
+     *  [onLaptopCastEnded] cannot cover this: it returns early unless a viewer is
+     *  already open, so a request that never got as far as a viewer had no
+     *  timeout whatsoever and stayed latched indefinitely. */
+    fun onLaptopCastSilent() {
+        if (!requestActive || viewerOpen) return
+        if (++castMisses < SILENT_LIMIT) return
+        castMisses = 0
+        requestActive = false
+        Log.w(TAG, "no cast offer after $SILENT_LIMIT heartbeats → request cleared")
+        onCastFailed?.invoke("The laptop did not respond")
         onRequestChanged?.invoke()
     }
 

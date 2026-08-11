@@ -161,6 +161,12 @@ data class AppState(
      *  viewer dials. null = not casting. Carried under the Noise-sealed
      *  transport; the key is never logged. */
     val laptopCast: LaptopCast? = null,
+    /** Laptop→phone: why the laptop's last cast attempt failed; null when it
+     *  didn't. Lets us stop asking and tell the user, instead of re-sending a
+     *  request the laptop cannot satisfy on every heartbeat forever — which
+     *  wedged the UI, since [LaptopMirror.requestView] ignores taps while a
+     *  request is already active. Absent from older laptops, hence nullable. */
+    val laptopCastError: String? = null,
     /** Laptop→phone: true while the laptop wants the phone's camera as a webcam
      *  (Continuity Camera). The phone starts its camera on the false→true edge. */
     val cameraReq: Boolean = false,
@@ -344,6 +350,8 @@ data class AppState(
                 lockCommandSeq = obj.optLong("lock_command_seq", 0L),
                 laptopMirrorReq = obj.optBoolean("laptop_mirror_req", false),
                 laptopMirrorExtend = obj.optBoolean("laptop_mirror_extend", false),
+                laptopCastError = obj.optString("laptop_cast_error", "")
+                    .takeIf { it.isNotBlank() },
                 laptopCast = obj.optJSONObject("laptop_cast")?.let { c ->
                     // ip is unused (the laptop dials us — we're the server); only
                     // port + key matter.

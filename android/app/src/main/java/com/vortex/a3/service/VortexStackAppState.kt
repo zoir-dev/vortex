@@ -167,13 +167,22 @@ internal fun VortexStack.handlePeerAppState(peerPub: ByteArray, state: com.vorte
     // offer DROPS (laptop hit "Stop sharing" / capture errored) close the viewer
     // so both screens stay in sync.
     val cast = state.laptopCast
+    val castError = state.laptopCastError
     if (cast != null) {
         val key = hexToBytes(cast.key)
         if (key != null && key.size == 32) {
             com.vortex.a3.core.mirror.LaptopMirror.onLaptopOffer(ctx, cast.port, key)
         }
+    } else if (castError != null) {
+        // The laptop tried and cannot: stop asking and say why. Checked BEFORE
+        // the silent path — an explicit reason beats waiting out a timeout.
+        com.vortex.a3.core.mirror.LaptopMirror.onLaptopCastFailed(castError)
     } else {
+        // No offer and no reason: either a viewer that just ended, or a request
+        // the laptop never answered. Both are handled, and each ignores the case
+        // that belongs to the other.
         com.vortex.a3.core.mirror.LaptopMirror.onLaptopCastEnded()
+        com.vortex.a3.core.mirror.LaptopMirror.onLaptopCastSilent()
     }
     // Continuity Camera: the laptop wants this phone's camera as a webcam.
     handleCameraRequest(state.cameraReq, state.cameraFacing)

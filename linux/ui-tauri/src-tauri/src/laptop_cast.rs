@@ -43,6 +43,59 @@ static CAST: Mutex<Option<CastHandle>> = Mutex::new(None);
 /// AppState, so the phone knows where to dial. `None` when not casting.
 static CAST_OFFER: Mutex<Option<LaptopCast>> = Mutex::new(None);
 
+/// Why the last cast attempt failed, for the phone to show and act on.
+///
+/// Without this the phone cannot tell "starting…" from "never going to work":
+/// it re-asserts `laptop_mirror_req` on every heartbeat, we fail again, and the
+/// only trace is a WARN in a log the user is not reading. Its request stays
+/// latched, `requestView` early-returns on `requestActive`, and further taps do
+/// nothing — the UI wedges until the app is force-stopped. The laptop already
+/// knows the exact reason and has a sealed channel to say it on, so it does.
+static CAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// The failure reason to ship in the next AppState push, if any.
+pub(crate) fn current_error() -> Option<String> {
+    CAST_ERROR.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_error(msg: Option<String>) {
+    if let Ok(mut g) = CAST_ERROR.lock() {
+        *g = msg;
+    }
+}
+
+/// Push the sealed stream to the phone, and tear the cast down if that gives up.
+///
+/// `run_tcp_video_client` returns either because `au_rx` closed (the normal stop
+/// path) or because it exhausted its ~60 s of connect retries — the phone's
+/// viewer never came up, or went away for good. The pipeline and the portal
+/// session live in a DIFFERENT task, so nothing used to act on that: the capture
+/// kept running with nobody watching, and for an extend cast KWin kept the
+/// virtual output in the desktop layout — a phantom 1920x1080 screen with no
+/// viewer behind it, which windows can be dragged into and lost. Observed
+/// exactly that after a viewer was closed: `kscreen-doctor` still listed
+/// `Virtual-virtual-xdp-kde-…` at 2058,0 until the whole app was killed.
+///
+/// Give-up on the transport therefore has to mean give-up on the cast — which
+/// also releases the compositor's output and, via `CAST_ERROR`, tells the phone
+/// why instead of leaving it on a black screen.
+fn spawn_video_sender(
+    phone_ip: std::net::IpAddr,
+    key: [u8; 32],
+    au_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx).await;
+        // On the normal stop path `stop()` has already taken CAST, so this is
+        // only reached with a live handle when the transport gave up by itself.
+        if CAST.lock().map(|g| g.is_some()).unwrap_or(false) {
+            tracing::warn!("laptop-cast: phone viewer unreachable — stopping the cast");
+            set_error(Some("the phone's viewer stopped responding".to_string()));
+            stop();
+        }
+    });
+}
+
 /// Edge-tracker for the phone's `laptop_mirror_req` level: we act only on the
 /// false→true (start) and true→false (stop) transitions, ignoring the repeats
 /// that arrive on every heartbeat.
@@ -120,12 +173,16 @@ pub fn dispatch_request(req: bool, extend: Option<bool>) {
                 key: hex::encode(key), // key material — logged nowhere
             });
         }
+        // A fresh attempt is not the previous attempt's failure: clear the
+        // reason so the phone isn't shown a stale one while this one runs.
+        set_error(None);
         tokio::spawn(async move {
             if let Err(e) = start(phone_ip, key, extend).await {
                 tracing::warn!("laptop-cast: start failed: {e}");
                 if let Ok(mut g) = CAST_OFFER.lock() {
                     *g = None;
                 }
+                set_error(Some(e));
                 REQ_WANTED.store(false, Ordering::SeqCst);
             }
         });
@@ -136,6 +193,10 @@ pub fn dispatch_request(req: bool, extend: Option<bool>) {
         if let Ok(mut g) = CAST_OFFER.lock() {
             *g = None;
         }
+        // The phone has stopped asking, so it has either seen the reason or no
+        // longer cares. Keeping it would re-report an old failure against the
+        // next request the moment it is made.
+        set_error(None);
     }
 }
 
@@ -156,14 +217,45 @@ pub async fn start(
     stop();
 
     // Extend mode swaps the SOURCE, nothing else: instead of a view of a screen
-    // that already exists, we ask Mutter for a brand-new monitor and capture
-    // that. Everything downstream — encode, seal, transport, the phone's viewer
-    // — is identical, which is the whole reason this fits here rather than in a
+    // that already exists we ask for a brand-new monitor and capture that.
+    // Everything downstream — encode, seal, transport, the phone's viewer — is
+    // identical, which is the whole reason this fits here rather than in a
     // module of its own.
     if extend.unwrap_or_else(extend_enabled) {
-        return start_extend(phone_ip, key).await;
+        // Mutter first: it is the tuned path (and it rides its own cursor
+        // overlay, because Mutter will not composite a pointer into a virtual
+        // monitor). But `org.gnome.Mutter.ScreenCast` is GNOME's private API, so
+        // on any other compositor it fails instantly with ServiceUnknown — and
+        // the ScreenCast portal's `Virtual` source is the cross-desktop
+        // equivalent, which KWin implements (its portal advertises it in
+        // AvailableSourceTypes). Falling back keeps "second screen" working off
+        // GNOME instead of failing with nothing on screen to say why.
+        match start_extend(phone_ip, key).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    "laptop-cast: Mutter virtual monitor unavailable ({e}); \
+                     trying the ScreenCast portal's Virtual source instead"
+                );
+                return start_portal(phone_ip, key, SourceType::Virtual).await;
+            }
+        }
     }
+    start_portal(phone_ip, key, SourceType::Monitor).await
+}
 
+/// Capture `source` through the ScreenCast portal and serve it sealed on
+/// [`mirror_tcp::LAPTOP_VIDEO_PORT`].
+///
+/// `SourceType::Monitor` is a view of a screen that already exists (mirror);
+/// `SourceType::Virtual` asks the compositor to materialise a NEW one (extend).
+/// Everything after the source selection is identical, which is why both kinds
+/// share this body.
+async fn start_portal(
+    phone_ip: std::net::IpAddr,
+    key: [u8; 32],
+    source: SourceType,
+) -> Result<(), String> {
     // ---- Portal: open a ScreenCast session and get the PipeWire node + fd. ----
     let proxy = Screencast::new()
         .await
@@ -176,7 +268,7 @@ pub async fn start(
         .select_sources(
             &session,
             CursorMode::Embedded,
-            SourceType::Monitor.into(),
+            source.into(),
             false,
             None,
             PersistMode::DoNot,
@@ -251,7 +343,7 @@ pub async fn start(
     );
 
     // Push the sealed stream to the phone (we dial it — the phone is the server).
-    tokio::spawn(mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx));
+    spawn_video_sender(phone_ip, key, au_rx);
 
     pipeline
         .set_state(gst::State::Playing)
@@ -267,9 +359,15 @@ pub async fn start(
     }
     let bus = pipeline.bus();
     tokio::spawn(async move {
-        // Keep these alive until teardown: dropping `fd`/`session` closes the
-        // PipeWire stream and the portal session; `proxy` backs the session.
-        let _keep = (proxy, session, fd);
+        // Keep these alive until teardown. `fd` closing does end the PipeWire
+        // stream, but the SESSION must be closed explicitly — ashpd 0.9's
+        // `Session` has `close()` and no `Drop` that calls it, so merely dropping
+        // it leaves the portal session open until our whole D-Bus connection goes
+        // away. For an extend cast that means the compositor keeps the virtual
+        // output: a phantom 1920x1080 screen stayed in the KDE display layout
+        // after the cast stopped, and only disappeared when the app was killed.
+        // See the explicit `close()` at the end of this task.
+        let _keep = (proxy, fd);
         let mut stop_rx = stop_rx;
         loop {
             // Drain any pending bus messages WITHOUT blocking the async runtime
@@ -315,7 +413,14 @@ pub async fn start(
         if let Ok(mut g) = CAST_OFFER.lock() {
             *g = None;
         }
-        tracing::info!("laptop-cast: stopped (capture + portal released)");
+        // Hand the session back to the compositor. Pipeline-to-Null stops the
+        // capture but leaves the SOURCE allocated — for `SourceType::Virtual`
+        // that is a whole output still sitting in the user's display layout,
+        // which windows can be dragged into and lost.
+        if let Err(e) = session.close().await {
+            tracing::warn!("laptop-cast: portal session close failed: {e}");
+        }
+        tracing::info!("laptop-cast: stopped (capture + portal session closed)");
     });
 
     Ok(())
@@ -432,7 +537,7 @@ async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), S
             .build(),
     );
 
-    tokio::spawn(mirror_tcp::run_tcp_video_client(phone_ip, key, au_rx));
+    spawn_video_sender(phone_ip, key, au_rx);
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|e| format!("pipeline play: {e}"))?;

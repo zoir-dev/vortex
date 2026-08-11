@@ -953,6 +953,7 @@ pub(crate) async fn run_ble_persistent_loop(
                     // Laptop→phone screen-cast offer (where to dial + key) while
                     // we're casting; None otherwise.
                     state.laptop_cast = crate::laptop_cast::current_offer();
+                    state.laptop_cast_error = crate::laptop_cast::current_error();
                     // Continuity Camera: ask the phone for its camera as a webcam.
                     state.camera_req = crate::camera::camera_wanted();
                     state.camera_facing = crate::camera::camera_facing();

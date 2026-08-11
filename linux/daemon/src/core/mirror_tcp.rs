@@ -32,9 +32,16 @@ use tokio::sync::mpsc;
 /// MUST match the Android `ScreenMirrorService` video server port.
 pub const VIDEO_PORT: u16 = 51822;
 
-/// Fixed TCP port the LAPTOP serves its own screen on (laptop→phone mirror, the
-/// mirror image of [`VIDEO_PORT`]); the phone connects out to it. MUST match the
-/// Android `LaptopMirrorClient` port.
+/// Fixed TCP port the PHONE serves its laptop-screen viewer on (laptop→phone
+/// mirror); the laptop connects out to it, exactly as for [`VIDEO_PORT`]. MUST
+/// match the Android `LaptopMirrorClient` port.
+///
+/// The name is historical and reads backwards: it is the port used *for* the
+/// laptop's screen, not a port the laptop listens on. Every video path here is
+/// dialled outward from the laptop — see the module note above — so Vortex needs
+/// no inbound firewall rule for any of them. (Said plainly because the previous
+/// wording claimed the laptop served this port, which sent one debugging session
+/// off after a firewall that was never involved.)
 pub const LAPTOP_VIDEO_PORT: u16 = 51823;
 
 /// Fixed TCP port the phone serves its CAMERA on (phone-as-webcam); the laptop
