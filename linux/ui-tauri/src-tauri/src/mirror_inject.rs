@@ -63,8 +63,74 @@ struct Injector {
 /// Which device `adb` should talk to, remembered between calls.
 static ADB_SERIAL: Mutex<Option<String>> = Mutex::new(None);
 
-/// The port `adb tcpip` puts the phone's daemon on, and the one [`redial`] dials.
+/// The port `adb tcpip` puts the phone's daemon on, and [`redial`]'s last resort.
 const WIRELESS_PORT: u16 = 5555;
+
+/// Port the most recent network transport was actually attached on.
+///
+/// `adb tcpip` always lands on [`WIRELESS_PORT`], but Android 11+ *Wireless
+/// debugging* — the only way to run adb with **USB debugging switched off**,
+/// which many banking/DRM apps insist on — picks a RANDOM port and keeps it for
+/// as long as the toggle stays on. Assuming 5555 there means [`redial`] can
+/// never get back on after a Wi-Fi roam or a suspend: `scan_transports` finds
+/// nothing, the redial dials a port nobody is listening on, and Universal
+/// Control arms with no cursor ever appearing on the phone.
+///
+/// Persisted, because the phone keeps that port across our own restarts.
+static LAST_ADB_PORT: Mutex<Option<u16>> = Mutex::new(None);
+
+fn adb_port_path() -> Option<std::path::PathBuf> {
+    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    p.push(".cache/vortex/last_adb_port");
+    Some(p)
+}
+
+/// Note the port a network transport is attached on, in memory and on disk.
+fn remember_adb_port(port: u16) {
+    let changed = {
+        let mut g = LAST_ADB_PORT.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = *g != Some(port);
+        *g = Some(port);
+        changed
+    };
+    if changed {
+        if let Some(p) = adb_port_path() {
+            let _ = vortex_l3_daemon::core::fs_private::write_private(
+                &p,
+                port.to_string().as_bytes(),
+            );
+        }
+        tracing::debug!(port, "mirror inject: remembered wireless adb port");
+    }
+}
+
+/// Ports [`redial`] should try, best guess first and never duplicated.
+///
+/// The remembered port comes first; 5555 stays as a fallback so a stale
+/// remembered port (phone re-paired, Wireless debugging toggled off and the
+/// legacy `adb tcpip` used instead) still recovers on the same pass.
+fn redial_ports() -> Vec<u16> {
+    let remembered = LAST_ADB_PORT
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .or_else(|| {
+            adb_port_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| s.trim().parse::<u16>().ok())
+        });
+    redial_port_order(remembered)
+}
+
+/// The pure half of [`redial_ports`], split out so the ordering is testable
+/// without a global or the filesystem in the way.
+fn redial_port_order(remembered: Option<u16>) -> Vec<u16> {
+    match remembered {
+        Some(p) if p != WIRELESS_PORT => vec![p, WIRELESS_PORT],
+        Some(p) => vec![p],
+        None => vec![WIRELESS_PORT],
+    }
+}
 
 /// Floor between redial attempts: `adb connect` blocks for about a second when
 /// nothing answers, and [`adb_serial`] sits in front of every injector call.
@@ -86,6 +152,15 @@ fn scan_transports() -> Option<String> {
         // A network transport is "host:port"; USB serials have no colon.
         let slot = if serial.contains(':') { &mut net } else { &mut usb };
         slot.get_or_insert_with(|| serial.to_string());
+    }
+    // Whatever port the network transport is on is the one worth redialling —
+    // `rsplit` also handles the bracketed IPv6 form (`[::1]:37129`).
+    if let Some(port) = net
+        .as_deref()
+        .and_then(|n| n.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        remember_adb_port(port);
     }
     usb.or(net)
 }
@@ -116,19 +191,28 @@ fn redial() -> bool {
     else {
         return false;
     };
-    let target = format!("{ip}:{WIRELESS_PORT}");
-    // `adb connect` exits 0 even when it fails ("failed to connect to …"), so
-    // the stdout text is the only honest signal. "already connected to" counts.
-    let ok = Command::new("adb")
-        .args(["connect", &target])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("connected to"));
-    if ok {
-        tracing::info!("mirror inject: wireless adb redialled at {target}");
-    } else {
-        tracing::debug!("mirror inject: no answer on {target} (needs `adb tcpip 5555` once)");
+    for port in redial_ports() {
+        let target = format!("{ip}:{port}");
+        // `adb connect` exits 0 even when it fails ("failed to connect to …"), so
+        // the stdout text is the only honest signal. "already connected to" counts.
+        let ok = Command::new("adb")
+            .args(["connect", &target])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("connected to"));
+        if ok {
+            // Also covers succeeding on the fallback: that port is now the one
+            // to try first next time.
+            remember_adb_port(port);
+            tracing::info!("mirror inject: wireless adb redialled at {target}");
+            return true;
+        }
+        tracing::debug!("mirror inject: no answer on {target}");
     }
-    ok
+    tracing::debug!(
+        "mirror inject: wireless adb unreachable — needs `adb tcpip 5555` once, or \
+         Wireless debugging paired (Android 11+, works with USB debugging OFF)"
+    );
+    false
 }
 
 /// Pick the phone to address, and pin every adb call to it with `-s`.
@@ -647,7 +731,18 @@ pub fn stop() {
 
 #[cfg(test)]
 mod tests {
-    use super::PointerCurve;
+    use super::{redial_port_order, PointerCurve, WIRELESS_PORT};
+
+    #[test]
+    fn redial_tries_the_remembered_port_before_5555() {
+        // Wireless-debugging port: try it first, keep 5555 as the fallback for a
+        // phone that has since gone back to `adb tcpip`.
+        assert_eq!(redial_port_order(Some(37129)), vec![37129, WIRELESS_PORT]);
+        // Nothing remembered yet — the legacy port is the only sensible guess.
+        assert_eq!(redial_port_order(None), vec![WIRELESS_PORT]);
+        // Already 5555: don't dial the same port twice (each miss costs ~1 s).
+        assert_eq!(redial_port_order(Some(WIRELESS_PORT)), vec![WIRELESS_PORT]);
+    }
 
     /// Android's side of the bargain: what a delta of `sent` pixels, arriving
     /// `dt` after the last one, actually moves the cursor by.
