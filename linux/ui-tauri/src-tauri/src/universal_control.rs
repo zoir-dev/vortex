@@ -424,15 +424,8 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
         Edge::Top | Edge::Bottom => (x, w),
         Edge::Left | Edge::Right => (y, h),
     };
-    let span = barrier_span(seg, full);
-    let (s0, sl) = span;
-    let pos = match edge {
-        Edge::Left => (x, s0, x, s0 + sl - 1),
-        Edge::Right => (x + w, s0, x + w, s0 + sl - 1),
-        Edge::Top => (s0, y, s0 + sl - 1, y),
-        Edge::Bottom => (s0, y + h, s0 + sl - 1, y + h),
-    };
-    let barriers = vec![Barrier::new(0, pos)];
+    let mut span = barrier_span(seg, full);
+    let mut pos = barrier_pos(edge, (x, y, w, h), span);
     tracing::info!(
         "universal-control: barrier at {pos:?} ({} edge, {} of it)",
         edge_name(edge),
@@ -444,10 +437,31 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     );
     // A barrier the compositor refuses to arm is silent otherwise: we would log
     // "armed", then wait forever for an activation that cannot come.
-    let set = ic
-        .set_pointer_barriers(&session, &barriers, zones.zone_set())
+    let mut set = ic
+        .set_pointer_barriers(&session, &[Barrier::new(BARRIER_ID, pos)], zones.zone_set())
         .await?
         .response()?;
+    // Not every compositor takes a partial edge. KWin only arms a barrier that
+    // spans the WHOLE screen edge — xdg-desktop-portal-kde's
+    // `inputcapturebarrier.cpp` rejects anything else with
+    // `BetweenScreensOrDoesNotFill` (it requires `y1 == geometry.y() && y2 ==
+    // geometry.bottom()`), so the short corner strip below is refused outright
+    // and Universal Control never arms on Plasma. Mutter accepts it, which is
+    // why this went unnoticed. Fall back to the full edge instead of giving up:
+    // the corner-avoidance is a nicety, crossing at all is the feature.
+    if !set.failed_barriers().is_empty() && seg != Segment::Full {
+        tracing::warn!(
+            "universal-control: compositor refused the partial {} barrier {pos:?}; \
+             retrying across the whole edge",
+            edge_name(edge)
+        );
+        span = full;
+        pos = barrier_pos(edge, (x, y, w, h), span);
+        set = ic
+            .set_pointer_barriers(&session, &[Barrier::new(BARRIER_ID, pos)], zones.zone_set())
+            .await?
+            .response()?;
+    }
     if !set.failed_barriers().is_empty() {
         return Err(format!("barrier_refused|{} {pos:?}", edge_name(edge)).into());
     }
@@ -547,6 +561,19 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     // 2 ms (~500 Hz) — low latency, still coalesces bursts so the socket never
     // backs up (per-event flooding caused stutter).
     let mut flush = tokio::time::interval(Duration::from_millis(2));
+    // Longest gap we allow in traffic to the phone while it holds the pointer.
+    //
+    // Android parks the Wi-Fi radio between packets, and the AP then buffers
+    // ours until the phone's next wake — measured at 150–350 ms on an otherwise
+    // idle link (vs ~2–13 ms awake), which is exactly what makes the cursor
+    // stutter when adb rides TCP instead of USB. Real motion already keeps the
+    // radio awake; this only fills the gaps when the hand pauses, so it costs
+    // nothing while you are actually moving.
+    const KEEPALIVE_GAP: Duration = Duration::from_millis(10);
+    // Last time ANYTHING was written to the phone. Deliberately separate from
+    // `last_motion`, which is the acceleration curve's `dt` — feeding keepalives
+    // into that would corrupt the curve we divide out.
+    let mut last_tx = Instant::now();
 
     loop {
         tokio::select! {
@@ -813,6 +840,7 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                             send_y -= ey;
                             last_motion = Instant::now();
                             crate::mirror_inject::send(&format!("P {ex} {ey}", ex = ex as i32, ey = ey as i32));
+                            last_tx = Instant::now();
                         }
                         // Dead reckoning, clamped exactly like Android clamps
                         // its own pointer, so `px`/`py` stay in step with what
@@ -1010,6 +1038,19 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                     overpush = 0.0;
                     set_cursor(false);
                 }
+                // Wi-Fi power-save keepalive (see KEEPALIVE_GAP). Covers both
+                // `active` (pointer on the phone) and `pending` (push being
+                // measured) so the radio is already awake when the crossing
+                // commits — otherwise the very first motion after crossing pays
+                // the wake penalty, which is the jolt you feel on arrival.
+                // Driven off the flush tick and gated on elapsed time, so it
+                // cannot leak: the moment both flags clear, it stops.
+                // An empty line is a no-op for the injector — `process_line`
+                // switches on `line[0]`, and '\0' matches no command.
+                if (active || pending) && last_tx.elapsed() >= KEEPALIVE_GAP {
+                    crate::mirror_inject::send("");
+                    last_tx = Instant::now();
+                }
             },
         }
     }
@@ -1148,6 +1189,31 @@ fn abandon_pos(
 /// the edge — at which point "leave the rest to the dock" quietly stops being
 /// true, which is the only reason a segment exists. Length stays at least 1
 /// because a zero-length barrier is not a barrier.
+/// Id for the single pointer barrier we register.
+///
+/// MUST NOT be 0. The InputCapture portal spec puts no constraint on the id, and
+/// Mutter happily takes 0, but xdg-desktop-portal-kde rejects it out of hand —
+/// `inputcapture.cpp` does `if (id == 0) { "Invalid barrier id"; failed; }`
+/// *before* looking at the geometry at all. With id 0 the barrier is silently
+/// refused on every KDE session, so Universal Control never arms and pushing at
+/// the screen edge does nothing.
+const BARRIER_ID: u32 = 1;
+
+/// The barrier line for `span` along `edge` of the monitor rect `(x, y, w, h)`.
+///
+/// Split out of the caller so the KWin full-edge retry builds its line the same
+/// way the first attempt did, rather than duplicating the four-way match.
+fn barrier_pos(edge: Edge, rect: (i32, i32, i32, i32), span: (i32, i32)) -> (i32, i32, i32, i32) {
+    let (x, y, w, h) = rect;
+    let (s0, sl) = span;
+    match edge {
+        Edge::Left => (x, s0, x, s0 + sl - 1),
+        Edge::Right => (x + w, s0, x + w, s0 + sl - 1),
+        Edge::Top => (s0, y, s0 + sl - 1, y),
+        Edge::Bottom => (s0, y + h, s0 + sl - 1, y + h),
+    }
+}
+
 fn barrier_span(seg: Segment, full: (i32, i32)) -> (i32, i32) {
     if seg == Segment::Full {
         return full;
