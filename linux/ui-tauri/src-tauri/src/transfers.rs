@@ -158,7 +158,10 @@ fn emit() {
         if all_done {
             (
                 format!("Received {label}"),
-                "Saved to Downloads".to_string(),
+                // Name the folder they actually landed in — it's localised
+                // ("Téléchargements", …), and a wrong name here sends the user
+                // hunting in a folder that hasn't got the files.
+                format!("Saved to {}", crate::clipboard_sync::downloads_label()),
                 100,
                 true,
             )
