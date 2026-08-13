@@ -92,7 +92,12 @@ case "$PM" in
     BUILD=(base-devel pkgconf curl
            webkit2gtk-4.1 gtk3 libayatana-appindicator librsvg
            dbus openssl protobuf gst-plugins-base-libs)
+    # gst-plugin-gtk carries `gtksink`, which the screen-mirror pipeline ends in
+    # (see ui-tauri mirror.rs). Arch split it OUT of gst-plugins-good, so
+    # installing the latter is not enough — without this the mirror window opens
+    # and spins forever on "gst parse: no element gtksink".
     RUN=(gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
+         gst-plugin-gtk
          libpulse networkmanager zenity android-tools
          nautilus-python python-pillow)
     NODE_PKGS=(nodejs npm)
@@ -158,6 +163,30 @@ PM_RC=$?
 set -e
 [ "$PM_RC" -eq 0 ] && ok "System packages installed." \
                    || warn "Package manager exited $PM_RC — some names may differ on your distro; check the log above."
+
+# ── verify gtksink ────────────────────────────────────────────────────────────
+# The screen-mirror / second-screen / continuity-camera pipelines all end in
+# `gtksink`. Which package ships it varies (Arch splits it out of
+# gst-plugins-good entirely), and when it's absent the failure is invisible:
+# the mirror window opens, spins on "Connecting…" forever, and the real reason
+# ("gst parse: no element gtksink") only appears in the log. Check it here
+# instead of shipping a guess for every distro.
+if command -v gst-inspect-1.0 >/dev/null 2>&1; then
+  if gst-inspect-1.0 gtksink >/dev/null 2>&1; then
+    ok "GStreamer gtksink present (screen mirroring can render)."
+  else
+    warn "GStreamer 'gtksink' is MISSING — the screen features will open a window that never shows a picture."
+    case "$PM" in
+      pacman)  warn "  Install it with: sudo pacman -S --needed gst-plugin-gtk" ;;
+      apt-get) warn "  Try: sudo apt-get install gstreamer1.0-gtk3" ;;
+      dnf)     warn "  Try: sudo dnf install gstreamer1-plugins-good-gtk" ;;
+      *)       warn "  Install your distro's GStreamer GTK sink plugin (provides libgstgtk.so)." ;;
+    esac
+    warn "  Everything else (notifications, clipboard, calls, files) works without it."
+  fi
+else
+  warn "gst-inspect-1.0 not found — cannot verify 'gtksink'; screen mirroring may not render."
+fi
 
 # ── Node + npm (separate & conditional) ───────────────────────────────────────
 # Only touch node when it's genuinely missing — if a working node+npm already

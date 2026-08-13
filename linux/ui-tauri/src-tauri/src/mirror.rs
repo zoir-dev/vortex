@@ -33,6 +33,40 @@ use vortex_l3_daemon::core::{mirror_tcp, mirror_udp};
 /// loop pushes into `input_tx`; `stop_mirror` takes + closes it.
 static MIRROR_HANDLE: std::sync::Mutex<Option<MirrorHandle>> = std::sync::Mutex::new(None);
 
+/// The live TCP video receiver task. Held so it can be ABORTED on teardown.
+///
+/// Without this it outlives its session: the receiver retries the connect for
+/// as long as the phone's video server is closed (it only opens after the user
+/// taps "Start now" on the consent dialog), so a second Start — a double click,
+/// or the address-retry pass — leaves the first receiver still looping. Both
+/// then connect the instant the phone's server opens, each holding a media key
+/// derived from its OWN session's IK handshake hash. The phone encrypts for the
+/// session it honoured (it debounces the duplicate START, see Android
+/// `VortexStack.kt`), so the other receiver fails to open frame 0
+/// ("AEAD open failed counter=0"), closes the socket, and takes the whole
+/// stream down with it — leaving the window spinning on a mirror that had in
+/// fact connected.
+static VIDEO_RX_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Abort any previous video receiver and remember the new one.
+fn set_video_rx_task(task: tokio::task::JoinHandle<()>) {
+    if let Ok(mut g) = VIDEO_RX_TASK.lock() {
+        if let Some(prev) = g.take() {
+            prev.abort();
+        }
+        *g = Some(task);
+    }
+}
+
+/// Abort the live video receiver, if any.
+fn abort_video_rx_task() {
+    let prev = VIDEO_RX_TASK.lock().ok().and_then(|mut g| g.take());
+    if let Some(t) = prev {
+        t.abort();
+    }
+}
+
 /// The live GStreamer pipeline. Held so a UI "Stop sharing" (and `cleanup`) can
 /// set it to Null without relying on the bus EOS cascade. It must reach Null
 /// BEFORE the mirror window goes away — the sink is drawing into that window.
@@ -881,12 +915,14 @@ pub async fn spawn_mirror(
     // needed (the laptop is the connecting side; its firewall allows that).
     let key = mirror_udp::derive_media_key(&handle.handshake_hash);
     let (au_tx, au_rx) = mpsc::channel::<Vec<u8>>(8);
-    tokio::spawn(mirror_tcp::run_tcp_video_receiver(
+    // Tracked + cancellable: a receiver from a previous session would otherwise
+    // still be retrying its connect with a stale media key. See VIDEO_RX_TASK.
+    set_video_rx_task(tokio::spawn(mirror_tcp::run_tcp_video_receiver(
         phone_addr.ip(),
         key,
         au_tx,
         Some(handle.keyframe_tx.clone()),
-    ));
+    )));
 
     let backend = detect_decoder_backend();
     start_player(app, backend, width, height, au_rx);
@@ -922,6 +958,9 @@ pub async fn stop_mirror() {
     }
     POINTER_DOWN.store(false, Ordering::Relaxed);
     SCROLL_ACTIVE.store(false, Ordering::Relaxed);
+    // Kill the video receiver before the decoder: it must not outlive this
+    // session and reconnect later with a now-stale media key.
+    abort_video_rx_task();
     // Decoder first, then the window it renders into.
     stop_pipeline();
     crate::mirror_window::close();
