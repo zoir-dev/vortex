@@ -113,6 +113,11 @@ pub(crate) async fn pair(
             emit_peers(app, ctx.peer_store.clone()).await;
         }
         Err(err) => {
+            // Log it: the UI funnels every failure into the same "codes didn't
+            // match" abort screen (PairingOverlay.vue keys off `ok` alone), so
+            // without this the real reason — connect, bearer, discovery — is
+            // lost entirely and the user is told it was a MITM scare.
+            tracing::warn!(peer = %addr_str, "pairing failed: {err}");
             let _ = app.emit(
                 "vortex:pairing_result",
                 PairingResultDto::Err { ok: false, error: err },

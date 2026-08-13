@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest, Service};
 use bluer::gatt::WriteOp;
-use bluer::{Adapter, Address, Result as BluerResult};
+use bluer::{Adapter, Address, Device, Result as BluerResult};
 use futures::future::try_join_all;
 use futures::{pin_mut, StreamExt};
 use tokio::time::timeout;
@@ -38,6 +38,10 @@ pub enum ClientError {
     UnsupportedVersion(u8),
     InvalidPayload(AdvDecodeError),
     FrameDecode(FrameDecodeError),
+    /// BlueZ brought up the classic (BR/EDR) bearer instead of LE, so no
+    /// GATT service can ever appear on the device object. See the bearer
+    /// note in `VortexClient::connect` for the mechanism and the way out.
+    ClassicBearerOnly,
 }
 
 impl std::fmt::Display for ClientError {
@@ -53,6 +57,13 @@ impl std::fmt::Display for ClientError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported V1 version byte: {v:#04x}"),
             Self::InvalidPayload(e) => write!(f, "invalid advertisement payload: {e:?}"),
             Self::FrameDecode(e) => write!(f, "frame decode: {e}"),
+            Self::ClassicBearerOnly => write!(
+                f,
+                "BlueZ kept the classic (BR/EDR) bearer, so no GATT service is reachable. \
+                 This phone is also paired to this laptop as a Bluetooth *audio* device, and \
+                 BlueZ always prefers the bonded bearer. Unpair it as an audio device \
+                 (`bluetoothctl remove <addr>`), then pair Vortex."
+            ),
         }
     }
 }
@@ -85,12 +96,75 @@ impl VortexClient {
     pub async fn connect(adapter: &Adapter, address: Address) -> Result<Self, ClientError> {
         let device = adapter.device(address)?;
         let t0 = std::time::Instant::now();
-        if !device.is_connected().await.unwrap_or(false) {
+
+        // Bring up an LE/ATT link — which can take TWO `Connect()` calls on a
+        // dual-mode phone.
+        //
+        // `Device1.Connect()` picks the bearer itself, and BlueZ's
+        // `select_conn_bearer()` opens with
+        //
+        // ```text
+        // if (bredr_state.prefer || (bredr_state.bonded && !le_state.bonded))
+        //         return BDADDR_BREDR;
+        // ```
+        //
+        // Vortex never creates an LE bond on purpose (see `ui-tauri`'s
+        // `pairing.rs`: on a dual-mode phone every bond attempt gets routed
+        // over BR/EDR and yields no IRK anyway). So as soon as the phone is
+        // *also* paired to this laptop as a Bluetooth audio device — an
+        // entirely ordinary thing to do — `bredr_state.bonded` is true,
+        // `le_state.bonded` is false, and every connect lands on BR/EDR:
+        // A2DP/HFP come up, the device object gets zero GATT services, and
+        // pairing dies in the discovery loop below. `PreferredBearer = "le"`
+        // does NOT rescue this; that clause is evaluated before
+        // `le_state.prefer`, and the property is experimental-gated anyway.
+        //
+        // The way through is BlueZ's documented "connect any disconnected
+        // bearer if one is already connected" rule. With BR/EDR up *and* a
+        // profile connected, `dev_connect()` takes
+        //
+        // ```text
+        // if (dev->bredr_state.svc_resolved && find_service_with_state(CONNECTED))
+        //         bdaddr_type = dev->bdaddr_type;   /* LE for a dual-mode dev */
+        // ```
+        //
+        // and routes to `device_connect_le()`. So: connect, and if we end up
+        // holding a classic-only link, connect again to add the LE bearer.
+        //
+        // Note the state test is `gatt_link_state`, not `is_connected()`.
+        // `Connected` is one property per device, true when *either* bearer is
+        // up, so a phone merely streaming A2DP used to satisfy it and send us
+        // straight into the discovery loop with no ATT channel at all.
+        let mut connect_err: Option<ClientError> = None;
+
+        // Round 1 — establish a link if we hold none.
+        if gatt_link_state(&device).await == GattLink::Absent {
             info!(%address, "GATT connect");
-            timeout(Duration::from_secs(15), device.connect())
-                .await
-                .map_err(|_| ClientError::Timeout("connect"))?
-                .map_err(ClientError::Bluer)?;
+            connect_err = connect_round(&device).await;
+            // The bearer switch below only happens once BlueZ has finished
+            // resolving this link and has a profile connected, so let it
+            // settle rather than racing it.
+            settle_link(&device, Duration::from_secs(3)).await;
+        }
+
+        // Round 2 — only when what we got is provably classic-only. Gating on
+        // `ClassicOnly` (rather than "not Up") matters: on a healthy but
+        // still-resolving LE link a second `Connect()` would take the
+        // `le_state.connected && dev->bredr` branch and pull up A2DP/HFP for
+        // no reason.
+        if gatt_link_state(&device).await == GattLink::ClassicOnly {
+            info!(%address, "classic-only link; asking BlueZ to add the LE bearer");
+            connect_err = connect_round(&device).await;
+            settle_link(&device, Duration::from_secs(3)).await;
+        }
+
+        // Only surface a connect error if we came away with no link at all;
+        // the second round routinely reports "already connected" once the
+        // first one gave us what we needed.
+        if let Some(e) = connect_err {
+            if gatt_link_state(&device).await == GattLink::Absent {
+                return Err(e);
+            }
         }
         let connect_ms = t0.elapsed().as_millis();
 
@@ -99,18 +173,41 @@ impl VortexClient {
         // match — see `find_vortex_service` for why we cannot block_on
         // from within an already-async context.
         let t1 = std::time::Instant::now();
-        let service: Service = timeout(Duration::from_secs(15), async {
+        let discovery = timeout(Duration::from_secs(15), async {
             loop {
-                let svcs = device.services().await?;
-                if let Some(s) = find_vortex_service(svcs).await? {
-                    return Ok::<Service, bluer::Error>(s);
+                // On a freshly established LE link BlueZ has not set
+                // ServicesResolved yet, and bluer turns that into an *error*
+                // ("GATT services have not been resolved") rather than an
+                // empty list. Propagating it aborted the whole connect after
+                // a single poll — the one case this loop exists to wait out.
+                // Every error here is "not ready yet"; the enclosing timeout
+                // is what bounds the wait.
+                match device.services().await {
+                    Ok(svcs) => match find_vortex_service(svcs).await {
+                        Ok(Some(s)) => return Ok::<Service, bluer::Error>(s),
+                        Ok(None) => {}
+                        Err(e) => debug!(%address, "service UUID read not ready: {e}"),
+                    },
+                    Err(e) => debug!(%address, "services() not ready: {e}"),
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         })
-        .await
-        .map_err(|_| ClientError::Timeout("service discovery"))?
-        .map_err(ClientError::Bluer)?;
+        .await;
+        // A timeout here is ambiguous on its own: the peer may simply not be
+        // running Vortex, or BlueZ may have handed us a classic link on which
+        // no GATT service will *ever* appear. Distinguish the two so the UI
+        // can say something the user can act on.
+        let service: Service = match discovery {
+            Ok(res) => res.map_err(ClientError::Bluer)?,
+            Err(_) => {
+                return Err(if gatt_link_state(&device).await == GattLink::ClassicOnly {
+                    ClientError::ClassicBearerOnly
+                } else {
+                    ClientError::Timeout("service discovery")
+                })
+            }
+        };
         info!(
             %address,
             connect_ms,
@@ -210,6 +307,63 @@ impl VortexClient {
         // the adapter; bluer's high-level API does not expose a direct
         // disconnect on the Service. Callers can drop and let bluer GC.
         Ok(())
+    }
+}
+
+/// What kind of link — if any — the device object currently carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GattLink {
+    /// Connected with GATT services present: usable as-is.
+    Up,
+    /// Connected, services resolved, yet not one GATT service exists. That
+    /// is a BR/EDR link (its "ServicesResolved" refers to SDP records, and
+    /// classic profiles hang off `sepN`/`avrcp` objects instead).
+    ClassicOnly,
+    /// Not connected, or an LE link whose services have not resolved yet.
+    Absent,
+}
+
+async fn gatt_link_state(device: &Device) -> GattLink {
+    if !device.is_connected().await.unwrap_or(false) {
+        return GattLink::Absent;
+    }
+    if !device.services().await.map(|s| s.is_empty()).unwrap_or(true) {
+        return GattLink::Up;
+    }
+    // Empty service list: only conclusive once BlueZ says it finished
+    // resolving. Mid-LE-connect the list is legitimately empty for a moment.
+    if device.is_services_resolved().await.unwrap_or(false) {
+        GattLink::ClassicOnly
+    } else {
+        GattLink::Absent
+    }
+}
+
+/// One bounded `Device1.Connect()` attempt. Returns the error, if any.
+async fn connect_round(device: &Device) -> Option<ClientError> {
+    match timeout(Duration::from_secs(15), device.connect()).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(ClientError::Bluer(e)),
+        Err(_) => Some(ClientError::Timeout("connect")),
+    }
+}
+
+/// Wait (bounded) for BlueZ to finish resolving whatever bearer it just
+/// brought up. A follow-up `Connect()` only switches to the LE bearer once
+/// `bredr_state.svc_resolved` is set and a profile is connected, so racing it
+/// would just re-run the BR/EDR path.
+async fn settle_link(device: &Device, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        // Both properties, not either: right after `Connect()` returns, BlueZ
+        // may not have propagated `Connected` yet, and bailing on that made
+        // this return instantly and defeat its own purpose.
+        if device.is_connected().await.unwrap_or(false)
+            && device.is_services_resolved().await.unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
