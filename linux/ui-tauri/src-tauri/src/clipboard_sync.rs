@@ -259,10 +259,28 @@ pub(crate) fn spawn_clipboard_sync(
                     *g = sync_sig(&text);
                 }
                 let t2 = text.clone();
-                let _ = tokio::task::spawn_blocking(move || set_system_text(t2)).await;
+                // Never swallow the apply error: "the phone's text didn't show
+                // up in my clipboard" is indistinguishable from "it never
+                // arrived" without this, and the two have nothing in common to
+                // debug. (The image path below has always logged its failures.)
+                let applied = match tokio::task::spawn_blocking(move || set_system_text(t2)).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        tracing::warn!("clipboard: phone text NOT applied: {e}");
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!("clipboard: apply task join: {e}");
+                        false
+                    }
+                };
+                // Still kept in history even if the system clipboard refused it,
+                // so the text is at least reachable from the Super+V popup.
                 store_capture("text", Some(text), None);
                 let _ = app.emit("vortex:clipboard", ());
-                tracing::info!("clipboard: synced from phone");
+                if applied {
+                    tracing::info!("clipboard: synced from phone");
+                }
             }
         });
     }

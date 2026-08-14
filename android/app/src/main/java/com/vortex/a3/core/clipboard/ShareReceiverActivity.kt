@@ -10,13 +10,18 @@ import android.widget.Toast
 import com.vortex.a3.service.VortexService
 
 /**
- * Share-sheet target: the user picks "Vortex" when sharing one or more files
- * (any type) to the laptop — instant-share style. The files arrive as granted
- * `content://` URIs in the intent (no focus trick needed). Each is read and
- * handed to [VortexService] as a FILE; the laptop saves them to Downloads (NOT
- * the clipboard). Handles both single (`ACTION_SEND`) and multi
- * (`ACTION_SEND_MULTIPLE`) shares — file managers use the latter for a
- * multi-selection, which is why a SEND-only filter never appeared.
+ * Share-sheet target: the user picks "Vortex" when sharing to the laptop —
+ * instant-share style. Three kinds of share, in priority order:
+ *
+ *  1. text containing a URL  → browsing handoff (the laptop opens the page),
+ *  2. any attachment         → FILE to the laptop's download folder,
+ *  3. plain text             → the laptop's CLIPBOARD.
+ *
+ * Files arrive as granted `content://` URIs in the intent (no focus trick
+ * needed) and are handed to [VortexService] as FILEs. Handles both single
+ * (`ACTION_SEND`) and multi (`ACTION_SEND_MULTIPLE`) shares — file managers use
+ * the latter for a multi-selection, which is why a SEND-only filter never
+ * appeared.
  */
 class ShareReceiverActivity : Activity() {
 
@@ -47,6 +52,28 @@ class ShareReceiverActivity : Activity() {
             Intent.ACTION_SEND -> listOfNotNull(streamExtra())
             Intent.ACTION_SEND_MULTIPLE -> streamListExtra()
             else -> emptyList()
+        }
+
+        // Shared plain TEXT (no URL in it, so the handoff above passed) → the
+        // laptop's CLIPBOARD, via the same bus the Quick Settings tile uses, so
+        // it inherits the cap + chunking + per-peer send. Without this, a text
+        // share fell through to the file loop below with nothing to read and
+        // died on "Couldn't read the shared file(s)" — the manifest advertises
+        // text/plain, so Vortex offers itself for text and must honour it.
+        //
+        // Guarded on `uris.isEmpty()`: a share can carry a caption ALONGSIDE an
+        // attachment (EXTRA_TEXT + EXTRA_STREAM), and there the file is the
+        // payload the user meant.
+        if (uris.isEmpty() && intent?.action == Intent.ACTION_SEND) {
+            val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()
+            if (!text.isNullOrEmpty()) {
+                VortexService.clipboardBus.tryEmit(text)
+                Log.i(TAG, "share: forwarded ${text.length} chars to the laptop clipboard")
+                Toast.makeText(this, "Sending text to laptop…", Toast.LENGTH_SHORT).show()
+                finish()
+                overridePendingTransition(0, 0)
+                return
+            }
         }
 
         var sent = 0
