@@ -139,6 +139,8 @@
     "close": "Done",
     "clipboard_sync": "Clipboard sync with phone",
     "clipboard_sync_hint": "Text copied on either device appears on the other. Phone→laptop needs the phone's Quick Settings tile.",
+    "file_auto_accept": "Auto-accept files from phone",
+    "file_auto_accept_hint": "Save files shared from your phone without asking. Only your paired phone can send them.",
     "uc": "Universal Control",
     "uc_hint": "Glide the laptop cursor & keyboard onto the phone. Push the screen edge to cross; push back to return.",
     "uc_needs": "Needs USB debugging (adb) and Wayland — the screen edge is held through the compositor's input-capture portal. Tested on GNOME 45+; KDE Plasma 6.1+ and Hyprland ship that portal too but are untested here, Sway does not have it, and X11 has no such thing. Two-finger scrolling is drawn as a real finger, which only phones that let adb write /dev/uinput allow — elsewhere it falls back to wheel steps. Hiding the laptop's own cursor is GNOME-only, and needs one log-out after installing.",

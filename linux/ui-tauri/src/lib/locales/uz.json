@@ -139,6 +139,8 @@
     "close": "Tayyor",
     "clipboard_sync": "Telefon bilan clipboard sync",
     "clipboard_sync_hint": "Bir qurilmada nusxalangan matn ikkinchisida paydo bo'ladi. Telefon→laptop uchun telefon Quick Settings plitkasi kerak.",
+    "file_auto_accept": "Telefondan fayllarni avtomatik qabul qilish",
+    "file_auto_accept_hint": "Telefondan ulashilgan fayllarni so'ramasdan saqlash. Ularni faqat bog'langan telefoningiz yubora oladi.",
     "uc": "Universal Control",
     "uc_hint": "Noutbuk kursori va klaviaturasi telefonga o'tadi. O'tish uchun ekran chetiga itaring; qaytish uchun orqaga itaring.",
     "uc_needs": "USB debugging (adb) va Wayland kerak — ekran cheti kompozitorning input-capture portali orqali ushlanadi. GNOME 45+ da sinalgan; KDE Plasma 6.1+ va Hyprland'da ham bu portal bor, lekin biz sinamaganmiz; Sway'da yo'q, X11'da umuman yo'q. Ikki barmoq bilan surish telefonda haqiqiy barmoq bo'lib chiziladi — buni faqat adb'ga /dev/uinput'ga yozishga ruxsat bergan telefonlar qila oladi, qolganlarida g'ildirak zinapoyasiga tushadi. Noutbukning o'z kursorini yashirish faqat GNOME'da, o'rnatgandan keyin bir marta tizimdan chiqib kirish kerak.",

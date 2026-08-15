@@ -14,6 +14,7 @@ import {
   LockOpen,
   ClipboardList,
   MousePointer2,
+  FileDown,
 } from "lucide-vue-next";
 import { theme } from "@/lib/theme";
 import { smartSwitchEnabled, setSmartSwitch } from "@/lib/smartSwitch";
@@ -38,6 +39,9 @@ onMounted(() => {
   void initProximity();
   void invoke<boolean>("get_clipboard_sync")
     .then((v) => (clipboardSync.value = v))
+    .catch(() => {});
+  void invoke<boolean>("get_file_auto_accept")
+    .then((v) => (fileAutoAccept.value = v))
     .catch(() => {});
   void invoke<boolean>("uc_running")
     .then((v) => (ucEnabled.value = v))
@@ -125,6 +129,20 @@ const clipboardSync = ref(true);
 function setClipboardSync(v: boolean) {
   clipboardSync.value = v;
   void invoke("set_clipboard_sync", { enabled: v }).catch(() => {});
+}
+
+// Files shared FROM the phone normally raise an Accept / Decline banner. With
+// this on they are saved straight away. Off by default (it drops a consent
+// gate) and persisted on the Rust side, so the choice survives a restart.
+// Revert the switch if the write fails — it must never show "on" over a
+// setting that didn't stick.
+const fileAutoAccept = ref(false);
+function setFileAutoAccept(v: boolean) {
+  const prev = fileAutoAccept.value;
+  fileAutoAccept.value = v;
+  void invoke("set_file_auto_accept", { enabled: v }).catch(() => {
+    fileAutoAccept.value = prev;
+  });
 }
 
 function pickLocale(code: LocaleCode) {
@@ -236,6 +254,14 @@ const pill = (active: boolean) =>
             :desc="t('settings.clipboard_sync_hint')"
             :model-value="clipboardSync"
             @update:model-value="setClipboardSync"
+          />
+          <SettingsRow
+            divider
+            :icon="FileDown"
+            :title="t('settings.file_auto_accept')"
+            :desc="t('settings.file_auto_accept_hint')"
+            :model-value="fileAutoAccept"
+            @update:model-value="setFileAutoAccept"
           />
           <SettingsRow
             divider

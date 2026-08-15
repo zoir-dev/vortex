@@ -20,6 +20,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * (FILE_PUSH_OFFER), pop a notification with Accept / Decline and BLOCK the
  * LAN handler thread until the user chooses (or a timeout → decline). The
  * laptop only streams the bytes after an accept.
+ *
+ * [FileAutoAcceptSetting] short-circuits the whole prompt when the user has
+ * opted in — see [request].
  */
 object FileConsent {
     private const val TAG = "VortexFileConsent"
@@ -43,6 +46,15 @@ object FileConsent {
         timeoutMs: Long = 45_000,
     ): Boolean {
         val app = ctx.applicationContext
+        // Auto-accept: skip the prompt entirely and answer immediately, so the
+        // laptop starts streaming without the 45 s wait. `init` is idempotent —
+        // this call also covers the case where the LAN handler races ahead of
+        // the UI/service having loaded the setting.
+        FileAutoAcceptSetting.init(app)
+        if (FileAutoAcceptSetting.isEnabled()) {
+            Log.i(TAG, "auto-accept on → '$label' accepted without asking")
+            return true
+        }
         ensureReceiver(app)
         val id = nextId.getAndIncrement()
         val q = ArrayBlockingQueue<Boolean>(1)

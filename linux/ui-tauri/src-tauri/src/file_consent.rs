@@ -10,12 +10,67 @@
 //! key prefix), so the two never collide.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
 
 use vortex_l3_daemon::core::notification_display;
+
+/// Auto-accept incoming file batches instead of asking. OFF unless the user
+/// turns it on: this removes a consent gate, so it can only ever be a
+/// deliberate opt-in — never a default, and never inferred from anything else.
+static AUTO_ACCEPT: AtomicBool = AtomicBool::new(false);
+/// Guards the one-time load of the persisted choice.
+static AUTO_ACCEPT_LOADED: OnceLock<()> = OnceLock::new();
+
+/// `~/.local/share/vortex/file_auto_accept` — "1" / "0". Persisted (unlike the
+/// clipboard-sync toggle) because a consent setting that silently reverted on
+/// restart would leave the user believing files are still gated when they are
+/// not, or waiting for a prompt that no longer comes.
+fn auto_accept_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".local/share/vortex/file_auto_accept"))
+}
+
+/// The current setting, loading the persisted value on first use. Anything
+/// unreadable or unrecognised means OFF — a consent bypass must never be the
+/// consequence of a missing or corrupt file.
+fn auto_accept() -> bool {
+    AUTO_ACCEPT_LOADED.get_or_init(|| {
+        let on = auto_accept_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        AUTO_ACCEPT.store(on, Ordering::Relaxed);
+        tracing::info!(auto_accept = on, "file receive consent");
+    });
+    AUTO_ACCEPT.load(Ordering::Relaxed)
+}
+
+/// Settings read: whether incoming files are accepted without a prompt.
+#[tauri::command]
+pub fn get_file_auto_accept() -> bool {
+    auto_accept()
+}
+
+/// Settings toggle: accept incoming file batches without prompting.
+#[tauri::command]
+pub fn set_file_auto_accept(enabled: bool) -> Result<(), String> {
+    // Run the loader FIRST: if it fired later it would clobber this choice
+    // with the on-disk value.
+    let _ = auto_accept();
+    AUTO_ACCEPT.store(enabled, Ordering::Relaxed);
+    let path = auto_accept_path().ok_or("no HOME")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, if enabled { "1" } else { "0" }).map_err(|e| e.to_string())?;
+    tracing::info!(enabled, "file auto-accept setting changed");
+    Ok(())
+}
 
 /// notification id → the waiter to resolve when the user clicks Accept/Decline.
 static REGISTRY: OnceLock<Mutex<HashMap<u32, oneshot::Sender<bool>>>> = OnceLock::new();
@@ -40,6 +95,12 @@ fn fmt_bytes(n: u64) -> String {
 /// out to a decline after 45 s. Fails CLOSED (decline) if the banner can't show
 /// — consent must never be silently bypassed.
 pub(crate) async fn request(label: &str, count: usize, total: u64) -> bool {
+    if auto_accept() {
+        // No banner at all — the transfer pill (see `transfers`) still reports
+        // what arrived and where it was saved, so the receive stays visible.
+        tracing::info!(count, bytes = total, "auto-accept on → file batch accepted without asking");
+        return true;
+    }
     let title = if count > 1 {
         format!("Phone wants to send {count} files")
     } else {

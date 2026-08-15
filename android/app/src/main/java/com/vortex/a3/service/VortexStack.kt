@@ -272,6 +272,9 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         com.vortex.a3.core.media.SmartSwitchSetting.init(ctx)
         com.vortex.a3.core.notif.NotificationMirrorSetting.init(ctx)
         com.vortex.a3.core.clipboard.ClipboardSyncSetting.init(ctx)
+        // Load early so an incoming file-push offer is answered from the user's
+        // real choice even if the UI has never been opened this run.
+        com.vortex.a3.core.lan.FileAutoAcceptSetting.init(ctx)
         scope.launch {
             com.vortex.a3.core.media.SmartSwitchSetting.enabled.collect { on ->
                 media.smartSwitchEnabled = on

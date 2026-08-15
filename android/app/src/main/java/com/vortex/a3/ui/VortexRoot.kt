@@ -140,6 +140,9 @@ fun VortexRoot(
                 val peerNotifShowOn = NotificationMirrorSetting.showPeer.collectAsState().value
                 remember { ClipboardSyncSetting.init(activity); 0 }
                 val clipboardSyncOn = ClipboardSyncSetting.enabled.collectAsState().value
+                remember { com.vortex.a3.core.lan.FileAutoAcceptSetting.init(activity); 0 }
+                val fileAutoAcceptOn =
+                    com.vortex.a3.core.lan.FileAutoAcceptSetting.enabled.collectAsState().value
                 // Re-evaluated each time Settings opens (the user may have just
                 // run the ADB grant); a hint tells them to re-open if so.
                 val clipboardAutoGranted = remember(showSettings) {
@@ -178,6 +181,10 @@ fun VortexRoot(
                         clipboardSyncOn = clipboardSyncOn,
                         onClipboardSyncChange = { ClipboardSyncSetting.setEnabled(it) },
                         clipboardAutoGranted = clipboardAutoGranted,
+                        fileAutoAcceptOn = fileAutoAcceptOn,
+                        onFileAutoAcceptChange = {
+                            com.vortex.a3.core.lan.FileAutoAcceptSetting.setEnabled(it)
+                        },
                         screenControlOn = screenControlOn,
                         onScreenControlClick = actions.onOpenScreenControl,
                         onBack = { showSettings = false },

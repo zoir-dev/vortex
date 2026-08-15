@@ -365,6 +365,8 @@ pub fn run() {
             clipboard::clipboard_capture_now,
             clipboard_sync::set_clipboard_sync,
             clipboard_sync::get_clipboard_sync,
+            file_consent::set_file_auto_accept,
+            file_consent::get_file_auto_accept,
             clipboard::clipboard_get,
             clipboard_window::clipboard_set_preview,
             clipboard::clipboard_select,

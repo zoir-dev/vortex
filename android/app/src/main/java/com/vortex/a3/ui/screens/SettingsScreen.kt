@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.DarkMode
+import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.Headset
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.LightMode
@@ -75,6 +76,8 @@ fun SettingsScreen(
     clipboardSyncOn: Boolean,
     onClipboardSyncChange: (Boolean) -> Unit,
     clipboardAutoGranted: Boolean,
+    fileAutoAcceptOn: Boolean,
+    onFileAutoAcceptChange: (Boolean) -> Unit,
     screenControlOn: Boolean,
     onScreenControlClick: () -> Unit,
     onBack: () -> Unit,
@@ -179,6 +182,14 @@ fun SettingsScreen(
                     else str("settings.clipboard_sync_hint"),
                     checked = clipboardSyncOn,
                     onCheckedChange = onClipboardSyncChange,
+                )
+                RowDivider()
+                ToggleRow(
+                    icon = Icons.Outlined.FileDownload,
+                    title = str("settings.file_auto_accept"),
+                    hint = str("settings.file_auto_accept_hint"),
+                    checked = fileAutoAcceptOn,
+                    onCheckedChange = onFileAutoAcceptChange,
                 )
             }
             // When sync is on but background reads aren't granted, phone→laptop
