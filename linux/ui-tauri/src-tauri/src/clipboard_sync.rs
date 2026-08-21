@@ -430,6 +430,31 @@ async fn flush_file_batch(batch: Vec<Offer>) {
     if batch.is_empty() {
         return;
     }
+    // Drop offers we are already holding. The phone RE-ANNOUNCES an offer that
+    // hasn't been fetched, because a notify its own stack accepted can still be
+    // dropped in flight and it has no other way to tell. Without this the
+    // duplicate would queue the same file a second time — a redundant pull and
+    // a spurious "name (1).ext" beside the real one — and re-prompt for consent
+    // on a batch the user already accepted. Deduped by content token, so a
+    // deliberate re-share AFTER the pull completed still goes through (the
+    // entry is gone from the queue by then).
+    let batch: Vec<Offer> = {
+        let queued: std::collections::HashSet<String> = crate::PENDING_FILE_OFFERS
+            .get()
+            .and_then(|m| m.lock().ok().map(|g| g.iter().map(|(t, ..)| t.clone()).collect()))
+            .unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        batch
+            .into_iter()
+            // `seen` also collapses duplicates WITHIN the batch: a re-announce
+            // can land inside the same debounce window as the original.
+            .filter(|o| !queued.contains(&o.token) && seen.insert(o.token.clone()))
+            .collect()
+    };
+    if batch.is_empty() {
+        tracing::info!("phone re-announced file offer(s) already queued; ignoring");
+        return;
+    }
     let count = batch.len();
     let total: u64 = batch.iter().map(|o| o.bytes).sum();
     let label = if count == 1 {
@@ -451,6 +476,7 @@ async fn flush_file_batch(batch: Vec<Offer>) {
             }
         }
     }
+    crate::lan::note_queue_progress();
     tracing::info!(count, "phone file offer(s) accepted → LAN pull nudged");
     if let Some(nudge) = crate::SYNC_NUDGE.get() {
         nudge.notify_one();

@@ -61,10 +61,20 @@ internal fun VortexStack.startClipboardOutbound() {
             o.put("token", token)
             o.put("bytes", png.size)
             val offer = o.toString().toByteArray(Charsets.UTF_8)
+            var delivered = false
             for (peer in peerStore.list()) {
-                gattServer?.sendClipboardImageOfferEncrypted(peer.peerStaticPub, offer)
+                if (gattServer?.sendClipboardImageOfferEncrypted(peer.peerStaticPub, offer) == true) {
+                    delivered = true
+                }
             }
-            Log.i(VortexStack.TAG, "clipboard image offered to laptop (${png.size} bytes, token=$token)")
+            // Not retried, unlike a file: a clipboard image is transient, and by
+            // the time the link is back the user has copied something else. But
+            // don't claim it was offered when it wasn't.
+            if (delivered) {
+                Log.i(VortexStack.TAG, "clipboard image offered to laptop (${png.size} bytes, token=$token)")
+            } else {
+                Log.w(VortexStack.TAG, "clipboard image offer couldn't go out (BLE link down?)")
+            }
         }
     }
 
@@ -82,10 +92,12 @@ internal fun VortexStack.startClipboardOutbound() {
             o.put("name", file.name)
             o.put("mime", file.mime)
             val offer = o.toString().toByteArray(Charsets.UTF_8)
-            for (peer in peerStore.list()) {
-                gattServer?.sendClipboardImageOfferEncrypted(peer.peerStaticPub, offer)
-            }
             Log.i(VortexStack.TAG, "clipboard file offered to laptop ('${file.name}', ${file.bytes.size} bytes, token=$token)")
+            // Tracked until the laptop has actually FETCHED the bytes: the OFFER
+            // is a fire-and-forget BLE notify that goes nowhere on a dead link,
+            // and even a delivered one can sit unfetched. Retries, warms the LAN
+            // path on delivery, and toasts here if it ends up nowhere.
+            offerFileToLaptop(token, file.name, offer)
             // Big file → bring up Wi-Fi Direct for a high-speed direct pull. Small
             // files stay on the router path (the ~6s Wi-Fi switch isn't worth it).
             if (file.bytes.size >= 4 * 1024 * 1024) maybeStartWifiDirect()

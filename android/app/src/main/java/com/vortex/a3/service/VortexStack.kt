@@ -80,6 +80,23 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      *  receive cipher. One-at-a-time keeps each burst at the proven 12ms rate. */
     internal val companionSendMutex = kotlinx.coroutines.sync.Mutex()
     internal var lanServer: LanServer? = null
+
+    /** Outgoing file offers not yet fetched by the laptop, keyed by content
+     *  token. See [offerFileToLaptop] — the retry + "it never arrived" toast
+     *  live there. */
+    internal val pendingOffers =
+        java.util.concurrent.ConcurrentHashMap<String, PendingOffer>()
+    internal var offerRetryJob: kotlinx.coroutines.Job? = null
+    internal val offerRetryKick = newOfferRetryKick()
+    /** Debounced "warm the LAN for the incoming pull" job — deferred so it
+     *  can't put an mDNS re-announce and a STATE notify between two offers. */
+    internal var lanWarmJob: kotlinx.coroutines.Job? = null
+    /** True once this outage has been reported on screen, so a 5-file share
+     *  doesn't stack 5 identical toasts. Cleared when a send gets through. */
+    @Volatile internal var offerUnreachableToasted: Boolean = false
+    /** Monotonic offer counter — the sequence the laptop's FIFO pull queue is
+     *  compared against to spot an offer that was dropped in flight. */
+    @Volatile internal var offerSeq: Long = 0L
     private var pairingOrchestrator: PairingOrchestrator? = null
     private var reconnectOrchestrator: ReconnectOrchestrator? = null
     internal var callFlowOrchestrator: com.vortex.a3.core.call.CallFlowOrchestrator? = null
@@ -119,6 +136,11 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     internal lateinit var peerStore: PeerStore
     /** Invoked when fresh peer state arrives, so the notification refreshes. */
     internal var onStateChanged: () -> Unit = {}
+
+    /** `elapsedRealtime()` of the last successful BLE AppState push. Lets the
+     *  file-offer path skip a redundant one that would only compete with the
+     *  offers for the notify queue. */
+    @Volatile internal var lastBleStatePushAtMs: Long = 0L
 
     /** True once [start] has wired the stack (advertiser is up). */
     fun isStarted(): Boolean = advertiser != null
@@ -546,6 +568,9 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             // Push our notes/todos set on (re)connect so the laptop merges +
             // replies — converges both sides after an offline edit. Debounced.
             com.vortex.a3.core.notes.NoteSync.markDirty()
+            // A file offer that couldn't go out while the link was down can go
+            // now — this is the whole reason it was kept.
+            kickOfferRetry()
             // Re-send app icons after a reconnect (until the laptop has them
             // cached) and flush any notifications buffered during the outage.
             sentIconPkgs.clear()
@@ -703,6 +728,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             try {
                 val json = buildLocalAppState().toJsonBytes()
                 if (server.sendStateEncrypted(peerPub, json)) {
+                    lastBleStatePushAtMs = android.os.SystemClock.elapsedRealtime()
                     Log.i(TAG, "state pushed over BLE")
                 }
             } catch (e: Exception) {
@@ -830,6 +856,9 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 ).run(firstFrame)
             }
         }
+        // A blob the laptop pulled is an offer that landed — stop tracking it
+        // (and don't toast a failure for a file that plainly arrived).
+        lan.onFileServed = { token -> noteFileServed(token) }
         lanServer = lan
     }
 

@@ -38,6 +38,51 @@ fn last_peer_ip_path() -> Option<std::path::PathBuf> {
     Some(p)
 }
 
+/// Is a phone→laptop file pull waiting on the next heartbeat round? The pull is
+/// piggybacked on the heartbeat (one queued file per round), so the tick
+/// cadence and the address probe both need to know when the queue is hot —
+/// otherwise a half-received batch sits out the idle backoff.
+pub(crate) fn files_queued() -> bool {
+    crate::PENDING_FILE_OFFERS
+        .get()
+        .and_then(|m| m.lock().ok().map(|g| !g.is_empty()))
+        .unwrap_or(false)
+}
+
+/// When the pull queue last MOVED — an offer accepted onto it, or a file pulled
+/// off it. See [`file_pull_active`].
+static QUEUE_PROGRESS_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// A queued file batch can stop draining for reasons a retry will never fix —
+/// notably a token the phone has evicted, which it answers `"nomatch"` while
+/// the laptop keeps it queued and re-requests it every round. Past this, treat
+/// the queue as cold: the brisk cadence is for a batch that is moving.
+const QUEUE_STALL_GRACE: Duration = Duration::from_secs(60);
+
+/// Record that the pull queue moved. Call whenever an entry is pushed or popped.
+pub(crate) fn note_queue_progress() {
+    if let Ok(mut g) = QUEUE_PROGRESS_AT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
+/// Is a file pull both queued AND still making progress? This — not bare
+/// [`files_queued`] — is what may drive the heartbeat harder: a queue that is
+/// permanently stuck must not spin a TCP+IK every 2 s for the rest of the
+/// session, which is exactly what the unconditional form would do.
+pub(crate) fn file_pull_active() -> bool {
+    if !files_queued() {
+        return false;
+    }
+    QUEUE_PROGRESS_AT
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|t| t.elapsed() < QUEUE_STALL_GRACE)
+        .unwrap_or(false)
+}
+
 /// Cache the peer IP that just resolved — in memory AND on disk — so after a
 /// daemon restart the very first heartbeat reuses it instead of the
 /// (wrong-on-a-shared-network) gateway guess that caused a transient
@@ -280,15 +325,32 @@ pub(crate) async fn try_lan_reconnect(
         match cached {
             Some(ip) => {
                 let sa = std::net::SocketAddr::new(ip, LAN_DEFAULT_PORT);
-                match tokio::time::timeout(
-                    Duration::from_secs(2),
-                    tokio::net::TcpStream::connect(sa),
-                )
-                .await
-                {
-                    Ok(Ok(_probe)) => Some(sa), // reachable — probe socket drops here
-                    _ => None,
+                // One attempt normally: a dozing Wi-Fi radio can miss a cold
+                // 2 s connect, and an idle heartbeat gets away with that
+                // because it ticks again shortly. A heartbeat carrying a
+                // queued file pull does NOT — losing the probe costs it a 6 s
+                // mDNS browse plus a failed dial, and four of those in a row
+                // park the rest of the batch on the idle backoff. So retry
+                // like `resolve_peer_addr` does when there's work waiting.
+                let attempts = if file_pull_active() { 3 } else { 1 };
+                let mut found = None;
+                for attempt in 0..attempts {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    if matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            tokio::net::TcpStream::connect(sa),
+                        )
+                        .await,
+                        Ok(Ok(_probe)) // reachable — probe socket drops here
+                    ) {
+                        found = Some(sa);
+                        break;
+                    }
                 }
+                found
             }
             None => None,
         }
@@ -460,11 +522,11 @@ pub(crate) async fn try_lan_reconnect(
         }
         // Instant-share file pull: request the FRONT queued file this round (the rest
         // follow on subsequent nudged rounds).
-        if let Some(token) = crate::PENDING_FILE_OFFERS
+        let requested_file_token: Option<String> = crate::PENDING_FILE_OFFERS
             .get()
-            .and_then(|m| m.lock().ok().and_then(|g| g.front().map(|(t, _, _, _)| t.clone())))
-        {
-            bulk_obj["clipboard_file"] = serde_json::Value::String(token);
+            .and_then(|m| m.lock().ok().and_then(|g| g.front().map(|(t, _, _, _)| t.clone())));
+        if let Some(token) = &requested_file_token {
+            bulk_obj["clipboard_file"] = serde_json::Value::String(token.clone());
         }
         let bulk_request = bulk_obj.to_string();
         match run_lan_reconnect(
@@ -539,6 +601,7 @@ pub(crate) async fn try_lan_reconnect(
                                 .get()
                                 .and_then(|m| m.lock().ok().and_then(|mut g| g.pop_front()));
                             if let Some((_, name, mime, id)) = meta {
+                                note_queue_progress();
                                 match crate::clipboard_sync::apply_synced_file(
                                     app,
                                     &name,
@@ -551,11 +614,7 @@ pub(crate) async fn try_lan_reconnect(
                                     None => crate::transfers::fail(id),
                                 }
                             }
-                            let more = crate::PENDING_FILE_OFFERS
-                                .get()
-                                .and_then(|m| m.lock().ok().map(|g| !g.is_empty()))
-                                .unwrap_or(false);
-                            if more {
+                            if files_queued() {
                                 if let Some(nudge) = crate::SYNC_NUDGE.get() {
                                     nudge.notify_one();
                                 }
@@ -581,14 +640,53 @@ pub(crate) async fn try_lan_reconnect(
                         }
                     }
                 }
+                // We asked for a file and the phone said it couldn't serve it —
+                // its blob store keeps only the last 32, so a token can be
+                // evicted before we get to it. Nothing will ever arrive for that
+                // entry: drop it, fail its pill, and move to the next. Left
+                // queued it would be re-requested on every round for the rest of
+                // the session, blocking every file behind it (and, on the
+                // Wi-Fi Direct path, never letting us restore Wi-Fi).
+                if let Some(req) = &requested_file_token {
+                    if outcome
+                        .bulk_status
+                        .as_ref()
+                        .is_some_and(|s| s.unservable("clipboard_file"))
+                    {
+                        // Pop only if the front is still the entry we asked
+                        // about, so a batch accepted mid-round is never dropped.
+                        let dead = crate::PENDING_FILE_OFFERS.get().and_then(|m| {
+                            m.lock().ok().and_then(|mut g| {
+                                let front_matches =
+                                    g.front().is_some_and(|(t, _, _, _)| t == req);
+                                if front_matches { g.pop_front() } else { None }
+                            })
+                        });
+                        if let Some((_, name, _, id)) = dead {
+                            note_queue_progress();
+                            crate::transfers::fail(id);
+                            tracing::warn!(
+                                name = %name,
+                                status = outcome
+                                    .bulk_status
+                                    .as_ref()
+                                    .and_then(|s| s.get("clipboard_file"))
+                                    .unwrap_or("?"),
+                                "phone can no longer serve this file (token evicted?); \
+                                 dropping it from the pull queue"
+                            );
+                            if files_queued() {
+                                if let Some(nudge) = crate::SYNC_NUDGE.get() {
+                                    nudge.notify_one();
+                                }
+                            }
+                        }
+                    }
+                }
                 // Wi-Fi Direct: once every queued file is pulled over the group
                 // link, hop back to the normal Wi-Fi; otherwise pull the next now.
                 if wd_active() {
-                    let empty = crate::PENDING_FILE_OFFERS
-                        .get()
-                        .and_then(|m| m.lock().ok().map(|g| g.is_empty()))
-                        .unwrap_or(true);
-                    if empty {
+                    if !files_queued() {
                         tracing::info!("Wi-Fi Direct: all files pulled → restoring Wi-Fi");
                         restore_wifi(app).await;
                     } else if let Some(n) = crate::SYNC_NUDGE.get() {
@@ -1080,6 +1178,21 @@ pub(crate) fn spawn_heartbeat(
                         Duration::from_secs(2)
                     } else if had_trust && !lan_synced && consec_lan_fail <= 3 {
                         Duration::from_secs(2)
+                    } else if file_pull_active() {
+                        // A phone file batch is mid-pull. One file rides each
+                        // round, so the cadence IS the transfer rate here, and
+                        // the idle branches below are ruinous: with BLE live
+                        // the 240 s tick parked a five-file share for 2m34s
+                        // (then the whole batch landed in 8 s once a round
+                        // finally ran). Stay brisk while there is queued work,
+                        // easing off only after the phone has been unreachable
+                        // for a while so an offer it can no longer serve does
+                        // not spin a TCP+IK every 2 s forever.
+                        if consec_lan_fail <= 15 {
+                            Duration::from_secs(2)
+                        } else {
+                            Duration::from_secs(12)
+                        }
                     } else if auto_ble_writers.lock().await.is_empty() {
                         Duration::from_secs(12)
                     } else {

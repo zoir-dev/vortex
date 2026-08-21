@@ -29,6 +29,47 @@ pub struct LanReconnectOutcome {
     /// stale: (frame type, reassembled JSON bytes). Empty when everything
     /// matched, no request was made, or the peer predates BULK_SYNC.
     pub bulk: Vec<(u8, Vec<u8>)>,
+    /// Per-dataset outcome from the bulk-sync DONE frame, e.g.
+    /// `{"contacts":"match","clipboard_file":"nomatch"}`. `None` when no
+    /// request was made or the peer never sent a done frame (predates
+    /// BULK_SYNC, or the exchange broke off).
+    ///
+    /// Datasets report their own failures HERE and nowhere else: a "nomatch"
+    /// looks exactly like "nothing to send" in [`bulk`], so a caller holding a
+    /// pull request open (the instant-share file queue) needs this to learn
+    /// that what it asked for is never coming.
+    pub bulk_status: Option<BulkStatus>,
+}
+
+/// The bulk-sync done frame's per-dataset outcome map.
+#[derive(Debug, Clone, Default)]
+pub struct BulkStatus(std::collections::HashMap<String, String>);
+
+impl BulkStatus {
+    /// Parse the done frame's JSON body. Non-string values are ignored rather
+    /// than failing the whole map — one odd field must not blind the caller to
+    /// the rest.
+    fn parse(json: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+        let obj = v.as_object()?;
+        Some(Self(
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect(),
+        ))
+    }
+
+    /// What the phone reported for `dataset` ("sent" / "match" / "nomatch" /
+    /// "error" / "unknown"), or `None` if it said nothing about it.
+    pub fn get(&self, dataset: &str) -> Option<&str> {
+        self.0.get(dataset).map(String::as_str)
+    }
+
+    /// True when the phone answered about `dataset` and it was NOT served —
+    /// i.e. asking again is pointless until something changes on its side.
+    pub fn unservable(&self, dataset: &str) -> bool {
+        matches!(self.get(dataset), Some(s) if s != "sent")
+    }
 }
 
 #[derive(Debug)]
@@ -268,9 +309,13 @@ pub async fn run_lan_reconnect(
     // socket instead of a BLE notify burst. Skipped when the app-state
     // exchange already failed (transport unhealthy) or no request was made.
     let mut bulk: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut bulk_status: Option<BulkStatus> = None;
     if let (Some(req), Some(_)) = (bulk_request, peer_state.as_ref()) {
         match exchange_bulk(&mut stream, &mut transport, req, wait_per_step).await {
-            Ok(datasets) => bulk = datasets,
+            Ok((datasets, status)) => {
+                bulk = datasets;
+                bulk_status = status;
+            }
             Err(e) => tracing::warn!("bulk-sync exchange failed: {e}"),
         }
     }
@@ -296,6 +341,7 @@ pub async fn run_lan_reconnect(
         peer_counter,
         peer_state,
         bulk,
+        bulk_status,
     })
 }
 
@@ -416,7 +462,7 @@ async fn exchange_bulk(
     transport: &mut snow::TransportState,
     request_json: &str,
     wait: Duration,
-) -> Result<Vec<(u8, Vec<u8>)>, LanError> {
+) -> Result<(Vec<(u8, Vec<u8>)>, Option<BulkStatus>), LanError> {
     let plain = request_json.as_bytes();
     let mut ct = vec![0u8; plain.len() + 16];
     let n = transport.write_message(plain, &mut ct)?;
@@ -427,6 +473,7 @@ async fn exchange_bulk(
     info!("→ bulk-sync request ({} bytes)", plain.len());
 
     let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut status: Option<BulkStatus> = None;
     let mut contacts = crate::core::contacts::ContactsAssembler::default();
     let mut call_log = crate::core::call_log::CallLogAssembler::default();
     let mut sms = crate::core::sms::SmsAssembler::default();
@@ -468,6 +515,10 @@ async fn exchange_bulk(
         match frame.ty {
             ty::BULK_SYNC if frame.sub == 0x02 => {
                 info!("← bulk-sync done: {}", String::from_utf8_lossy(&pt));
+                status = BulkStatus::parse(&pt);
+                if status.is_none() {
+                    tracing::warn!("bulk-sync: done frame is not a JSON object; no status");
+                }
                 break;
             }
             ty::CONTACTS => {
@@ -579,6 +630,40 @@ async fn exchange_bulk(
             }
         }
     }
-    Ok(out)
+    Ok((out, status))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::BulkStatus;
+
+    #[test]
+    fn nomatch_is_unservable_and_sent_is_not() {
+        let s = BulkStatus::parse(br#"{"contacts":"match","clipboard_file":"nomatch"}"#).unwrap();
+        assert!(s.unservable("clipboard_file"));
+        assert_eq!(s.get("contacts"), Some("match"));
+
+        let s = BulkStatus::parse(br#"{"clipboard_file":"sent"}"#).unwrap();
+        assert!(!s.unservable("clipboard_file"));
+    }
+
+    #[test]
+    fn a_dataset_the_phone_said_nothing_about_is_not_unservable() {
+        // Never drop a queued pull on silence — only on an explicit answer.
+        let s = BulkStatus::parse(br#"{"contacts":"match"}"#).unwrap();
+        assert!(!s.unservable("clipboard_file"));
+        assert_eq!(s.get("clipboard_file"), None);
+    }
+
+    #[test]
+    fn errors_count_as_unservable_and_junk_parses_to_none() {
+        let s = BulkStatus::parse(br#"{"clipboard_file":"error"}"#).unwrap();
+        assert!(s.unservable("clipboard_file"));
+        // Non-string values are skipped, not fatal.
+        let s = BulkStatus::parse(br#"{"clipboard_file":"nomatch","n":7}"#).unwrap();
+        assert!(s.unservable("clipboard_file"));
+        assert!(BulkStatus::parse(b"[]").is_none());
+        assert!(BulkStatus::parse(b"not json").is_none());
+    }
+}

@@ -101,6 +101,12 @@ class LanServer(
      *  the stack can gate the redundant BLE burst. */
     var onBulkDelivered: (key: String, hash: String) -> Unit = { _, _ -> }
 
+    /** Fired after an instant-share FILE blob has been written to the peer,
+     *  with the content token it pulled by. Closes the loop the outgoing-offer
+     *  watchdog waits on: an offer is only really done once the laptop has the
+     *  bytes. */
+    var onFileServed: (token: String) -> Unit = { }
+
     /**
      * Watermark-dataset provider for bulk-sync (currently `sms_history`):
      * called with the peer's "I have everything up to [sinceMs]" watermark,
@@ -196,9 +202,68 @@ class LanServer(
     }
 
     private fun releasePerfLock() {
+        // A batch window ([keepLanHot]) owns the lock for its whole duration —
+        // the per-blob `finally` must not drop it between the laptop's rounds,
+        // which is exactly what let the radio park mid-batch.
+        if (lanHotJob?.isActive == true) return
         try { if (perfLock?.isHeld == true) perfLock?.release() } catch (_: Exception) {}
         perfLock = null
     }
+
+    /** Runs for the duration of the current "a file pull is imminent" window. */
+    @Volatile
+    private var lanHotJob: Job? = null
+
+    /** Bumped per window so a superseded expiry (the scope is multi-threaded:
+     *  an old timer can resume just as a new window opens) can't release the
+     *  locks the new window is holding. */
+    @Volatile
+    private var lanHotGen: Int = 0
+
+    /** Whether the persistent BLE link is up, per [setBleLinked] — decides
+     *  whether a closing hot window hands the multicast lock back or keeps it. */
+    @Volatile
+    private var bleLinked: Boolean = false
+
+    /**
+     * A phone→laptop file pull is imminent: file offers just went out over BLE
+     * and the laptop will dial us, ONE file per heartbeat round. Keep the LAN
+     * path hot for [ms] so those rounds land:
+     *
+     *  - hold the throughput Wi-Fi lock, so the radio doesn't park between
+     *    rounds and answer the laptop's cold TCP probe too late,
+     *  - hold the multicast lock and re-announce, so the laptop can find our
+     *    CURRENT address. While BLE is up we release that lock and answer no
+     *    mDNS, which leaves the laptop's cached IP as its only guess — and a
+     *    DHCP renew since the last successful handshake makes it a dead one.
+     *
+     * Repeat calls extend the window; only the first one re-announces. Returns
+     * true when this call OPENED the window, so a caller can pair it with a
+     * one-per-batch action (the BLE AppState push) instead of a per-file one.
+     */
+    fun keepLanHot(ms: Long = HOT_WINDOW_MS): Boolean {
+        val first = lanHotJob?.isActive != true
+        acquirePerfLock()
+        acquireMulticast()
+        if (first) {
+            nudge()
+            Log.i(TAG, "LAN hot: radio + mDNS held for an incoming file pull")
+        }
+        val gen = ++lanHotGen
+        lanHotJob?.cancel()
+        lanHotJob = scope.launch {
+            kotlinx.coroutines.delay(ms)
+            if (gen != lanHotGen) return@launch
+            // Clear before releasing: [releasePerfLock] refuses to drop the
+            // lock while a window is live, and this one is over.
+            lanHotJob = null
+            releasePerfLock()
+            if (bleLinked) releaseMulticast()
+            Log.i(TAG, "LAN hot window over (no file pull for ${ms}ms)")
+        }
+        return first
+    }
+
     /** Bound concurrent client handlers so a slow-loris attacker cannot
      *  pin every coroutine + socket FD on the device. */
     private val clientSlots = Semaphore(MAX_CONCURRENT_CLIENTS)
@@ -310,8 +375,12 @@ class LanServer(
      * is up; re-acquire the moment BLE drops and mDNS matters again.
      */
     fun setBleLinked(linked: Boolean) {
+        bleLinked = linked
         if (linked) {
-            releaseMulticast()
+            // Exception: a file pull in flight ([keepLanHot]) needs mDNS to
+            // answer, because the laptop's cached IP may be a dead lease and
+            // an unanswered browse leaves it nothing else to dial.
+            if (lanHotJob?.isActive != true) releaseMulticast()
         } else if (acceptJob != null) {
             acquireMulticast()
         }
@@ -681,11 +750,16 @@ class LanServer(
                                         Log.i(TAG, "bulk-sync: clipboard_file token=$token not found")
                                         status.put(key, "nomatch")
                                     } else {
-                                        acquirePerfLock()
-                                        try { sendChunked(FrameType.CLIPBOARD_FILE, blob) }
-                                        finally { releasePerfLock() }
+                                        // Extends the hot window: the laptop
+                                        // comes back for the NEXT queued file
+                                        // in a fresh round moments from now.
+                                        keepLanHot()
+                                        sendChunked(FrameType.CLIPBOARD_FILE, blob)
                                         Log.i(TAG, "bulk-sync: clipboard_file sent (${blob.size} bytes)")
                                         status.put(key, "sent")
+                                        try { onFileServed(token) } catch (e: Exception) {
+                                            Log.w(TAG, "onFileServed listener threw: ${e.message}")
+                                        }
                                     }
                                     continue
                                 }
@@ -1026,6 +1100,12 @@ class LanServer(
         const val IDLE_TIMEOUT_MS: Int = 90_000
         /** Cap on concurrent client coroutines (handshake + idle). */
         const val MAX_CONCURRENT_CLIENTS: Int = 16
+
+        /** How long [keepLanHot] keeps the radio + mDNS up after the last file
+         *  offer or served blob. Generous on purpose: the laptop needs one
+         *  heartbeat round PER queued file, and a round that misses its window
+         *  costs far more battery in retries than the lock costs held. */
+        const val HOT_WINDOW_MS: Long = 60_000
 
         /** Bulk-sync chunk payload size over TCP. Far larger than the 450B
          *  BLE chunks (TCP is reliable; only the 8KB frame cap binds) —
