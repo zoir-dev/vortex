@@ -1718,6 +1718,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "humantime",
+ "libc",
  "mdns-sd",
  "rand",
  "secret-service",

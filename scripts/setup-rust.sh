@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # 🦀 Vortex-Lab Rust environment setup helper
-# NOTE: This script performs guided setup and may invoke apt or rustup.
+# NOTE: This script performs guided setup and may invoke your distro package
+# manager (apt/dnf/pacman/zypper) or rustup.
 
 set -u
 
@@ -107,36 +108,28 @@ install_cargo_tool() {
   fi
 }
 
+# Hand the whole job to linux/packaging/install-deps.sh — it already knows the
+# package names for apt/dnf/pacman/zypper. The apt-only list that used to live
+# here failed outright on Fedora (no build-essential, no libssl-dev …) and
+# drifted from the real list every time a dependency was added.
 install_system_deps() {
-  warn "Rust and Tauri on Linux require several system packages."
-  printf '%s\n' "Packages:"
-  printf '%s\n' "  build-essential"
-  printf '%s\n' "  pkg-config"
-  printf '%s\n' "  libssl-dev"
-  printf '%s\n' "  libdbus-1-dev"
-  printf '%s\n' "  protobuf-compiler"
-  printf '%s\n' "  libwebkit2gtk-4.1-dev"
-  printf '%s\n' "  libayatana-appindicator3-dev"
-  printf '%s\n' "  librsvg2-dev"
+  local deps
+  deps="$(cd "$(dirname "$0")/.." && pwd)/linux/packaging/install-deps.sh"
 
-  if confirm "Run sudo apt update?"; then
-    sudo apt update
-  else
-    warn "Skipped apt update"
+  if [ ! -f "$deps" ]; then
+    fail "Not found: $deps"
+    warn "Install the Tauri/Rust build dependencies with your package manager by hand."
+    return 1
   fi
 
-  if confirm "Install the required system packages with apt?"; then
-    sudo apt install -y \
-      build-essential \
-      pkg-config \
-      libssl-dev \
-      libdbus-1-dev \
-      protobuf-compiler \
-      libwebkit2gtk-4.1-dev \
-      libayatana-appindicator3-dev \
-      librsvg2-dev
+  warn "Rust and Tauri on Linux require several system packages."
+  printf '%s\n' "They will be installed with your distro's package manager"
+  printf '%s\n' "(apt / dnf / pacman / zypper), which asks before each step."
+
+  if confirm "Run $deps now?"; then
+    bash "$deps" --ask || warn "Dependency step reported problems — check the output above"
   else
-    warn "Skipped apt package installation"
+    warn "Skipped system package installation"
   fi
 }
 

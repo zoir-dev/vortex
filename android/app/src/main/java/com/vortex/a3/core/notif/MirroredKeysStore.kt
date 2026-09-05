@@ -37,7 +37,12 @@ object MirroredKeysStore {
      *  worst case of losing the last write is one stale notification, which the
      *  reconnect catch-up already mitigates. */
     fun save(ctx: Context, keys: Set<String>) {
-        val bounded = if (keys.size > MAX) keys.take(MAX).toSet() else keys
+        // `take` on a HashSet takes an ARBITRARY subset — hash order, not
+        // recency — so trimming could equally well drop a notification that is
+        // on screen right now and keep one from hours ago. The dismissal of the
+        // dropped one then never syncs. An Android SBN key ends with the post
+        // ID, which increases over time, so sorting by key keeps the newest.
+        val bounded = if (keys.size > MAX) keys.sorted().takeLast(MAX).toSet() else keys
         try {
             prefs(ctx).edit().putStringSet(FIELD, bounded).apply()
         } catch (_: Throwable) {

@@ -62,27 +62,73 @@ pm_install() {
 # Fedora/Arch java-17-openjdk[-…], openSUSE /usr/lib64/jvm/java-17-openjdk-17.
 find_jdk() {
   local d
-  for d in /usr/lib/jvm/java-17-openjdk* /usr/lib64/jvm/java-17-openjdk* \
+  for d in "$HOME/.local/opt/jdk-21"* "$HOME/.local/opt/jdk-17"* \
+           /usr/lib/jvm/java-17-openjdk* /usr/lib64/jvm/java-17-openjdk* \
            /usr/lib/jvm/java-21-openjdk* /usr/lib64/jvm/java-21-openjdk*; do
     if [ -x "$d/bin/javac" ]; then echo "$d"; return 0; fi
   done
   return 1
 }
 
+# Portable JDK fallback — NOT optional polish. Fedora 44 ships ONLY
+# java-25-openjdk: no 17, no 21, so on a clean F44 box every distro package
+# name below fails and the install would otherwise dead-end. Temurin unpacks
+# into ~/.local/opt/jdk-21 (the first path find_jdk looks at), needs no sudo,
+# and touches nothing system-wide.
+install_portable_jdk() {
+  local arch tgz top
+  case "$(uname -m)" in
+    x86_64)  arch="x64" ;;
+    aarch64) arch="aarch64" ;;
+    *)       echo "✗ no portable JDK build for $(uname -m)"; return 1 ;;
+  esac
+  command -v curl >/dev/null 2>&1 || pm_install curl || return 1
+  echo "▶ this distro has no JDK 17/21 package — fetching a portable Temurin 21"
+  echo "  into ~/.local/opt/jdk-21 (no sudo, nothing system-wide is changed)…"
+  tgz="$(mktemp -t vortex-jdk-XXXXXX.tar.gz)"
+  if ! curl -fL --retry 3 -o "$tgz" \
+       "https://api.adoptium.net/v3/binary/latest/21/ga/linux/$arch/jdk/hotspot/normal/eclipse"; then
+    rm -f "$tgz"; return 1
+  fi
+  rm -rf "${HOME:?}/.local/opt/.jdk-unpack"
+  mkdir -p "$HOME/.local/opt/.jdk-unpack"
+  if ! tar -xzf "$tgz" -C "$HOME/.local/opt/.jdk-unpack"; then rm -f "$tgz"; return 1; fi
+  rm -f "$tgz"
+  top="$(find "$HOME/.local/opt/.jdk-unpack" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+  if [ -z "$top" ] || [ ! -x "$top/bin/javac" ]; then
+    echo "✗ the downloaded JDK has no bin/javac — ignoring it"
+    rm -rf "${HOME:?}/.local/opt/.jdk-unpack"; return 1
+  fi
+  rm -rf "${HOME:?}/.local/opt/jdk-21"
+  mv "$top" "$HOME/.local/opt/jdk-21"
+  rm -rf "${HOME:?}/.local/opt/.jdk-unpack"
+}
+
 if ! JAVA_HOME="$(find_jdk)"; then
-  echo "▶ JDK 17/21 not found — installing (this is the only sudo step)…"
+  echo "▶ JDK 17/21 not found — installing…"
   # One attempt with the CORRECT name for this distro (17, falling back to 21)
   # — a blind cross-distro name chain just buries the real error under
-  # "package not found" noise.
+  # "package not found" noise. No PM at all is fine too: we fall through to
+  # the portable JDK below.
   case "$PM" in
     apt-get)    pm_install openjdk-17-jdk-headless || pm_install openjdk-21-jdk-headless || true ;;
     dnf|zypper) pm_install java-17-openjdk-devel   || pm_install java-21-openjdk-devel   || true ;;
     pacman)     pm_install jdk17-openjdk           || pm_install jdk21-openjdk           || true ;;
-    *)          pm_install jdk || true ;;
   esac
+  find_jdk >/dev/null 2>&1 || install_portable_jdk || true
   if ! JAVA_HOME="$(find_jdk)"; then
-    echo "✗ JDK still not found — see the package-manager error above, fix it"
-    echo "  (e.g. sudo apt install openjdk-17-jdk-headless) and re-run."
+    # Name the package for the distro we are ACTUALLY on. Printing an apt name
+    # on Fedora once sent a user hunting for a package that cannot exist there.
+    case "$PM" in
+      apt-get) hint="sudo apt install openjdk-21-jdk-headless" ;;
+      dnf)     hint="sudo dnf install java-21-openjdk-devel" ;;
+      zypper)  hint="sudo zypper install java-21-openjdk-devel" ;;
+      pacman)  hint="sudo pacman -S jdk21-openjdk" ;;
+      *)       hint="install a JDK 17 or 21 with your package manager" ;;
+    esac
+    echo "✗ JDK still not found — see the error above, fix it and re-run."
+    echo "  Distro package: $hint"
+    echo "  Or by hand:     unpack a JDK 17/21 into ~/.local/opt/jdk-21"
     exit 1
   fi
 fi
@@ -144,7 +190,13 @@ if ! command -v adb >/dev/null 2>&1; then
   esac
   if ! command -v adb >/dev/null 2>&1; then
     echo "✗ adb still not found — see the package-manager error above, fix it"
-    echo "  (apt: adb, others: android-tools) and re-run."
+    case "$PM" in
+      apt-get) echo "  (sudo apt install adb) and re-run." ;;
+      dnf)     echo "  (sudo dnf install android-tools) and re-run." ;;
+      zypper)  echo "  (sudo zypper install android-tools) and re-run." ;;
+      pacman)  echo "  (sudo pacman -S android-tools) and re-run." ;;
+      *)       echo "  (install the package providing adb) and re-run." ;;
+    esac
     exit 1
   fi
 fi

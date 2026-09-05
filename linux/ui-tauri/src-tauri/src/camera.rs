@@ -11,7 +11,7 @@
 //! same direction the phone→laptop screen mirror uses).
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use gst::prelude::*;
@@ -26,6 +26,11 @@ use vortex_l3_daemon::core::mirror_tcp;
 /// webcam"). Read by the AppState builder → `camera_req`; the phone streams only
 /// while it's set. The actual v4l2 pipe starts when the phone's offer arrives.
 pub static CAMERA_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// Consecutive failed pipeline starts, and how many we tolerate before
+/// releasing the phone's camera. See the dispatch handler.
+static START_FAILS: AtomicU32 = AtomicU32::new(0);
+const START_FAIL_LIMIT: u32 = 3;
 
 /// "A camera session is engaged." The phone's offer arrives over BOTH BLE and
 /// LAN at nearly the same instant; without an atomic gate both dispatchers race
@@ -50,9 +55,28 @@ pub fn camera_facing() -> String {
 
 /// Tauri command: the UI toggles "use phone as webcam".
 #[tauri::command]
-pub(crate) fn set_camera_request(on: bool) {
+pub(crate) fn set_camera_request(on: bool) -> Result<(), String> {
+    // Check the loopback device BEFORE asking the phone for its camera.
+    //
+    // It used to be checked only deep inside `start()`, whose failure was a
+    // `tracing::warn!` and nothing else: `CAMERA_WANTED` stayed true, so the
+    // phone kept `camera_req=true`, kept its camera open with the indicator lit,
+    // and every heartbeat dialled again — while the laptop showed nothing and
+    // said nothing. On a fresh Fedora, where the module has to be loaded by
+    // hand, that is the DEFAULT experience of this feature.
+    //
+    // The message names the exact modprobe line. Loading the module is the
+    // user's to do, not ours: it is a system-wide kernel module, and vortex does
+    // not install those behind anyone's back.
+    if on {
+        if let Err(e) = resolve_v4l2_device() {
+            tracing::warn!("continuity-camera: refusing to start — {e}");
+            return Err(e);
+        }
+    }
     tracing::info!(on, "continuity-camera: request toggled");
     set_wanted(on);
+    Ok(())
 }
 
 /// Tauri command: flip the phone lens (front ↔ back). The phone re-opens the
@@ -123,6 +147,19 @@ pub fn dispatch_offer(offer: &Option<CameraOffer>, phone_ip: Option<IpAddr>) {
                 if let Err(e) = start(ip, key, o.rot) {
                     tracing::warn!("continuity-camera: start failed: {e}");
                     ENGAGED.store(false, Ordering::SeqCst);
+                    // Repeated failure means it is not going to work this
+                    // session. Stop asking, so the phone can close its camera
+                    // instead of holding it open for a stream nobody receives.
+                    if START_FAILS.fetch_add(1, Ordering::SeqCst) + 1 >= START_FAIL_LIMIT {
+                        START_FAILS.store(0, Ordering::SeqCst);
+                        tracing::warn!(
+                            "continuity-camera: giving up after {START_FAIL_LIMIT} failed starts \
+                             — releasing the phone's camera"
+                        );
+                        set_wanted(false);
+                    }
+                } else {
+                    START_FAILS.store(0, Ordering::SeqCst);
                 }
             }
         }

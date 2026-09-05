@@ -8,7 +8,9 @@ version = "1.0.0-beta.6"
 license = "GPL-3.0-or-later"
 description = "Vortex Tauri UI"
 edition = "2021"
-rust-version = "1.77"
+# 1.80 for `LazyLock` (the tray icon) — and ksni, our StatusNotifierItem, sets
+# the same floor, so nothing older could build this crate anyway.
+rust-version = "1.80"
 
 [lib]
 name = "vortex_ui_tauri_lib"
@@ -81,3 +83,4 @@ reis = { version = "0.3", features = ["tokio"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Fresh random per-cast media key for the laptop→phone screen stream.
 rand = "0.8"
+ksni = "0.3"

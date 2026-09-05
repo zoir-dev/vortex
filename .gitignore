@@ -150,3 +150,9 @@ benchmarks/results/
 .tmp-build/
 *.tsbuildinfo
 .eslintcache
+
+# Local AI-assistant workspace config — personal to whoever is working here,
+# not project files. Untracked they would also block scripts/publish.sh, whose
+# first check is a clean tree.
+.agents/
+GEMINI.md

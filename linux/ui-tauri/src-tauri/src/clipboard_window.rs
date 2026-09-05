@@ -76,124 +76,6 @@ fn panel_geometry(app: &AppHandle) -> (f64, f64, f64) {
     (height, x, y)
 }
 
-/// Put the keyboard on the popup via a direct X11 `SetInputFocus`. Tauri's
-/// `set_focus()` only ASKS the WM, but under Wayland+XWayland Mutter's
-/// focus-stealing prevention denies a focus request lacking a fresh
-/// user-activation timestamp — and the Super+V press went to gnome-shell, not to
-/// our already-running process. Without real focus the search box never gets the
-/// caret AND the window never emits `Focused(false)`, so click-outside can't
-/// auto-hide it. Going straight to X bypasses the WM policy.
-///
-/// Asking ONCE is not enough, which is what made this flaky: `show()` maps the
-/// window asynchronously and X refuses `SetInputFocus` on a window that is not
-/// yet viewable, and Mutter can take focus back a beat after it is granted. So
-/// ask, then VERIFY with `GetInputFocus`, and keep at it until X agrees.
-fn force_x11_focus() {
-    std::thread::spawn(|| {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::{
-            AtomEnum, ConfigureWindowAux, ConnectionExt, InputFocus, MapState, StackMode,
-        };
-
-        fn find(conn: &impl Connection, win: u32, target: &str) -> Option<u32> {
-            if let Ok(r) =
-                conn.get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
-            {
-                if let Ok(r) = r.reply() {
-                    if !r.value.is_empty()
-                        && String::from_utf8_lossy(&r.value).contains(target)
-                    {
-                        return Some(win);
-                    }
-                }
-            }
-            let tree = conn.query_tree(win).ok()?.reply().ok()?;
-            for child in tree.children {
-                if let Some(w) = find(conn, child, target) {
-                    return Some(w);
-                }
-            }
-            None
-        }
-
-        /// X may report focus on a DESCENDANT of our toplevel (WebKitGTK nests
-        /// its own X windows), which is still our window having the keyboard.
-        fn owns(conn: &impl Connection, ancestor: u32, mut win: u32) -> bool {
-            for _ in 0..8 {
-                if win == ancestor {
-                    return true;
-                }
-                let Some(parent) = conn
-                    .query_tree(win)
-                    .ok()
-                    .and_then(|c| c.reply().ok())
-                    .map(|r| r.parent)
-                else {
-                    return false;
-                };
-                if parent == 0 || parent == win {
-                    return false;
-                }
-                win = parent;
-            }
-            false
-        }
-
-        let Ok((conn, screen)) = x11rb::connect(None) else {
-            return;
-        };
-        let root = conn.setup().roots[screen].root;
-
-        // Resolve the id once: the tree walk costs a round-trip PER window, so
-        // paying it on every open is both slow and pointless for a window we
-        // only ever hide.
-        let mut win = CLIP_XID.load(Ordering::Relaxed);
-        if win == 0 {
-            for _ in 0..25 {
-                std::thread::sleep(std::time::Duration::from_millis(40));
-                if let Some(w) = find(&conn, root, "Vortex Clipboard") {
-                    win = w;
-                    CLIP_XID.store(w, Ordering::Relaxed);
-                    break;
-                }
-            }
-            if win == 0 {
-                tracing::warn!("clipboard popup: X window never appeared; focus not forced");
-                return;
-            }
-        }
-
-        for attempt in 0..40 {
-            if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            let viewable = conn
-                .get_window_attributes(win)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|a| a.map_state == MapState::VIEWABLE)
-                .unwrap_or(false);
-            if !viewable {
-                continue; // still mapping — SetInputFocus would be a BadMatch
-            }
-            let _ = conn
-                .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
-            let _ = conn.set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME);
-            let _ = conn.flush();
-            let focused = conn
-                .get_input_focus()
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|r| r.focus)
-                .unwrap_or(0);
-            if focused != 0 && owns(&conn, win, focused) {
-                return; // X confirms we hold the keyboard
-            }
-        }
-        tracing::warn!("clipboard popup: X never confirmed keyboard focus");
-    });
-}
-
 fn schedule_group_hide(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
@@ -282,7 +164,13 @@ pub(crate) fn show_clipboard_window(app: &AppHandle) {
     let _ = w.set_position(tauri::LogicalPosition::new(x, y));
     let _ = w.show();
     let _ = w.set_focus();
-    force_x11_focus();
+    // Mutter would otherwise deny the focus request: the Super+V press went to
+    // gnome-shell, not to us. See `x11_focus`.
+    crate::x11_focus::raise_and_focus(
+        |t| t.contains("Vortex Clipboard"),
+        &CLIP_XID,
+        "clipboard popup",
+    );
     let _ = w.eval("window.__vortexRearm && window.__vortexRearm()");
     tracing::info!("clipboard popup: shown");
 }

@@ -232,6 +232,78 @@ pub(crate) struct AudioSetup {
 /// (with its race-for-first-success sender), the smart audio-follow
 /// watcher, the media runtime, the post-switch resume watcher, and the
 /// orchestrator→webview switch-state bridge. Split out of run_worker.
+/// Put the saved earbuds' card back on A2DP when it ends up headset-only
+/// outside any switch flow.
+///
+/// `ensure_card_on_a2dp` already exists, but it only ever runs INSIDE
+/// `connect_audio` — so it covers switches vortex performed and nothing else.
+/// When the earbuds reconnect to this laptop on their own (they do; they are
+/// paired here) and A2DP fails to come up, the card is left with only headset
+/// profiles: playback is 16 kHz mono, or nothing at all. WirePlumber says as
+/// much and gives up — "Could not find valid non-headset profile, not
+/// switching" — four times in a week here, with no vortex activity anywhere
+/// near it.
+///
+/// Deliberately narrow. It touches ONE card, the saved earbuds', and only when
+/// three things hold: they are connected here, the card is on a headset
+/// profile, and nobody is using the microphone (that is a call, and a call is
+/// exactly when the headset profile is correct). It is a per-device
+/// `set-card-profile` — nothing global, nothing that outlives vortex.
+pub(crate) fn spawn_a2dp_profile_watch(adapter: bluer::Adapter, mac: String) {
+    tokio::spawn(async move {
+        let Ok(addr) = mac.parse::<bluer::Address>() else { return };
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tick.tick().await;
+            // Only while the buds are actually here.
+            if !vortex_l3_daemon::core::audio_switch::audio_active(&adapter, addr).await {
+                continue;
+            }
+            if vortex_l3_daemon::core::audio_switch::a2dp_card_active(&mac).await {
+                continue;
+            }
+            // A live call is the legitimate reason to be on headset.
+            if laptop_on_headset_call() {
+                continue;
+            }
+            tracing::info!(%mac, "earbuds are here but the card is headset-only — repairing");
+            let _ =
+                vortex_l3_daemon::core::audio_switch::ensure_card_on_a2dp(&adapter, addr, &mac)
+                    .await;
+        }
+    });
+}
+
+/// Cached answer to "is this laptop on a Bluetooth call right now".
+///
+/// Cached because the acceptance provider is synchronous and is consulted on the
+/// frame-handling path, where forking `pactl` twice is not acceptable. Refreshed
+/// by [`spawn_headset_call_watch`] on a slow tick; a couple of seconds of
+/// staleness is harmless, since a call lasts far longer than that.
+static LAPTOP_ON_HEADSET_CALL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn laptop_on_headset_call() -> bool {
+    LAPTOP_ON_HEADSET_CALL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Keep [`laptop_on_headset_call`] current for the saved earbuds.
+pub(crate) fn spawn_headset_call_watch(mac: String) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut last = false;
+        loop {
+            tick.tick().await;
+            let now = vortex_l3_daemon::core::audio_switch::headset_mic_in_use(&mac).await;
+            if now != last {
+                tracing::info!(on_call = now, "laptop headset-call state changed");
+                last = now;
+            }
+            LAPTOP_ON_HEADSET_CALL.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
 pub(crate) async fn setup_audio(
     app: &tauri::AppHandle,
     adapter: &bluer::Adapter,
@@ -332,10 +404,32 @@ pub(crate) async fn setup_audio(
                         }
                     })
                 }),
-                Arc::new(|| vortex_l3_daemon::core::audio_orchestrator::Acceptance::Allow),
+                // Owner-vote: the laptop refuses to hand the earbuds over while
+                // it is the one on a call.
+                //
+                // This side always answered Allow, so a phone-side media start
+                // could pull the earbuds — and the microphone with them — out of
+                // a live meeting here, mid-sentence. The phone has had exactly
+                // this gate since Phase 2; the laptop never got its half.
+                Arc::new(|| {
+                    if laptop_on_headset_call() {
+                        vortex_l3_daemon::core::audio_orchestrator::Acceptance::Reject(
+                            vortex_l3_daemon::core::audio_op::RejectReason::InCall,
+                        )
+                    } else {
+                        vortex_l3_daemon::core::audio_orchestrator::Acceptance::Allow
+                    }
+                }),
             )
         });
     switch_orchestrator.recover_on_start().await;
+
+    // Keep the "am I on a call through these earbuds" flag fresh for the
+    // acceptance gate above.
+    if let Some(saved) = get_saved_earbuds() {
+        spawn_headset_call_watch(saved.address.clone());
+        spawn_a2dp_profile_watch(adapter.clone(), saved.address.clone());
+    }
 
     // ----- First-run earbuds adoption. On a fresh install, if a
     //       Bluetooth audio device is already connected to this laptop
@@ -464,6 +558,126 @@ pub(crate) async fn setup_audio(
                     });
                 }
                 was_active = active;
+            }
+        });
+    }
+
+    // Safety net for the resume above. That watcher hangs the resume off a
+    // switch-flow EDGE, which silently assumes a flow always runs after a
+    // call. It doesn't: the phone's post-call reclaim rides the one-shot
+    // `audio_claim_request`, and when that never lands — BLE down, LAN beat
+    // missed, or the claim deferred past its window — no flow starts, no
+    // edge fires, and the media we paused for the call stays paused with
+    // the buds sitting right here. (Observed 2026-08-24: six claims
+    // dropped, one resume.) So poll the same preconditions directly.
+    //
+    // Deliberately conservative — it only ever un-sticks, never routes:
+    //   * the call must be over on BOTH signals we have (`media_in_call`
+    //     from AppState, and the locally-owned call pill),
+    //   * the orchestrator must be settled, so a live flow keeps ownership
+    //     of the resume and this can't double-fire against the edge above,
+    //   * the buds must be ON THIS LAPTOP — resuming otherwise would blast
+    //     the speakers, the exact regression the strict routing rule exists
+    //     to prevent,
+    //   * and all of that must hold for two consecutive polls, so the edge
+    //     watcher always wins the normal path and we only step in when it
+    //     genuinely never fired.
+    // `resume_paused_for_call` brings its own 5-minute staleness TTL, so a
+    // long call still declines to surprise the user with audio.
+    {
+        let store = media_store.clone();
+        let in_call = media_in_call.clone();
+        let adapter_n = adapter.clone();
+        let orch_n = switch_orchestrator.clone();
+        let peers_n = peer_store.clone();
+        tokio::spawn(async move {
+            use vortex_l3_daemon::core::audio_orchestrator::SwitchState;
+            const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+            let mut stable = 0u8;
+            // Consecutive polls where the call is over, our media is held, and
+            // the buds are on neither device.
+            let mut idle_polls = 0u8;
+            loop {
+                tokio::time::sleep(POLL).await;
+                // Cheap synchronous gates first; the `Ref` from the watch
+                // channel is dropped on this statement, never held across
+                // the awaits below.
+                let call_over = !in_call.load(std::sync::atomic::Ordering::Relaxed)
+                    && !crate::call::call_pill_active();
+                let settled = matches!(
+                    *orch_n.state().borrow(),
+                    SwitchState::Idle | SwitchState::Failed(_)
+                );
+                let eligible = if !(call_over && settled && store.read().await.is_paused()) {
+                    false
+                } else {
+                    // Last, because it's the only gate that costs a D-Bus
+                    // round-trip.
+                    match vortex_l3_daemon::core::earbuds_store::load()
+                        .and_then(|s| s.address.parse::<bluer::Address>().ok())
+                    {
+                        Some(addr) => {
+                            vortex_l3_daemon::core::audio_switch::audio_active(&adapter_n, addr)
+                                .await
+                        }
+                        None => false,
+                    }
+                };
+                if !eligible {
+                    // The call is over and our media is still held, but the
+                    // buds are not here. Nobody is going to bring them: the
+                    // phone's post-call hand-back is a single fire-and-forget
+                    // Claim, and if the laptop was asleep or out of range when
+                    // it went out, that flag is consumed and never re-sent. The
+                    // buds sit on nobody and the media stays paused until the
+                    // user reaches for the tray.
+                    //
+                    // We know which earbuds they are, so ask for them
+                    // ourselves. `request` is a no-op unless the orchestrator is
+                    // Idle, so this can never cut across a live flow.
+                    if call_over && settled && store.read().await.is_paused() {
+                        idle_polls = idle_polls.saturating_add(1);
+                        // ~10s of the buds being on nobody before stepping in,
+                        // so the normal hand-back always wins the race.
+                        if idle_polls == 5 {
+                            let peer = {
+                                let ps = peers_n.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    ps.list().unwrap_or_default().first().map(|p| p.peer_static_pub)
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                            };
+                            if let (Some(saved), Some(peer)) =
+                                (vortex_l3_daemon::core::earbuds_store::load(), peer)
+                            {
+                                tracing::info!(
+                                    "call over and the buds are on nobody — reclaiming them here"
+                                );
+                                let _ = orch_n.request(peer, saved.address.clone()).await;
+                            }
+                        }
+                    } else {
+                        idle_polls = 0;
+                    }
+                    stable = 0;
+                    continue;
+                }
+                idle_polls = 0;
+                stable = stable.saturating_add(1);
+                if stable < 2 {
+                    continue;
+                }
+                stable = 0;
+                let resumed =
+                    vortex_l3_daemon::core::media_runtime::resume_paused_for_call(&store).await;
+                if !resumed.is_empty() {
+                    tracing::info!(
+                        ?resumed,
+                        "media resumed after call (safety net — no switch flow ever fired)"
+                    );
+                }
             }
         });
     }

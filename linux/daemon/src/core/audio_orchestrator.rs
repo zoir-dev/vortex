@@ -138,6 +138,10 @@ pub struct SwitchOrchestrator {
     state_tx: watch::Sender<SwitchState>,
     state_rx: watch::Receiver<SwitchState>,
     initiator: Arc<Mutex<Option<ActiveFlow>>>,
+    /// Bumped every time a flow starts. A `connect_profile` that outlives its
+    /// own flow compares this before acting on its result — see
+    /// [`Self::attempt_connect`].
+    flow_gen: Arc<std::sync::atomic::AtomicU64>,
     responder: Arc<Mutex<Option<ActiveFlow>>>,
     /// Identity of the in-flight flow, kept in sync with [`Self::initiator`]
     /// so the persistence row captures *which* peer + mac the current
@@ -170,6 +174,7 @@ impl SwitchOrchestrator {
             state_tx,
             state_rx,
             initiator: Arc::new(Mutex::new(None)),
+            flow_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             responder: Arc::new(Mutex::new(None)),
             current_peer: Arc::new(Mutex::new(None)),
             current_mac: Arc::new(Mutex::new(None)),
@@ -350,6 +355,7 @@ impl SwitchOrchestrator {
         // returns to Idle so later switches aren't dropped as "busy".
         self.arm_flow_watchdog();
 
+        self.flow_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let Some(nonce) = next_out_nonce(&self.peer_store, peer_pub).await else {
             self.fail_initiator("nonce store unavailable".to_string());
             return;
@@ -431,16 +437,77 @@ impl SwitchOrchestrator {
         let _ = self.cas_state(SwitchState::Connecting, SwitchState::AlmostDone);
     }
 
-    /// Reject is the only NACK that matters — peer refuses to release
-    /// (e.g. Phase 2 InCall). Surface to UI and stop retrying.
-    async fn on_reject(&self, peer_pub: [u8; 32], reason: RejectReason) {
+    /// Reject is the only NACK that matters — peer refuses to release.
+    ///
+    /// `InCall` is treated as TEMPORARY rather than final, because on the
+    /// measured deployment it almost never meant what it says. The phone keeps
+    /// an ended call in its state for ~6 s so the laptop can clear the call
+    /// pill promptly, and its acceptance gate reads that same field — so the
+    /// hand-back it had just asked for came back refused, and this function
+    /// made the refusal terminal. 19 of 20 switch failures in a week were this
+    /// one loop, and the earbuds were left on neither device.
+    ///
+    /// The phone side now honours a Request answering its own Claim, which
+    /// removes the cause. This is the belt to that pair of braces: even against
+    /// an older phone build, a call that has genuinely just ended stops being
+    /// "in call" within seconds, so the right response is to ask again rather
+    /// than to give up. Anything else really is the peer saying no.
+    async fn on_reject(self: Arc<Self>, peer_pub: [u8; 32], reason: RejectReason) {
         let g = self.initiator.lock().await;
         let Some(ref f) = *g else { return };
         if f.peer_pub != peer_pub {
             return;
         }
+        let mac = f.mac.clone();
         drop(g);
-        self.fail_initiator(format!("peer rejected: {reason:?}"));
+        if !matches!(reason, RejectReason::InCall) {
+            self.fail_initiator(format!("peer rejected: {reason:?}"));
+            return;
+        }
+        info!(?peer_pub, "peer rejected: InCall — retrying rather than giving up");
+        let me = self.clone();
+        tokio::spawn(async move {
+            // 1s, 2s, 4s: covers the phone's ~6 s post-call linger without
+            // hammering, and gives up well before a user would try by hand.
+            for wait_ms in [1_000u64, 2_000, 4_000] {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                // Someone else moved the flow on — nothing left to retry.
+                let s = me.state_rx.borrow().clone();
+                if matches!(s, SwitchState::Idle | SwitchState::Failed(_)) {
+                    return;
+                }
+                if me.resend_request(peer_pub, &mac).await {
+                    return; // asked again; the answer arrives as its own event
+                }
+            }
+            me.fail_initiator("peer rejected: InCall (still in a call after 7s)".into());
+        });
+    }
+
+    /// Send another `Request` for the same flow. `true` when it went out.
+    ///
+    /// Used only by the InCall retry above: the flow is already in-flight, so
+    /// this re-asks rather than starting anything new.
+    async fn resend_request(&self, peer_pub: [u8; 32], mac: &str) -> bool {
+        let Some(nonce) = next_out_nonce(&self.peer_store, peer_pub).await else {
+            return false;
+        };
+        let frame = AudioOpFrame {
+            nonce,
+            op: AudioOp::Request,
+            mac: mac.to_string(),
+            ts: now_sec(),
+        };
+        match (self.sender)(peer_pub, frame).await {
+            Ok(()) => {
+                info!(?peer_pub, %mac, nonce, "initiator: re-requesting buds after InCall");
+                true
+            }
+            Err(e) => {
+                warn!("resend Request: {e}");
+                false
+            }
+        }
     }
 
     /// Retry-driven local BT connect. The first attempt fires
@@ -450,6 +517,13 @@ impl SwitchOrchestrator {
     /// roughly the time it takes BlueZ to notice a peer-side
     /// disconnect, so by attempt 2 or 3 we usually win.
     async fn attempt_connect(self: Arc<Self>, peer_pub: [u8; 32], mac: String) {
+        // The flow this attempt belongs to. A watchdog reset or a peer
+        // Reject can retire our flow and let a NEW one start while a
+        // `connect_profile` from this one is still in BlueZ — that call can
+        // outlive the 14s watchdog by a wide margin. Its late result then
+        // flipped the NEW flow to Idle mid-connect, or dragged it to Failed.
+        // Carrying the generation makes a stale continuation harmless.
+        let my_gen = self.flow_gen.load(std::sync::atomic::Ordering::SeqCst);
         let mut last_err = String::from("connect not attempted");
         for attempt in 1..=CONNECT_RETRY_COUNT {
             // If a peer Reject arrived between attempts, bail out — the
@@ -464,7 +538,22 @@ impl SwitchOrchestrator {
             }
             match self.bt.connect(&mac).await {
                 Ok(()) => {
+                    if self.flow_gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                        tracing::info!("attempt_connect: a newer flow owns this now — dropping our result");
+                        return;
+                    }
                     info!(?peer_pub, attempt, "initiator: switch complete");
+                    // Clear the crash-recovery row here as well as in `cas_state`.
+
+                    // This path transitions through `send_if_modified`, which does not
+
+                    // touch persistence — so a COMPLETED switch left "connecting" on
+
+                    // disk, and the next launch rolled it back as stale and spent three
+
+                    // seconds in Failed. A claim arriving in that window was dropped.
+
+                    let _ = crate::core::audio_switch_persistence::clear();
                     // Transition to Idle FIRST so the UI clears
                     // "Switching…" and the lib.rs route+resume watcher
                     // fires immediately. Without this, a slow
@@ -1358,8 +1447,9 @@ mod tests {
 
         orch.request(PEER, MAC.to_string()).await.unwrap();
         wait_state(&mut rx, |s| *s == SwitchState::Connecting).await;
+        // A reason other than InCall is the peer genuinely saying no.
         orch.clone()
-            .on_incoming(PEER, frame(1, AudioOp::Reject { reason: RejectReason::InCall }))
+            .on_incoming(PEER, frame(1, AudioOp::Reject { reason: RejectReason::Busy }))
             .await
             .unwrap();
 
@@ -1367,6 +1457,37 @@ mod tests {
         if let SwitchState::Failed(r) = st {
             assert!(r.contains("rejected"), "reason should mention the peer reject: {r}");
         }
+    }
+
+    /// `InCall` must NOT be terminal.
+    ///
+    /// The old behaviour — any Reject ends the flow — is what made every
+    /// post-call hand-back fail: the phone holds an ended call in its state for
+    /// ~6 s so the laptop can clear the call pill, and its acceptance gate reads
+    /// the same field, so it refused the hand-off it had itself just asked for.
+    /// This test exists to keep the retry, and to keep `Failed` from appearing
+    /// during the window where a retry is still pending.
+    #[tokio::test(start_paused = true)]
+    async fn initiator_in_call_reject_retries_instead_of_failing() {
+        let _env = isolate_persist();
+        let bt = Arc::new(FakeBt::new(false).with_connect(Outcome::Hang)); // hold in Connecting
+        let (orch, _cap) = make_orch(bt.clone());
+        let mut rx = orch.state();
+
+        orch.request(PEER, MAC.to_string()).await.unwrap();
+        wait_state(&mut rx, |s| *s == SwitchState::Connecting).await;
+        orch.clone()
+            .on_incoming(PEER, frame(1, AudioOp::Reject { reason: RejectReason::InCall }))
+            .await
+            .unwrap();
+
+        // Give the first backoff step (1s) room to run under paused time.
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        let st = rx.borrow().clone();
+        assert!(
+            !matches!(st, SwitchState::Failed(_)),
+            "InCall must not end the flow while a retry is still pending, got {st:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

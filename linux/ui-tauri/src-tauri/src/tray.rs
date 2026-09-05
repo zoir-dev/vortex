@@ -1,29 +1,147 @@
-//! System-tray icon + menu. Split out of lib.rs; `run()`'s setup hook
-//! calls [`setup`] once at startup.
+//! System-tray icon + menu, spoken as StatusNotifierItem ourselves (ksni).
+//!
+//! NOT Tauri's tray, and the reason is the click. On Linux Tauri goes through
+//! libayatana-appindicator, whose D-Bus item exposes no `Activate` method at
+//! all — only `Scroll` and `SecondaryActivate`. GNOME's appindicator extension
+//! calls `Activate` on a DOUBLE click and disables the gesture outright when
+//! the method is missing (`supportsActivation === false`), so
+//! double-click-to-open — what every other tray app does, Telegram included —
+//! could not be made to work from the app side. `on_tray_icon_event` never
+//! fires there either: tray-icon documents click events as unsupported on
+//! Linux. Speaking the spec ourselves puts `Activate` back on the item, and
+//! with it the double click (KDE and XFCE activate on a single click).
+//!
+//! `run()`'s setup hook calls [`setup`] once at startup.
 
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
-};
+use ksni::{menu::StandardItem, Handle, Icon, MenuItem, ToolTip, Tray, TrayMethods};
 
 use vortex_l3_daemon::core::appstate::{AppState, EarbudsInfo};
 
 use crate::{CmdChannel, UiCmd};
 
-/// The tray's battery-readout menu items, kept in managed state so the
-/// heartbeat can update their text as batteries change. Two plain `MenuItem`
-/// rows (earbuds + phone) with word labels ("Buds"/"Phone") instead of emoji
-/// or image icons: the Linux backend (libayatana-appindicator) renders
-/// neither custom menu-item icons (IconMenuItem) nor color emoji — both come
-/// out blank/invisible on dark themes. Plain text renders in the theme color
-/// (visible in dark mode) AND updates live via `set_text`.
-pub(crate) struct BatteryMenuItem {
-    pub(crate) buds: MenuItem<tauri::Wry>,
-    pub(crate) phone: MenuItem<tauri::Wry>,
+/// White monochrome BRAND SPIRAL for the status area. Like Telegram / Cursor,
+/// we ship ONE fixed light icon rather than swapping per theme: the
+/// GNOME/Ubuntu top bar is dark even in light mode, and Linux SNI hosts render
+/// the pixmap as-is (no auto-recolor), so a single white glyph reads
+/// everywhere. Embedded via include_bytes so it works from the standalone prod
+/// binary.
+static ICON: LazyLock<Vec<Icon>> = LazyLock::new(|| {
+    let Ok(img) = image::load_from_memory_with_format(
+        include_bytes!("../icons/tray.png"),
+        image::ImageFormat::Png,
+    ) else {
+        tracing::warn!("tray: icon failed to decode; falling back to a themed name");
+        return Vec::new();
+    };
+    // Offer panel sizes rather than the 512px source: the host picks the one it
+    // wants and the pixmap crosses D-Bus on every read, so a megabyte of ARGB
+    // per icon change is a megabyte wasted. 64 covers a 1x panel, 128 a HiDPI
+    // one.
+    [64u32, 128]
+        .iter()
+        .map(|&s| {
+            let scaled = img.resize_exact(s, s, image::imageops::FilterType::Lanczos3);
+            let mut data = scaled.into_rgba8().into_vec();
+            for px in data.chunks_exact_mut(4) {
+                px.rotate_right(1); // RGBA → ARGB32, which is what the spec asks for
+            }
+            Icon { width: s as i32, height: s as i32, data }
+        })
+        .collect()
+});
+
+/// The live tray. Its fields ARE the rendered menu: ksni asks for `menu()`
+/// again after every [`Handle::update`], so a battery change is a field write.
+struct VortexTray {
+    app: tauri::AppHandle,
+    /// Battery readout rows, as plain WORD labels ("Buds"/"Phone") rather than
+    /// emoji or item icons: SNI hosts render neither custom menu-item icons nor
+    /// color emoji reliably — both come out blank on dark themes. Plain text
+    /// renders in the theme color everywhere.
+    buds: String,
+    phone: String,
+    tooltip: String,
 }
+
+impl Tray for VortexTray {
+    fn id(&self) -> String {
+        "vortex".into()
+    }
+
+    fn title(&self) -> String {
+        "Vortex".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        ICON.clone()
+    }
+
+    fn tool_tip(&self) -> ToolTip {
+        ToolTip {
+            title: self.tooltip.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Double-click on GNOME, single click on KDE/XFCE.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        crate::window::toggle_main(&self.app);
+    }
+
+    /// Middle click — the same thing, since the alternative is nothing at all.
+    fn secondary_activate(&mut self, _x: i32, _y: i32) {
+        crate::window::toggle_main(&self.app);
+    }
+
+    fn menu(&self) -> Vec<MenuItem<Self>> {
+        vec![
+            StandardItem {
+                label: self.phone.clone(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: self.buds.clone(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Switch earbuds".into(),
+                // Toggle the buds between this laptop and the phone. The
+                // callback must not block — the menu is frozen until it
+                // returns — so it only posts to the worker.
+                activate: Box::new(|t: &mut Self| {
+                    use tauri::Manager;
+                    if let Some(ch) = t.app.try_state::<CmdChannel>() {
+                        let _ = ch.0.send(UiCmd::ToggleEarbuds);
+                    }
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Show".into(),
+                activate: Box::new(|t: &mut Self| crate::window::present_main(&t.app)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|t: &mut Self| t.app.exit(0)),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
+/// Set once the item is registered with the host; `None` until then, and
+/// forever on a desktop with no StatusNotifierWatcher at all.
+static TRAY: OnceLock<Handle<VortexTray>> = OnceLock::new();
 
 /// Phone-side fields cached from the last inbound AppState, so a local-only
 /// refresh (BlueZ rescan — knows nothing about the phone) can still redraw
@@ -33,7 +151,16 @@ struct PhoneSnap {
     battery: Option<u8>,
     charging: bool,
     earbuds: Option<EarbudsInfo>,
+    /// When this snapshot arrived, so the tray can stop believing it.
+    at: std::time::Instant,
 }
+
+/// How long a phone snapshot is worth rendering. The phone's own foreground
+/// notification already ages its copy of the laptop's state out at this
+/// threshold — the tray simply never did the same in the other direction, so a
+/// phone switched off at night left the tray cheerfully reporting "Redmi 9
+/// 67% ⚡" and "Buds 80% (phone)" until the app was next restarted.
+const PHONE_SNAP_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 static LAST_PHONE: Mutex<Option<PhoneSnap>> = Mutex::new(None);
 
@@ -44,7 +171,6 @@ static LAST_PHONE: Mutex<Option<PhoneSnap>> = Mutex::new(None);
 /// appear the moment they connect to the laptop, instead of sitting on
 /// "Buds --" until the phone's next heartbeat happens to arrive.
 pub(crate) fn update_battery_rows(
-    app: &tauri::AppHandle,
     local_earbuds: Option<&EarbudsInfo>,
     phone: Option<&AppState>,
 ) {
@@ -56,7 +182,16 @@ pub(crate) fn update_battery_rows(
             battery: p.battery,
             charging: p.charging,
             earbuds: p.earbuds.clone(),
+            at: std::time::Instant::now(),
         });
+    }
+    // Stale is the same as absent: better an honest "--" than a battery
+    // percentage from hours ago presented as current.
+    if cache
+        .as_ref()
+        .is_some_and(|s| s.at.elapsed() > PHONE_SNAP_FRESH)
+    {
+        *cache = None;
     }
     let snap = &*cache;
 
@@ -91,9 +226,6 @@ pub(crate) fn update_battery_rows(
         owner,
         pf(snap.as_ref().and_then(|s| s.battery))
     );
-    if let Some(tray) = app.tray_by_id("vortex") {
-        let _ = tray.set_tooltip(Some(tip));
-    }
     let buds_name = if laptop_owns {
         local_earbuds.map(|e| e.name.clone())
     } else {
@@ -116,91 +248,43 @@ pub(crate) fn update_battery_rows(
         format!("{}   {}{}", trunc(&name, 18), pf(s.battery), bolt)
     });
     drop(cache);
-    // Menu mutations must run on the main thread.
-    let app_menu = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(item) = app_menu.try_state::<BatteryMenuItem>() {
-            let _ = item.buds.set_text(buds_text);
-            if let Some(pt) = phone_text {
-                let _ = item.phone.set_text(pt);
-            }
-        }
+
+    let Some(handle) = TRAY.get().cloned() else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        handle
+            .update(move |t: &mut VortexTray| {
+                t.buds = buds_text;
+                t.tooltip = tip;
+                if let Some(pt) = phone_text {
+                    t.phone = pt;
+                }
+            })
+            .await;
     });
 }
 
 pub(crate) fn setup(app: &tauri::App) -> tauri::Result<()> {
-    // System tray (Telegram-style): icon in the top status area;
-    // left-click shows/hides the main window; right-click → menu.
-    // Battery readout: two disabled rows (earbuds + phone) with plain
-    // WORD labels. We deliberately avoid glyph/icon prefixes: color
-    // emoji (🎧/📱) render blank in the appindicator menu, and the
-    // monochrome icon glyphs that do render here (Font Awesome / Nerd
-    // Font PUA, e.g. U+F025/U+F10B) are NOT installed on a stock Linux
-    // box, so they'd show empty boxes on other machines. Plain text
-    // renders everywhere in the theme color. Refreshed from heartbeat.
-    let buds_i = MenuItem::with_id(
-        app, "buds_batt", "Buds   --", false, None::<&str>,
-    )?;
-    let phone_i = MenuItem::with_id(
-        app, "phone_batt", "Phone   --", false, None::<&str>,
-    )?;
-    let switch_i =
-        MenuItem::with_id(app, "switch", "Switch earbuds", true, None::<&str>)?;
-    let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
-    let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[&phone_i, &buds_i, &switch_i, &show_i, &quit_i],
-    )?;
-    app.manage(BatteryMenuItem { buds: buds_i, phone: phone_i });
-    // White monochrome BRAND SPIRAL for the status area. Like Telegram / Cursor,
-    // we ship ONE fixed light icon rather than swapping per theme: the
-    // GNOME/Ubuntu top bar is dark even in light mode, and Linux SNI hosts
-    // render a raw PNG as-is (no auto-recolor), so a single white glyph reads
-    // everywhere. Embedded via include_bytes so it works from the standalone
-    // prod binary.
-    let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))
-        .unwrap_or_else(|_| app.default_window_icon().unwrap().clone());
-    let _ = TrayIconBuilder::with_id("vortex")
-        .icon(tray_icon)
-        .tooltip("Vortex")
-        .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "switch" => {
-                // Toggle the buds between this laptop and the phone.
-                use tauri::Manager;
-                if let Some(ch) = app.try_state::<CmdChannel>() {
-                    let _ = ch.0.send(UiCmd::ToggleEarbuds);
-                }
+    let handle = app.handle().clone();
+    // Registering with the host is a D-Bus round-trip, so it happens off the
+    // setup hook. A desktop with no StatusNotifierWatcher (a bare wlroots
+    // session, GNOME without the appindicator extension) simply has no tray —
+    // the app keeps running headless in exactly the way it already did.
+    tauri::async_runtime::spawn(async move {
+        let tray = VortexTray {
+            app: handle,
+            buds: "Buds   --".into(),
+            phone: "Phone   --".into(),
+            tooltip: "Vortex".into(),
+        };
+        match tray.spawn().await {
+            Ok(h) => {
+                let _ = TRAY.set(h);
+                tracing::info!("tray: StatusNotifierItem registered");
             }
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let app = tray.app_handle();
-                if let Some(w) = app.get_webview_window("main") {
-                    if w.is_visible().unwrap_or(false) {
-                        let _ = w.hide();
-                    } else {
-                        let _ = w.show();
-                        let _ = w.set_focus();
-                    }
-                }
-            }
-        })
-        .build(app)?;
-
+            Err(e) => tracing::warn!("tray: no status-notifier host ({e}); running without a tray"),
+        }
+    });
     Ok(())
 }

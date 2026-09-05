@@ -77,7 +77,7 @@ fn offer_login_code(known: &[SmsMessage], incoming: &[SmsMessage]) {
     // The code itself is never logged — it is a credential.
     let sender = msg.address.clone();
     tracing::info!(from = %sender, "sms: login code → clipboard");
-    if let Err(e) = crate::clipboard_sync::set_local_text(&code) {
+    if let Err(e) = crate::clipboard_sync::set_local_secret(&code) {
         tracing::warn!("sms: could not put the login code on the clipboard: {e}");
         return;
     }
@@ -86,7 +86,12 @@ fn offer_login_code(known: &[SmsMessage], incoming: &[SmsMessage]) {
             vortex_l3_daemon::core::notif_mirror::NotificationMirror,
         >(serde_json::json!({
             "app": "Vortex",
-            "title": format!("Code {code} copied"),
+            // The code itself stays out of the notification. Shell
+            // notifications linger in the message tray, so putting it in the
+            // title left every OTP readable there long after it expired — and
+            // the user does not need to be told the digits, they need to know
+            // the paste is ready.
+            "title": "Login code copied",
             "text": format!("from {sender} — paste with Ctrl+V"),
         })) else {
             return;

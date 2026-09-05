@@ -109,9 +109,20 @@ pub fn extract_otp(body: &str) -> Option<String> {
     // Spans, not just positions: which END of the hint faces the number decides
     // how close it really is, and "code: 1234" is a much stronger claim than a
     // word that merely happens to sit nearby.
+    // Whole words only. `match_indices` matched substrings, so "pin" fired
+    // inside "shipping", "code" inside "barcode" and "postcode", "kod" inside
+    // "Kodak" — and one of those anywhere in the body qualified every 4-8 digit
+    // run in it. "Your order 48213 is shipping" put 48213 on the clipboard and
+    // announced it as a login code.
+    let is_word_char = |c: char| c.is_alphanumeric();
     let hints: Vec<(usize, usize)> = OTP_HINTS
         .iter()
         .flat_map(|h| lower.match_indices(h).map(|(i, m)| (i, i + m.len())))
+        .filter(|&(start, end)| {
+            let before_ok = lower[..start].chars().next_back().is_none_or(|c| !is_word_char(c));
+            let after_ok = lower[end..].chars().next().is_none_or(|c| !is_word_char(c));
+            before_ok && after_ok
+        })
         .collect();
     if hints.is_empty() {
         return None;
@@ -179,12 +190,51 @@ pub fn extract_otp(body: &str) -> Option<String> {
             _ => 0,
         };
         score += proximity;
+        // A hint that is nowhere near this number is not evidence about it.
+        // `proximity` stays 0 past the window, and the length bonus alone used
+        // to be enough to elect a candidate — so a hint at one end of a long
+        // message crowned an unrelated number at the other.
+        if proximity == 0 {
+            continue;
+        }
         let candidate = &body[start..end];
         if best.is_none_or(|(s, _)| score > s) {
             best = Some((score, candidate));
         }
     }
     best.map(|(_, c)| c.to_string())
+}
+
+#[cfg(test)]
+mod otp_word_boundary_tests {
+    use super::extract_otp;
+
+    #[test]
+    fn hint_words_inside_other_words_do_not_count() {
+        // "shipping" contains "pin"; "barcode" and "postcode" contain "code";
+        // "Kodak" contains "kod". None of these is a login code.
+        for body in [
+            "Your order 48213 is shipping",
+            "Scan barcode 99187 at the till",
+            "Delivery to postcode 10025 confirmed",
+            "Kodak order 55512 is ready",
+        ] {
+            assert_eq!(extract_otp(body), None, "must not treat as an OTP: {body}");
+        }
+    }
+
+    #[test]
+    fn a_real_code_is_still_found() {
+        assert_eq!(extract_otp("Your code is 481923"), Some("481923".to_string()));
+        assert_eq!(extract_otp("123456 is your verification code"), Some("123456".to_string()));
+    }
+
+    #[test]
+    fn a_far_away_hint_does_not_elect_an_unrelated_number() {
+        let body = "Payment of 500000 sum accepted. Thank you for shopping with us \
+                    today, and remember you can reach support any time. Reference code";
+        assert_eq!(extract_otp(body), None);
+    }
 }
 
 #[cfg(test)]

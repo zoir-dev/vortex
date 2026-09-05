@@ -149,6 +149,13 @@ fn finalize(
         title: title.chars().take(MAX_TITLE).collect(),
         text: text.chars().take(MAX_TEXT).collect(),
         ts: now_ms(),
+        // A stable identity for this conversation, so the phone can REPLACE
+        // rather than stack. Without it every update from a chat that edits its
+        // own notification — the normal case — arrived on the phone as another
+        // separate notification, and closing one on either device meant nothing
+        // to the other. App plus title is the same pairing the dedup above
+        // already treats as "the same thread".
+        key: format!("laptop:{app}:{title}"),
         ..Default::default()
     };
     info!(app = %notif.app, "notif-capture: desktop notification → phone");

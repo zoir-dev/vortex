@@ -177,12 +177,48 @@ class MediaNotificationListenerService : NotificationListenerService() {
         } catch (t: Throwable) {
             Log.w(TAG, "restore mirrored keys: ${t.message}")
         }
+        // Reconcile the mirrored-keys set against what is actually on screen.
+        //
+        // Restored keys were never checked, so a notification the user cleared
+        // while we were unbound stayed in the set for the life of the process —
+        // and its eventual real removal was then read as a dismissal to sync,
+        // or swallowed as already-removed. Keep only keys that still exist.
+        try {
+            val liveKeysNow = activeNotifications?.map { it.key }?.toSet().orEmpty()
+            val dropped = synchronized(mirroredKeys) {
+                val before = mirroredKeys.size
+                mirroredKeys.retainAll(liveKeysNow)
+                before - mirroredKeys.size
+            }
+            if (dropped > 0) {
+                persistMirroredKeys()
+                Log.i(TAG, "dropped $dropped mirrored key(s) that are no longer active")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "reconcile mirrored keys: ${t.message}")
+        }
         // Seed from notifications that are ALREADY active: their
         // onNotificationPosted fired before we (re)bound — e.g. a navigation
         // that was already running — so without this its live-activity pill
         // would never appear on the laptop until the app next posts an update.
         try {
-            activeNotifications?.forEach { handleLiveActivity(it) }
+            // Re-seed from what is ACTUALLY live, and drop anything we were
+            // still tracking that is not — the reconciliation the old code
+            // never did: it only ever added, so a key removed while we were
+            // unbound stayed in the map for the life of the process.
+            val live = activeNotifications?.toList().orEmpty()
+            val stillLive = live.map { it.key }.toSet()
+            val gone = activeLive.keys.filter { it !in stillLive }
+            for (key in gone) {
+                activeLive.remove(key)
+                if (NotificationMirrorSetting.isEnabled()) {
+                    VortexService.liveActivityBus.tryEmit(LiveActivity(key = key, ended = true))
+                }
+            }
+            if (gone.isNotEmpty()) {
+                Log.i(TAG, "cleared ${gone.size} live activity(ies) that ended while unbound")
+            }
+            live.forEach { handleLiveActivity(it) }
         } catch (t: Throwable) {
             Log.w(TAG, "seed active live activities: ${t.message}")
         }
@@ -238,6 +274,17 @@ class MediaNotificationListenerService : NotificationListenerService() {
         liveHeartbeatHandler.removeCallbacks(liveHeartbeat)
         callPollHandler.removeCallbacks(callPoll)
         if (instance === this) instance = null
+        // Forget the live activities we were tracking.
+        //
+        // While unbound we cannot be told that one ended, so anything left here
+        // is a claim we can no longer stand behind. Keeping them meant a
+        // navigation that finished during the gap was re-sent by the 25s
+        // heartbeat forever — and because every re-send refreshed it, the
+        // laptop's own 90-second staleness sweeper never got the chance to
+        // reap the pill. It sat on the top bar until the app was killed.
+        // `onListenerConnected` re-seeds from `activeNotifications`, so
+        // anything genuinely still running comes straight back.
+        activeLive.clear()
         // MIUI kills the listener binding freely (after a process restart it
         // often never rebinds on its own) — without the listener NOTHING mirrors
         // and call connect/end detection dies. Ask the system to rebind us.
@@ -510,6 +557,19 @@ class MediaNotificationListenerService : NotificationListenerService() {
         @Volatile
         private var instance: MediaNotificationListenerService? = null
 
+        /** Is the system actually BOUND to us right now?
+         *
+         *  Not the same question as "is notification access granted", and the
+         *  difference is the whole bug: MIUI's OneKeyClean kills this process,
+         *  Android restarts the foreground services but does NOT rebind the
+         *  listener, and the permission still reads as granted. Nothing mirrors,
+         *  while BLE and LAN keep working — so both devices show "connected"
+         *  and the user has no way to tell. Observed here: killed at 09:20,
+         *  still unbound 1h51m later, and only a manual re-toggle in Settings
+         *  brought it back. `getEnabledListenerPackages()` cannot see this;
+         *  only whether we ever received onListenerConnected can. */
+        fun isBound(): Boolean = instance != null
+
         /** Key of the dialer's ongoing-call notification while a call is on
          *  screen — so its REMOVAL is a definitive "call ended" signal. */
         @Volatile
@@ -535,6 +595,32 @@ class MediaNotificationListenerService : NotificationListenerService() {
             if (cur.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED) return
             callNotifKey = sbn.key
             val n = sbn.notification ?: return
+            // Fill in who is calling when telephony would not say.
+            //
+            // On Android 12+ the modern `TelephonyCallback.CallStateListener`
+            // is handed only a state — no number — and the deprecated listener
+            // that did carry one is blanked by the platform without
+            // READ_CALL_LOG. So every incoming banner read "Unknown caller",
+            // contact lookup had nothing to look up, and a missed call left
+            // nothing behind because that notification needs a non-empty
+            // number. The dialer's own notification knows perfectly well who is
+            // calling, and we are already reading it for the connect timer.
+            if (cur.name.isEmpty() && cur.number.isEmpty()) {
+                val who = n.extras?.getCharSequence(android.app.Notification.EXTRA_TITLE)
+                    ?.toString()
+                    ?.trim()
+                    .orEmpty()
+                if (who.isNotEmpty()) {
+                    // A title of digits and dialling punctuation is a number;
+                    // anything else is the contact name the dialer resolved.
+                    val looksNumeric = who.any { it.isDigit() } &&
+                        who.all { it.isDigit() || it in "+ -()." }
+                    val filled = if (looksNumeric) cur.copy(number = who) else cur.copy(name = who)
+                    VortexService.currentCall = filled
+                    VortexService.callEventBus.tryEmit(filled)
+                    Log.i(TAG, "call notif: filled caller identity from the dialer notification")
+                }
+            }
             val chrono = n.extras?.getBoolean(android.app.Notification.EXTRA_SHOW_CHRONOMETER, false) ?: false
             val whenMs = n.`when`
             Log.i(TAG, "call notif: chrono=$chrono when=$whenMs phase=${cur.phase} outgoing=${cur.outgoing} connected=${cur.connected}")
@@ -557,10 +643,46 @@ class MediaNotificationListenerService : NotificationListenerService() {
             callNotifKey = null
             val cur = VortexService.currentCall ?: return
             if (cur.phase == com.vortex.a3.core.call.CallEvent.PHASE_ENDED) return
+            // A vanished notification is a HINT that the call ended, not proof.
+            //
+            // `callNotifKey` follows any notification from the dialer package,
+            // and dialers move those around constantly: MIUI cancels the ringing
+            // notification the moment you answer (the in-call screen takes
+            // over), and a "missed call from A" card can be re-posted, tracked,
+            // and then swiped away while call B is live. Both looked exactly
+            // like a hang-up from here, so the laptop's pill vanished mid-call
+            // and its Mute/End buttons went with it — and the real end event
+            // that followed was discarded as a duplicate.
+            //
+            // Telephony knows the truth, and READ_PHONE_STATE is already
+            // required for the call mirror to work at all.
+            if (telephonyBusy()) {
+                Log.i(TAG, "dialer notification removed but telephony is still busy — not ending")
+                return
+            }
             val ended = cur.copy(phase = com.vortex.a3.core.call.CallEvent.PHASE_ENDED)
             VortexService.currentCall = null
             VortexService.callEventBus.tryEmit(ended)
             Log.i(TAG, "dialer call notification removed → END")
+        }
+
+        /** Is a call still up according to the telephony stack?
+         *
+         *  Errs towards "no" when it cannot tell (permission gone, no service):
+         *  the old behaviour ended the call on notification removal alone, so an
+         *  unreadable state is no worse than before, while a readable one is
+         *  strictly better. */
+        private fun telephonyBusy(): Boolean {
+            val ctx = instance ?: return false
+            return try {
+                val tm = ctx.getSystemService(android.telephony.TelephonyManager::class.java)
+                    ?: return false
+                @Suppress("DEPRECATION")
+                tm.callState != android.telephony.TelephonyManager.CALL_STATE_IDLE
+            } catch (t: Throwable) {
+                Log.w(TAG, "telephony state unreadable: ${t.message}")
+                false
+            }
         }
 
         /** Latest state of every CURRENTLY-active live activity, keyed by SBN
@@ -630,22 +752,58 @@ class MediaNotificationListenerService : NotificationListenerService() {
          *  action accepts inline text and `reply` is non-empty. */
         fun invokeAction(key: String, index: Int, reply: String) {
             val svc = instance ?: return
+            fun fail(why: String) {
+                // Say so out loud. All of these used to be a silent `return`:
+                // the user typed a reply on their laptop, pressed send, GNOME
+                // closed the notification — and the words went nowhere, with
+                // nothing anywhere recording that they had.
+                Log.w(TAG, "invokeAction($index) failed: $why")
+            }
             try {
-                val sbn = svc.activeNotifications?.firstOrNull { it.key == key } ?: return
-                val action = sbn.notification.actions?.getOrNull(index) ?: return
-                val pi = action.actionIntent ?: return
+                val sbn = svc.activeNotifications?.firstOrNull { it.key == key }
+                if (sbn == null) {
+                    fail("the notification is no longer active")
+                    return
+                }
+                // Index against the SAME filtered list the laptop was shown.
+                //
+                // `buildMirror` sends actions with empty titles removed and the
+                // list capped at three, then the laptop sends back a position in
+                // THAT list — but this indexed the raw array, so a blank-titled
+                // or reordered action shifted everything: "Mark as read" could
+                // fire the reply intent with no text attached, or the reverse.
+                val actions = sbn.notification.actions
+                    ?.filter { it.title?.toString()?.trim()?.isNotEmpty() == true }
+                    ?.take(MAX_ACTIONS)
+                val action = actions?.getOrNull(index)
+                if (action == null) {
+                    fail("action $index is gone (the app re-posted with a different set)")
+                    return
+                }
+                val pi = action.actionIntent
+                if (pi == null) {
+                    fail("action has no intent")
+                    return
+                }
                 val inputs = action.remoteInputs
-                if (reply.isNotEmpty() && !inputs.isNullOrEmpty()) {
+                if (reply.isNotEmpty() && inputs.isNullOrEmpty()) {
+                    fail("a reply was typed but this action takes no text")
+                    return
+                }
+                if (reply.isNotEmpty()) {
                     val intent = android.content.Intent()
                     val bundle = android.os.Bundle()
-                    for (ri in inputs) bundle.putCharSequence(ri.resultKey, reply)
+                    for (ri in inputs!!) bundle.putCharSequence(ri.resultKey, reply)
                     android.app.RemoteInput.addResultsToIntent(inputs, intent, bundle)
                     pi.send(svc, 0, intent)
                 } else {
                     pi.send()
                 }
+                Log.i(TAG, "invokeAction($index) fired${if (reply.isEmpty()) "" else " with a reply"}")
+            } catch (e: android.app.PendingIntent.CanceledException) {
+                fail("the app cancelled this action (notification already handled?)")
             } catch (e: Exception) {
-                Log.w(TAG, "invokeAction: ${e.message}")
+                fail(e.message ?: e.toString())
             }
         }
 
@@ -663,14 +821,26 @@ class MediaNotificationListenerService : NotificationListenerService() {
             val svc = instance ?: return false
             return try {
                 val ns = svc.activeNotifications ?: return false
-                val callSbn = ns.firstOrNull { sbn ->
-                    val n = sbn.notification ?: return@firstOrNull false
+                fun isCallSbn(sbn: StatusBarNotification): Boolean {
+                    val n = sbn.notification ?: return false
                     val isCall = n.category == android.app.Notification.CATEGORY_CALL ||
                         sbn.packageName.contains("dialer") ||
                         sbn.packageName.contains("incallui") ||
                         sbn.packageName == "com.android.server.telecom"
-                    isCall && (n.actions?.isNotEmpty() == true)
-                } ?: return false
+                    return isCall && (n.actions?.isNotEmpty() == true)
+                }
+                // Prefer the notification we are ACTUALLY mirroring.
+                //
+                // Taking "the first call notification with actions" is wrong
+                // during call waiting: with a call in progress and a second one
+                // ringing, both are present, and the ringing one usually sorts
+                // first. So End — meant for the call the laptop's pill is
+                // showing — pressed "Decline" on the incoming call instead, and
+                // the call the user wanted to hang up carried on. `callNotifKey`
+                // is the one we have been tracking all along.
+                val callSbn = callNotifKey?.let { key -> ns.firstOrNull { it.key == key && isCallSbn(it) } }
+                    ?: ns.firstOrNull { isCallSbn(it) }
+                    ?: return false
                 val actions = callSbn.notification.actions ?: return false
                 val answerKw = listOf(
                     "answer", "accept", "pick up", "javob", "qabul",

@@ -389,12 +389,9 @@ class GattServer(
             ) {
                 return false
             }
-            // Pace like the ICON chunk stream (12 ms) — back-to-back notifies
-            // overflow the stack's queue and drop, which is the very failure
-            // this fragmentation exists to fix.
-            if (idx + 1 < total) {
-                try { Thread.sleep(10) } catch (_: InterruptedException) {}
-            }
+            // No pacing sleep here any more: notifyTo now returns only once
+            // the stack has acked the previous fragment, which is the real
+            // condition the old 10 ms guess was standing in for.
         }
         Log.i(TAG, "sendAudioSignal: fragmented ${encoded.size}B frame into $total FRAGs (budget $budget)")
         return true
@@ -597,6 +594,59 @@ class GattServer(
     fun audioSignalSubscriberSnapshot(): List<BluetoothDevice> =
         synchronized(audioSignalSubscribers) { audioSignalSubscribers.toList() }
 
+    /** One per connected device: serialises notifies and holds the result of
+     *  the one currently in flight. */
+    private class SendGate {
+        val lock = Object()
+        /** A notify is queued with the stack and `onNotificationSent` has
+         *  not landed yet. */
+        var pending = false
+        /** `BluetoothGatt.GATT_*` from the last `onNotificationSent`. */
+        var status = BluetoothGatt.GATT_FAILURE
+    }
+
+    private val sendGates =
+        java.util.concurrent.ConcurrentHashMap<String, SendGate>()
+
+    /** How long to wait for `onNotificationSent` before calling a notify lost.
+     *  A healthy link acks within a connection interval or two (single-digit
+     *  ms up to ~50 ms); this only has to be far enough above that to not trip
+     *  on congestion, and low enough that a wedged link fails over to LAN
+     *  while the data is still worth sending. */
+    private val notifyAckTimeoutMs = 1500L
+
+    /** Release a device's gate — a dropped link never delivers the ack the
+     *  sender is blocked on. */
+    private fun releaseSendGate(addr: String) {
+        val gate = sendGates.remove(addr) ?: return
+        synchronized(gate.lock) {
+            gate.pending = false
+            gate.status = BluetoothGatt.GATT_FAILURE
+            gate.lock.notifyAll()
+        }
+    }
+
+    /** Send one notification and WAIT for the stack to confirm it went out.
+     *
+     *  Android's contract is one notification in flight per device: the next
+     *  `notifyCharacteristicChanged` must not be issued until
+     *  `onNotificationSent` has fired. We previously never implemented that
+     *  callback and paced bursts with `Thread.sleep(10)` instead — a guess
+     *  that holds on an idle link and fails exactly when it matters (contacts,
+     *  SMS, icon and notes bursts), where the stack silently drops notifies.
+     *
+     *  Silently is the damaging part: [sealAndNotify] has already advanced the
+     *  Noise send nonce by then, so the laptop's receive nonce falls behind and
+     *  a large enough gap drops the session and forces a fresh handshake.
+     *
+     *  Blocking here is also what makes the return value honest. On API 29-32
+     *  `notifyCharacteristicChanged` returns true as soon as the binder call
+     *  succeeds — it says nothing about delivery — so callers that fall back to
+     *  the outbox or LAN were reading a value that could not tell them what
+     *  they were asking. Now `true` means the stack reported the notify sent.
+     *
+     *  Callers are always on background threads (the send paths already slept
+     *  here), and the wait is bounded by [notifyAckTimeoutMs]. */
     private fun notifyTo(
         device: BluetoothDevice,
         frame: Frame,
@@ -615,20 +665,54 @@ class GattServer(
             return false
         }
         c.value = frame.encode()
-        return try {
-            // `notifyCharacteristicChanged` is the wire return: true =
-            // the OS accepted the notify for delivery (it can still
-            // bounce off a bad link, but at that point it's outside
-            // our visibility). false = the OS refused — busy stack,
-            // no GATT link, congestion. Caller MUST observe this
-            // so the LAN fallback can fire; previously we ignored
-            // it and `sendAudioOpEncrypted` silently lied about
-            // success (ChatGPT finding #3).
-            @Suppress("DEPRECATION")
-            s.notifyCharacteristicChanged(device, c, /*confirm=*/false)
-        } catch (e: SecurityException) {
-            Log.w(TAG, "notify threw for ${device.address}: ${e.message}")
-            false
+
+        val gate = sendGates.getOrPut(device.address) { SendGate() }
+        // Held across the notify AND the wait, so concurrent senders to the
+        // same device queue up here instead of racing into the stack. The
+        // callback thread only needs the monitor briefly, and `wait()` below
+        // has already released it by then.
+        synchronized(gate.lock) {
+            gate.pending = true
+            gate.status = BluetoothGatt.GATT_FAILURE
+
+            val queued = try {
+                // false = the OS refused outright (busy stack, no GATT link).
+                // No callback follows, so don't wait for one.
+                @Suppress("DEPRECATION")
+                s.notifyCharacteristicChanged(device, c, /*confirm=*/false)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "notify threw for ${device.address}: ${e.message}")
+                false
+            }
+            if (!queued) {
+                gate.pending = false
+                return false
+            }
+
+            val deadline = android.os.SystemClock.elapsedRealtime() + notifyAckTimeoutMs
+            while (gate.pending) {
+                val left = deadline - android.os.SystemClock.elapsedRealtime()
+                if (left <= 0L) break
+                try {
+                    gate.lock.wait(left)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+
+            if (gate.pending) {
+                // No ack in time. Report failure so the caller queues to the
+                // outbox or falls back to LAN rather than assuming delivery.
+                gate.pending = false
+                Log.w(TAG, "notify to ${device.address} not acked in ${notifyAckTimeoutMs}ms")
+                return false
+            }
+            if (gate.status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "notify to ${device.address} failed: status=${gate.status}")
+                return false
+            }
+            return true
         }
     }
 
@@ -658,6 +742,19 @@ class GattServer(
             Log.i(TAG, "ATT MTU for $addr → $mtu (notify budget ${mtu - 3})")
         }
 
+        /** The ack [notifyTo] blocks on. Without this override the stack has
+         *  no way to tell us a notify completed, which is why bursts used to
+         *  be paced by a sleep and dropped under load. */
+        override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
+            val addr = device?.address ?: return
+            val gate = sendGates[addr] ?: return
+            synchronized(gate.lock) {
+                gate.status = status
+                gate.pending = false
+                gate.lock.notifyAll()
+            }
+        }
+
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             val state = when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
@@ -673,6 +770,9 @@ class GattServer(
                 if (connectedAddrs.isEmpty()) {
                     lastDisconnectAtMs = android.os.SystemClock.elapsedRealtime()
                 }
+                // Wake anyone blocked waiting for an ack that can no longer
+                // arrive, and drop the gate so the next link starts clean.
+                releaseSendGate(device.address)
                 // Drop any half-buffered long-write so a reconnect starts clean.
                 prepWriteBuf.remove(device.address)
                 prepWriteChar.remove(device.address)
@@ -888,6 +988,18 @@ class GattServer(
                             Log.w(TAG, "AudioSignal WRITE: recv cipher desynced — disconnecting to force re-handshake")
                             recvAeadFails.remove(addr)
                             audioRecvNonce.remove(addr)
+                            // Retire the CIPHER too, not just the nonce.
+                            //
+                            // Dropping the nonce alone makes the next write
+                            // start again from 0 while the same cipher stays
+                            // registered — so nonces 0..128 of this session
+                            // become acceptable a second time. If cancelConnection
+                            // does not take, or a write lands before the re-IK,
+                            // that is a replay window: a captured frame — a
+                            // CALL_CONTROL "accept", say — would open cleanly.
+                            // The next IK installs a fresh pair anyway, so
+                            // there is nothing to lose by removing it now.
+                            audioRecvCiphers.remove(addr)
                             try { device?.let { server?.cancelConnection(it) } } catch (_: Exception) {}
                         }
                         return

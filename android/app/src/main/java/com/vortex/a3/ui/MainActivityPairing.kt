@@ -71,6 +71,13 @@ internal fun MainActivity.wirePairingOrchestrator(identity: IdentityRecord) {
                             peerName = outcome.peerName,
                         )
                     )
+                    try {
+                        if (outcome.device.bondState == android.bluetooth.BluetoothDevice.BOND_NONE) {
+                            outcome.device.createBond()
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.w("Pairing", "createBond: ${e.message}")
+                    }
                     refreshPeerList()
                     state.value = AdvertiseState.TrustedPresence
                     // Hand off to the background service: stop our

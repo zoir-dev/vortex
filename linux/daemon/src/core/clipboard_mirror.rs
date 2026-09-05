@@ -82,9 +82,21 @@ impl ClipboardMirror {
 /// (`[total u16][idx u16]`) + 16 AEAD + 4 frame ≈ fits a 512-MTU notify.
 pub const IMAGE_CHUNK_BYTES: usize = 454;
 
-/// Cap on a clipboard image synced over BLE (B1). ~95% of real screenshots
-/// fit; larger ones wait for the LAN path. Bounds the BLE chunk storm.
-pub const MAX_BLE_IMAGE_BYTES: usize = 1_048_576; // 1 MiB
+/// Cap on a clipboard image synced over BLE (B1).
+///
+/// Was 1 MiB, on the reasoning that most screenshots fit and bigger ones "wait
+/// for the LAN path". Two things were wrong with that. There is no laptop→phone
+/// LAN path for images, so anything over the cap was simply never synced, in
+/// silence. And 1 MiB is 2 300 chunks: at the 12 ms pacing the push occupies the
+/// ATT bearer for close to half a minute, during which the STATE heartbeat kept
+/// coming back "In Progress" — which the reconnect loop then read as a dead link
+/// and tore the session down. (That misreading is fixed separately; this bounds
+/// the contention that provoked it.)
+///
+/// 256 KiB is ~570 chunks, about seven seconds of bearer time. It still covers
+/// ordinary copied images, and what it excludes is now logged rather than
+/// dropped without a word.
+pub const MAX_BLE_IMAGE_BYTES: usize = 262_144; // 256 KiB
 
 const MAX_IMAGE_CHUNKS: u16 = 4096;
 
@@ -148,9 +160,26 @@ pub fn build_text_chunks(text: &str) -> Vec<Vec<u8>> {
 pub struct ImageAssembler {
     total: u16,
     chunks: Vec<Option<Vec<u8>>>,
+    /// When the last chunk landed, for the staleness rule in [`Self::add`].
+    last_add: Option<std::time::Instant>,
 }
 
+/// How long a partial set may sit before the next chunk is assumed to belong to
+/// a NEW message rather than to this one.
+///
+/// Chunks of one message arrive back-to-back — milliseconds apart, at the 12 ms
+/// pacing the senders use — so this cannot split a healthy set. What it does
+/// catch is the leftovers of a set that never completed, which would otherwise
+/// wait indefinitely for a chunk that is never coming.
+const PARTIAL_SET_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl ImageAssembler {
+    /// Pretend the partial set has been sitting here past its TTL.
+    #[cfg(test)]
+    fn age_for_test(&mut self) {
+        self.last_add = Some(std::time::Instant::now() - PARTIAL_SET_TTL * 2);
+    }
+
     pub fn add(&mut self, total: u16, idx: u16, data: Vec<u8>) -> Option<Vec<u8>> {
         if total == 0 || total > MAX_IMAGE_CHUNKS || idx >= total {
             return None;
@@ -158,7 +187,31 @@ impl ImageAssembler {
         if self.total != total {
             self.total = total;
             self.chunks = vec![None; total as usize];
+            self.last_add = None;
         }
+        // Leftovers of a set that never completed must not be mixed into the
+        // next one.
+        //
+        // For FRAG — where this assembler rebuilds oversized SEALED frames —
+        // that mixing was worse than a lost message. A two-chunk notification
+        // losing its first fragment left slot 0 empty; the next long
+        // notification's chunk 0 filled it, the set read as "complete", and a
+        // frame made of two different messages went to AEAD. That burns a
+        // nonce and forces a resync whose re-send is also two fragments, which
+        // poisons the next set in turn: self-sustaining for the rest of the
+        // session, and exactly the symptom fragmentation exists to cure.
+        //
+        // Keyed on TIME rather than on index order, because chunks of one
+        // message can legitimately arrive out of order or duplicated, and both
+        // land within milliseconds. Age is the honest signal for "this belongs
+        // to something else".
+        if self
+            .last_add
+            .is_some_and(|t| t.elapsed() > PARTIAL_SET_TTL)
+        {
+            self.chunks = vec![None; total as usize];
+        }
+        self.last_add = Some(std::time::Instant::now());
         self.chunks[idx as usize] = Some(data);
         if self.chunks.iter().any(|c| c.is_none()) {
             return None;
@@ -169,7 +222,34 @@ impl ImageAssembler {
         }
         self.total = 0;
         self.chunks = Vec::new();
+        self.last_add = None;
         Some(bytes)
+    }
+}
+
+#[cfg(test)]
+mod frag_identity_tests {
+    use super::ImageAssembler;
+
+    /// A set abandoned long ago must not be completed by a LATER message's
+    /// chunks — the FRAG-poisoning loop.
+    #[test]
+    fn a_stale_partial_set_is_discarded() {
+        let mut a = ImageAssembler::default();
+        // Message A: two chunks, the first lost in the air.
+        assert_eq!(a.add(2, 1, b"A1".to_vec()), None);
+        a.age_for_test();
+        // Message B, seconds later. It must reassemble as B — never as B0+A1.
+        assert_eq!(a.add(2, 0, b"B0".to_vec()), None);
+        assert_eq!(a.add(2, 1, b"B1".to_vec()), Some(b"B0B1".to_vec()));
+    }
+
+    #[test]
+    fn a_complete_set_still_reassembles_in_order() {
+        let mut a = ImageAssembler::default();
+        assert_eq!(a.add(3, 0, b"x".to_vec()), None);
+        assert_eq!(a.add(3, 1, b"y".to_vec()), None);
+        assert_eq!(a.add(3, 2, b"z".to_vec()), Some(b"xyz".to_vec()));
     }
 }
 

@@ -29,6 +29,12 @@ const A2DP_SINK_UUID: Uuid = Uuid::from_u128(0x0000_110b_0000_1000_8000_0080_5f9
 /// call audio, separate from the A2DP media path.
 const HFP_AG_UUID: Uuid = Uuid::from_u128(0x0000_111f_0000_1000_8000_0080_5f9b_34fb);
 
+/// HFP Hands-Free — the role the EARBUDS advertise (0x111e), as opposed to
+/// [`HFP_AG_UUID`] (0x111f), which is the laptop's own side of the same
+/// profile. These buds list Handsfree, so this is the UUID that names a
+/// profile actually present on the remote device.
+const HFP_HF_UUID: Uuid = Uuid::from_u128(0x0000_111e_0000_1000_8000_0080_5f9b_34fb);
+
 #[derive(Debug, thiserror::Error)]
 pub enum SwitchError {
     #[error("bad MAC address: {0}")]
@@ -235,6 +241,32 @@ pub async fn connect_audio(adapter: &Adapter, mac: &str) -> Result<(), SwitchErr
     let bluez_ms = t_profile_start.elapsed().as_millis();
     let a2dp_busy = matches!(a2dp, ProfileOutcome::Busy);
     if matches!(a2dp, ProfileOutcome::Ok | ProfileOutcome::Busy) {
+        // Connect the hands-free profile too, in the background, purely to make
+        // the sink appear sooner.
+        //
+        // PipeWire's bluez5 device publishes the card immediately only once all
+        // the profiles it expects are connected; short of that it waits out an
+        // internal timer before giving up and publishing anyway. That timer is
+        // the single largest cost in a switch here: the gap between
+        // `connect_profile` returning and the sink existing measured 2.3-3.8 s
+        // in EVERY successful switch, while BlueZ itself took 0.6-1.2 s. We
+        // only ever connected A2DP and left HFP to the earbuds, so the timer
+        // ran every time.
+        //
+        // Detached on purpose: this is an optimisation, not a requirement. If
+        // the buds have no HFP, or it is slow, or it fails outright, the A2DP
+        // path below is unaffected — it just takes as long as it used to.
+        let hfp_adapter = adapter.clone();
+        let hfp_addr = addr;
+        tokio::spawn(async move {
+            if let Ok(dev) = hfp_adapter.device(hfp_addr) {
+                // HF (the buds' role) first; AG as the fallback for stacks
+                // that want the local side named instead.
+                if dev.connect_profile(&HFP_HF_UUID).await.is_err() {
+                    let _ = dev.connect_profile(&HFP_AG_UUID).await;
+                }
+            }
+        });
         let t_wait_start = tokio::time::Instant::now();
         if wait_audio_connected(adapter, addr, CONNECT_SETTLE).await {
             let wait_ms = t_wait_start.elapsed().as_millis();
@@ -517,7 +549,7 @@ async fn card_block(mac: &str) -> Vec<String> {
 
 /// The card profile currently selected for these buds, e.g. `a2dp-sink` or
 /// `headset-head-unit`. `None` when the card doesn't exist.
-async fn card_active_profile(mac: &str) -> Option<String> {
+pub async fn card_active_profile(mac: &str) -> Option<String> {
     parse_active_profile(&card_block(mac).await)
 }
 
@@ -539,7 +571,7 @@ fn parse_active_profile(block: &[String]) -> Option<String> {
 /// (AAC, 133). Taking the list order would pin the user to SBC while AAC was
 /// available — a silent quality downgrade every time we repaired the profile.
 /// `available: no` profiles are dropped: they cannot be selected.
-async fn card_a2dp_profiles(mac: &str) -> Vec<String> {
+pub async fn card_a2dp_profiles(mac: &str) -> Vec<String> {
     parse_a2dp_profiles(&card_block(mac).await)
 }
 
@@ -589,6 +621,40 @@ pub async fn a2dp_card_active(mac: &str) -> bool {
         .is_some_and(|p| p.starts_with("a2dp"))
 }
 
+/// Is the laptop itself using these earbuds AS A HEADSET right now — i.e. is
+/// someone on a call here?
+///
+/// Two conditions, both required. The card is on a `headset-*` profile (HFP/HSP,
+/// which is the only reason to give up stereo), AND something is actually
+/// recording from the Bluetooth microphone. Either alone is not enough: a card
+/// can be parked on HFP with nothing using it, and a mic can be in use on a
+/// different device entirely.
+///
+/// There is no MPRIS signal for this. A Meet or Zoom call in a browser never
+/// reports "Playing", which is exactly why the laptop looked idle to the switch
+/// logic and let the phone take the earbuds mid-sentence — taking the microphone
+/// with them.
+pub async fn headset_mic_in_use(mac: &str) -> bool {
+    let on_headset = card_active_profile(mac)
+        .await
+        .is_some_and(|p| p.starts_with("headset"));
+    if !on_headset {
+        return false;
+    }
+    let Ok(out) = tokio::process::Command::new("pactl")
+        .args(["list", "source-outputs"])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle = mac.replace(':', "_");
+    text.lines()
+        .filter(|l| l.trim_start().starts_with("Source:"))
+        .any(|l| l.contains(&needle) || l.contains("bluez"))
+}
+
 /// Poll until the card reports an A2DP profile, or the timeout elapses.
 /// `set-card-profile` returns before PipeWire has rebuilt the sink.
 async fn settle_until_a2dp(mac: &str, timeout: Duration) -> bool {
@@ -634,7 +700,7 @@ async fn device_advertises_a2dp(adapter: &Adapter, addr: Address) -> bool {
 /// if the card offers NONE but the device advertises A2DP, PipeWire lost the
 /// endpoint (classic aftermath of a wireplumber restart while connected), so
 /// recycle the ACL link once to force a re-probe; then re-select.
-async fn ensure_card_on_a2dp(adapter: &Adapter, addr: Address, mac: &str) -> bool {
+pub async fn ensure_card_on_a2dp(adapter: &Adapter, addr: Address, mac: &str) -> bool {
     if a2dp_card_active(mac).await {
         return true;
     }

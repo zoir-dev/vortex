@@ -36,6 +36,10 @@ use reis::event::{DeviceCapability, EiEvent};
 use reis::tokio::{EiConvertEventStream, EiEventStream};
 
 /// A capture session is live (loop running). Prevents double-starts.
+/// How long the pointer may sit still ON THE PHONE before the failsafe hands it
+/// back to the laptop. See its use site.
+const IDLE_RELEASE_AFTER: Duration = Duration::from_secs(45);
+
 static RUNNING: AtomicBool = AtomicBool::new(false);
 /// Set by [`uc_stop`]; the capture loop notices on its next flush tick, releases
 /// the portal and exits.
@@ -205,6 +209,43 @@ fn enabled_path() -> Option<std::path::PathBuf> {
 /// Remember whether the user wants the edge armed, so a reboot or a quit does
 /// not quietly turn the feature off. Only the intent is stored — whether it can
 /// actually arm is decided again on the next launch.
+/// Path of the cached phone bounds, stored next to `placement`.
+fn bounds_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| {
+        std::path::PathBuf::from(h).join(".local/share/vortex/universal_control/bounds")
+    })
+}
+
+/// Remember the phone's pixel bounds so arming never depends on adb.
+fn remember_bounds(w: i32, h: i32) {
+    let Some(p) = bounds_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, format!("{w}x{h}"));
+}
+
+/// The last bounds we saw, for the launch where the phone is not reachable.
+fn cached_bounds() -> Option<(i32, i32)> {
+    let s = std::fs::read_to_string(bounds_path()?).ok()?;
+    let (w, h) = s.trim().split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// Is this a failure that will still be a failure at the next launch?
+///
+/// Only those justify forgetting the switch. The phone being off adb is the
+/// opposite of permanent — it is the NORMAL state at login — yet it used to
+/// disarm the feature and delete the `enabled` marker, so the switch silently
+/// turned itself off and the user had no way to know why. That happened five
+/// times on this machine, and the last one left it off for eight boots.
+fn error_is_permanent(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    // No input-capture portal at all: X11, or a compositor without the
+    // backend. Arming into this every login really is pointless.
+    e.contains("no_portal") || e.contains("not supported") || e.contains("no such interface")
+}
+
 fn remember_enabled(on: bool) {
     let Some(p) = enabled_path() else { return };
     if on {
@@ -267,6 +308,24 @@ pub(crate) async fn uc_start(app: tauri::AppHandle) -> Result<(), String> {
 /// `require_injector` separates a switch flipped by hand — where an unreachable
 /// phone is worth saying out loud immediately — from a restore at launch, where
 /// it is not yet worth mentioning.
+static BT_HID_INIT: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn ensure_bt_hid() {
+    if BT_HID_INIT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let server = vortex_l3_daemon::core::bt_hid::BtHidServer::new();
+        if let Ok(conn) = zbus::connection::Connection::system().await {
+            if server.register(&conn).await.is_ok() {
+                server.try_connect_paired_devices(&conn).await;
+                crate::mirror_inject::set_bt_hid(server);
+                tracing::info!("universal-control: Bluetooth HID registered as ADB-free fallback");
+            }
+        }
+    });
+}
+
 fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
@@ -276,11 +335,22 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
     // ownership — zbus on the capture thread's current-thread runtime didn't
     // acquire it). Started lazily here, lives for the app's lifetime.
     ensure_cursor_publisher();
-    // The native-cursor path needs the uinput injector (adb/Shizuku). Without it
-    // we'd fall back to the accessibility overlay — not wired yet, so require it.
-    if require_injector && !crate::mirror_inject::active() && !crate::mirror_inject::start() {
-        RUNNING.store(false, Ordering::SeqCst);
-        return Err("no_injector".into());
+    ensure_bt_hid();
+
+    // The native-cursor path needs either the ADB uinput injector or Bluetooth HID server.
+    if require_injector && !crate::mirror_inject::has_transport() && !crate::mirror_inject::start() {
+        if !crate::mirror_inject::has_transport() {
+            RUNNING.store(false, Ordering::SeqCst);
+            return Err("no_injector".into());
+        }
+    }
+
+    if let Some(hid) = crate::mirror_inject::get_bt_hid() {
+        tauri::async_runtime::spawn(async move {
+            if let Ok(conn) = zbus::connection::Connection::system().await {
+                hid.try_connect_paired_devices(&conn).await;
+            }
+        });
     }
     // libei's stream is !Send → own thread + current-thread runtime.
     std::thread::spawn(move || {
@@ -307,19 +377,65 @@ fn arm(app: tauri::AppHandle, require_injector: bool) -> Result<(), String> {
             }
         };
         rt.block_on(async {
-            if let Err(e) = capture_loop().await {
-                tracing::warn!("universal-control: capture loop ended: {e}");
-                // Everything that can go wrong in here goes wrong AFTER the
-                // command has already answered Ok — no portal on this desktop, a
-                // compositor that will not arm the barrier, adb dropping the
-                // phone. Left unreported, the switch stays on over a feature
-                // that is not running, which is the same thing to the user as
-                // "it is broken and will not say why".
-                let _ = tauri::Emitter::emit(&app, "vortex:uc-stopped", e.to_string());
-                // …and stop remembering the switch: whatever went wrong will go
-                // wrong again at the next launch, and arming into the same error
-                // every login is worse than an off switch the user can flip.
-                remember_enabled(false);
+            // Supervised: one capture session ending is not the feature ending.
+            //
+            // The compositor severs the EIS connection on every screen lock and
+            // every suspend. `capture_loop` returns Ok(()) for that — it is a
+            // clean shutdown, not an error — so the thread simply exited, the
+            // switch stayed on, and the edge was dead until the app was
+            // restarted by hand. Every one of the seventeen capture sessions
+            // recorded on this machine ended exactly that way, and fourteen were
+            // followed by the user restarting the app.
+            //
+            // So: re-arm. Backoff because a re-arm attempted while the screen is
+            // still locked will itself fail, and there is no point spinning
+            // through it.
+            let mut backoff_ms = 500u64;
+            loop {
+                let started = std::time::Instant::now();
+                let outcome = capture_loop().await;
+                // The user turning it off is the one exit that stays exited.
+                if STOP.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Every exit is reported, not only the failures. The Settings
+                // switch reads `uc_running` once, when the page opens, so a
+                // session that ended between then and now was invisible — the
+                // switch sat on over a feature that was not running, which to
+                // the user is the same as broken and silent.
+                let _ = tauri::Emitter::emit(&app, "vortex:uc-state", uc_running());
+                match outcome {
+                    Ok(()) => tracing::info!(
+                        "universal-control: capture session ended (lock or suspend?) — \
+                         re-arming in {backoff_ms}ms"
+                    ),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::warn!("universal-control: capture loop ended: {msg}");
+                        // A cause that will still be there next time is worth
+                        // reporting and giving up on. A phone that is not
+                        // plugged in is not one of those.
+                        if error_is_permanent(&msg) {
+                            let _ = tauri::Emitter::emit(&app, "vortex:uc-stopped", msg);
+                            remember_enabled(false);
+                            break;
+                        }
+                        tracing::info!("universal-control: transient — re-arming in {backoff_ms}ms");
+                    }
+                }
+                // A session that actually ran for a while means the last
+                // failure is behind us; don't carry its backoff forward.
+                if started.elapsed() > std::time::Duration::from_secs(30) {
+                    backoff_ms = 500;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                if STOP.load(Ordering::SeqCst) {
+                    break;
+                }
+                backoff_ms = (backoff_ms * 2).min(30_000);
+                // About to re-arm — tell the UI so a switch left showing the
+                // failed state comes back on its own.
+                let _ = tauri::Emitter::emit(&app, "vortex:uc-state", true);
             }
         });
     });
@@ -345,7 +461,17 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     // cannot tell "the cursor is against the far edge" from "it is halfway
     // across" — and returning to the laptop has to happen at the edge, the way
     // it does when you run the pointer off a second monitor.
-    let phys = crate::mirror_inject::display_size().ok_or("no_display_size")?;
+    // Ask the phone; fall back to the last bounds we saw. `restore()`'s own
+    // comment says arming deliberately must not require the injector, because
+    // at login the phone is usually not reachable — but reading the size here
+    // made it require exactly that, and the loop died before it began.
+    let phys = match crate::mirror_inject::display_size() {
+        Some(p) => {
+            remember_bounds(p.0, p.1);
+            p
+        }
+        None => cached_bounds().ok_or("no_display_size")?,
+    };
     // Re-derived at every crossing, because the phone can be rotated between
     // one and the next.
     let (mut pw, mut ph) = phys;
@@ -467,6 +593,19 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     }
     ic.enable(&session).await?;
     let mut activated = ic.receive_activated().await?;
+    // The compositor invalidates our barrier whenever the screen layout
+    // changes, and says so — we simply were not listening. So docking a
+    // monitor, closing the lid, changing resolution, or vortex's own second
+    // screen adding a Mutter monitor left the feature running with a barrier
+    // that no longer existed: the edge did nothing, the switch still read on,
+    // and no event said otherwise.
+    //
+    // Ending the session is the right response rather than patching the
+    // barrier in place: the supervisor above re-runs this whole function, which
+    // re-queries the zones and re-places the barrier against the NEW layout —
+    // the same path that already handles a lock/suspend.
+    let mut zones_changed = ic.receive_zones_changed().await?;
+    let mut deactivated_stream = ic.receive_deactivated().await?;
     crate::mirror_inject::refresh_rotation();
     tracing::info!("universal-control: armed on {} edge", edge_name(edge));
 
@@ -483,6 +622,7 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
     // something is actually sent.
     let (mut send_x, mut send_y) = (0f32, 0f32);
     let mut last_motion = Instant::now();
+    let mut entered_at = Instant::now();
     let mut entry: (f32, f32) = (0.0, 0.0);
     // Barrier touched, but control has not crossed yet: we are measuring how
     // hard the user is pushing into it, and how far they have slid along it.
@@ -592,6 +732,15 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                     // wanted a fraction of a second later, at the crossing, and
                     // fetching it there is what used to stall the pointer.
                     crate::mirror_inject::refresh_rotation();
+                    crate::mirror_inject::trigger_bt_connect();
+                    // Same reasoning as the rotation fetch above, and the same
+                    // head start: getting the injector up takes a few hundred
+                    // milliseconds, and the push that commits is a few hundred
+                    // milliseconds away. Starting it here means the crossing
+                    // usually finds it ready — and never waits on it.
+                    if !crate::mirror_inject::has_transport() {
+                        crate::mirror_inject::start_async();
+                    }
                     captured = true;
                     if active {
                         // Re-activated without our release having landed: the
@@ -609,6 +758,19 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => break,
             },
+
+            // Layout changed under us — our barrier is gone. End the session so
+            // the supervisor re-arms it against the new zones.
+            _ = zones_changed.next() => {
+                tracing::info!("universal-control: screen layout changed — re-arming the edge");
+                break;
+            }
+
+            // The compositor withdrew the capture session outright.
+            _ = deactivated_stream.next() => {
+                tracing::info!("universal-control: capture deactivated by the compositor");
+                break;
+            }
 
             ev = ei_events.next() => {
                 // A dead EI stream must NOT skip the cleanup below — see the
@@ -767,23 +929,27 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                         let needed = PUSH_THROUGH + (PUSH_THROUGH_FAST - PUSH_THROUGH) * t;
                         // …and it has to be a push, not a sweep past.
                         let deliberate = push >= needed && push >= slide.abs() * PUSH_INWARD_RATIO;
-                        if deliberate && !crate::mirror_inject::active()
-                            && !crate::mirror_inject::start()
-                        {
-                            // No injector, no cursor on the phone — crossing
-                            // would strand the pointer on a screen that shows
-                            // nothing. Rebuilding it HERE (and not only at
-                            // uc_start) is what recovers from adb dropping out
-                            // mid-session: pulling the cable, a Wi-Fi roam, or
-                            // the mirror window closing and taking it with it.
-                            // Zeroing the push lets the abandon timer below
-                            // hand the pointer back instead of leaving the user
-                            // straining against a barrier that will never give.
-                            tracing::warn!(
-                                "universal-control: injector unavailable — staying on the laptop"
-                            );
-                            push = 0.0;
-                        } else if deliberate {
+                        if deliberate {
+                            // NOTHING that can block belongs here. The pointer
+                            // and keyboard are captured at this instant, so a
+                            // slow call is not a slow crossing — it is a frozen
+                            // desktop with no way out, which is what `start()`
+                            // inline used to produce whenever the phone was not
+                            // reachable. Ask only the cheap in-memory question.
+                            if !crate::mirror_inject::has_transport() {
+                                // Bring it up off this thread and let this push
+                                // go. It was already asked to start when the
+                                // barrier was touched, so by now it is usually
+                                // up; when it is not, the next push crosses.
+                                crate::mirror_inject::start_async();
+                                crate::mirror_inject::trigger_bt_connect();
+                                tracing::warn!(
+                                    "universal-control: injector not up yet — staying on the laptop, \
+                                     starting it in the background"
+                                );
+                                push = 0.0;
+                                continue;
+                            }
                             // Bounds are re-derived per crossing: the phone may
                             // have been rotated since the last one, and Android
                             // clamps the pointer to the ROTATED display.
@@ -800,6 +966,7 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                             pending = false;
                             active = true;
                             overpush = 0.0;
+                            entered_at = Instant::now();
                             set_cursor(true);
                             crate::mirror_inject::send(&format!("V 1 {ox} {oy} {sx} {sy}"));
                             px = tx as f32;
@@ -866,7 +1033,11 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                             Edge::Bottom => -ny.min(0.0),
                             Edge::Top => (ny - (ph - 1) as f32).max(0.0),
                         };
-                        overpush = if over > 0.0 { overpush + over } else { 0.0 };
+                        if entered_at.elapsed() >= Duration::from_millis(350) {
+                            overpush = if over > 0.0 { overpush + over } else { 0.0 };
+                        } else {
+                            overpush = 0.0;
+                        }
                         if overpush >= RETURN_MARGIN {
                             tracing::info!("universal-control: return → laptop (edge push)");
                             lift_scroll(&mut scroll_finger, SCROLL_SLOT);
@@ -981,7 +1152,7 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                 // down on its own schedule (closing the mirror window kills it).
                 // Without this we would sit "active" forwarding into a dead
                 // socket: no cursor on the phone, none on the laptop either.
-                if active && !crate::mirror_inject::active() {
+                if active && !crate::mirror_inject::active() && !crate::mirror_inject::has_transport() {
                     tracing::warn!("universal-control: injector gone → returning to laptop");
                     match ic
                         .release(&session, activation_id, Some(return_pos(edge, entry)))
@@ -1021,7 +1192,15 @@ async fn capture_loop() -> Result<(), Box<dyn std::error::Error>> {
                 // this has to rescue is precisely the one where our own flags
                 // say we let go but the compositor never got the message, so a
                 // failed release gets retried here every tick.
-                if captured && last_input.elapsed() >= Duration::from_secs(6) {
+                // The window is long, and deliberately so. Six seconds is a
+                // perfectly ordinary pause while READING something on the
+                // phone, and snapping the pointer home mid-read is the feature
+                // interrupting the user rather than rescuing them. The state
+                // this exists to escape — a release the compositor never
+                // honoured — is not going to resolve on its own, so waiting
+                // longer costs nothing while a short window costs correctness.
+                // Apple's equivalent leaves the pointer where you put it.
+                if captured && last_input.elapsed() >= IDLE_RELEASE_AFTER {
                     tracing::info!("universal-control: idle release → laptop (at {px},{py})");
                     if active {
                         crate::mirror_inject::send("V 0");

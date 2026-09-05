@@ -80,12 +80,46 @@ class VortexNotification(
         handler.postDelayed(ticker, REFRESH_MS)
     }
 
-    /** Re-render the notification (e.g. after fresh peer state / battery). */
+    /** Signature of what the ongoing notification currently shows. */
+    @Volatile private var lastRendered: String? = null
+
+    /**
+     * Re-render the notification — but only when something in it CHANGED.
+     *
+     * The ticker runs every two seconds and used to re-post unconditionally:
+     * 288 posts in a morning, almost all of them identical. That is expensive
+     * for nothing, and on MIUI it is worse than that — a foreground
+     * notification updating that often looks like a misbehaving app in the
+     * battery accounting, which is what OneKeyClean goes hunting for. The kill
+     * it then performs is what leaves the notification listener unbound.
+     */
     fun refresh() {
         try {
+            val sig = renderSignature()
+            if (sig == lastRendered) return
+            lastRendered = sig
             service.getSystemService(NotificationManager::class.java)
                 ?.notify(NOTIF_ID, build())
         } catch (_: Exception) {}
+    }
+
+    /** Everything the rendered notification depends on, as one comparable
+     *  string. Cheap: all of it is already in memory. */
+    private fun renderSignature(): String {
+        val peer = host.peerState()
+        val fresh = peer != null && host.peerStateAgeMs() < PEER_FRESH_MS
+        return listOf(
+            host.phoneOwnsBuds(),
+            host.phoneEarbudsBattery(),
+            fresh,
+            if (fresh) peer?.battery else null,
+            if (fresh) peer?.charging else null,
+            if (fresh) peer?.earbuds?.connected else null,
+            if (fresh) peer?.earbuds?.battery else null,
+            if (fresh) peer?.locked else null,
+            lastOwner,
+            targetOwner,
+        ).joinToString("|")
     }
 
     /** The service's toggle handler calls this after kicking off a switch:
@@ -287,6 +321,66 @@ class VortexNotification(
             .build()
     }
 
+    /**
+     * Tell the user, once, that notification mirroring has stopped and only
+     * they can restart it.
+     *
+     * This is deliberately a real, tappable, IMPORTANCE_DEFAULT notification
+     * rather than a log line or a badge inside the app. The whole failure is
+     * that everything LOOKS fine — both devices say connected, the toggle says
+     * on — while nothing mirrors, so a signal the user has to go looking for is
+     * no signal at all. Tapping it lands on the exact system screen that fixes
+     * it.
+     */
+    fun postListenerBroken(accessRevoked: Boolean) {
+        createBrokenChannel()
+        val intent = android.content.Intent(
+            android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS,
+        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pi = android.app.PendingIntent.getActivity(
+            service,
+            0,
+            intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+                android.app.PendingIntent.FLAG_IMMUTABLE,
+        )
+        val text = if (accessRevoked) {
+            "Notification access is off, so nothing reaches your laptop. Tap to turn it back on."
+        } else {
+            "Android stopped delivering notifications to Vortex. Tap, then switch Vortex off and " +
+                "on again to restore mirroring."
+        }
+        val n = NotificationCompat.Builder(service, BROKEN_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentTitle("Notification mirroring stopped")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        try {
+            androidx.core.app.NotificationManagerCompat.from(service).notify(BROKEN_NOTIF_ID, n)
+        } catch (_: SecurityException) {
+            // POST_NOTIFICATIONS denied — nothing more we can do from here.
+        }
+    }
+
+    private fun createBrokenChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = service.getSystemService(NotificationManager::class.java) ?: return
+        if (nm.getNotificationChannel(BROKEN_CHANNEL_ID) != null) return
+        nm.createNotificationChannel(
+            NotificationChannel(
+                BROKEN_CHANNEL_ID,
+                "Vortex problems",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Tells you when a Vortex feature has stopped working."
+            },
+        )
+    }
+
     private fun createChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = service.getSystemService(NotificationManager::class.java) ?: return
@@ -305,6 +399,10 @@ class VortexNotification(
     companion object {
         private const val CHANNEL_ID = "vortex_bg"
         private const val NOTIF_ID = 0x701E5
+        /** Separate channel: the ongoing one is IMPORTANCE_LOW and silent by
+         *  design, which is wrong for something the user must act on. */
+        private const val BROKEN_CHANNEL_ID = "vortex_broken"
+        private const val BROKEN_NOTIF_ID = 0x701E6
         /** How often the foreground notification re-reads batteries. */
         private const val REFRESH_MS = 2_000L
         /** Keep the earbuds row visible (showing "…") this long after the

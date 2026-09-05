@@ -37,6 +37,11 @@ pub(crate) const CONFIRM_SCAN_MS: u64 = 2_000;
 /// key false-positive guard: if you're typing, you ARE the presence,
 /// even when the phone's app got killed (MIUI OneKeyClean).
 pub(crate) const IDLE_GATE_MS: u64 = 30_000;
+/// Idle time at a lock edge above which the lock is taken to be the
+/// screensaver's rather than the user's. Set well above the desktop's own idle
+/// delay so a deliberate lock — always preceded by recent input — never
+/// qualifies.
+pub(crate) const IDLE_LOCK_MIN_MS: u64 = 120_000;
 /// After a wake-while-locked with no live link yet (resume from
 /// suspend), keep the unlock intent armed this long so the unlock
 /// fires the moment the BLE session re-establishes. Sized for the
@@ -170,6 +175,20 @@ pub(crate) struct Inputs {
     /// Is the paired phone currently unlocked? Auto-unlock requires this
     /// (owner-present model) so a locked/pocketed phone can't open the laptop.
     pub phone_unlocked: bool,
+    /// Have we heard from the phone over ANY transport recently (BLE or LAN)?
+    ///
+    /// Presence used to be BLE-only, which made the laptop lock itself in front
+    /// of its owner: turn the phone's Bluetooth off, or let MIUI kill the app,
+    /// and the laptop saw "gone" while its own window still said "Online" off
+    /// the LAN heartbeat. A phone answering us on the LAN is in the building.
+    pub peer_contact_fresh: bool,
+    /// Is the laptop playing audio or video right now?
+    ///
+    /// The idle gate asks "has a key been pressed in the last 30 s", and the
+    /// answer is no for the entire length of a film. Watching something is not
+    /// being away, and locking the screen during it is the machine being wrong
+    /// about its owner in the most annoying possible way.
+    pub media_active: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -196,6 +215,7 @@ pub(crate) fn step(s: &mut ProxState, i: &Inputs) -> Action {
     s.last_link_live = i.link_live;
 
     let present = i.link_live
+        || i.peer_contact_fresh
         || (i.last_presence_ms != 0
             && i.now_ms.saturating_sub(i.last_presence_ms) < AWAY_GRACE_MS);
 
@@ -210,7 +230,23 @@ pub(crate) fn step(s: &mut ProxState, i: &Inputs) -> Action {
         if !prev && cur {
             // Just locked. Ours / phone-away → unlock may fire on return;
             // a manual lock with the phone present is respected.
-            s.unlock_armed = s.we_locked || !present;
+            // An IDLE lock is not a deliberate one.
+            //
+            // The rule was "ours, or the phone was away" — so GNOME's own idle
+            // lock, the ordinary way a screen locks when you step away for six
+            // minutes with the phone still on the desk, counted as a manual
+            // lock and demanded a password on return.
+            //
+            // A deliberate lock still stays locked, and that matters: locking
+            // your screen on purpose with your phone in your pocket must not be
+            // undone by the phone in your pocket. Idle time at the moment of
+            // the edge is what separates them — nobody presses Super+L after
+            // sitting still for five minutes, and the screensaver never fires
+            // while you are typing.
+            let was_idle_lock = i
+                .idle_ms
+                .is_some_and(|ms| ms >= IDLE_LOCK_MIN_MS);
+            s.unlock_armed = s.we_locked || !present || was_idle_lock;
             s.we_locked = false;
             s.eager_at_ms = 0;
         }
@@ -260,6 +296,11 @@ pub(crate) fn step(s: &mut ProxState, i: &Inputs) -> Action {
     if i.auto_lock_on
         && link_dropped
         && s.lock_armed
+        && !i.media_active
+        // A BLE drop is only evidence of absence when it is the ONLY thing we
+        // had. If the phone is still answering on the LAN it plainly has not
+        // left — its Bluetooth went off, or MIUI killed the app.
+        && !i.peer_contact_fresh
         && i.locked == Some(false)
         && i.idle_ms.map(|v| v >= IDLE_GATE_MS).unwrap_or(false)
     {
@@ -272,6 +313,7 @@ pub(crate) fn step(s: &mut ProxState, i: &Inputs) -> Action {
     if i.auto_lock_on
         && !present
         && s.lock_armed
+        && !i.media_active
         && i.locked == Some(false)
         && i.idle_ms.map(|v| v >= IDLE_GATE_MS).unwrap_or(false)
     {
@@ -332,6 +374,25 @@ pub(crate) fn step(s: &mut ProxState, i: &Inputs) -> Action {
 pub(crate) fn nudge() -> &'static tokio::sync::Notify {
     static NUDGE: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
     NUDGE.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Say ONCE per process that unlock is refused because the polkit rule was
+/// never installed. Without this the whole feature fails in a `tracing::warn!`
+/// nobody reads: the Settings toggle stays on, the phone shows an unlock
+/// button, and neither ever does anything. Once per process, because the
+/// proximity loop retries every 2s and a notification per attempt would be
+/// worse than the silence.
+pub(crate) async fn warn_unlock_denied_once() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    desktop_notify(
+        "Unlock needs a one-time permission",
+        "The system blocks remote unlock until you run, once, in the vortex \
+         folder:  sudo linux/packaging/install-unlock-rule.sh",
+    )
+    .await;
 }
 
 async fn desktop_notify(title: &str, text: &str) {
@@ -403,6 +464,13 @@ pub(crate) fn spawn_proximity_watch(
                         auto_unlock_on,
                         user_active,
                         phone_unlocked: LAST_PHONE_UNLOCKED.load(Ordering::Relaxed),
+                        // The phone answering on the LAN is presence too. The
+                        // window matches the pill sweeper's "we are in contact"
+                        // threshold.
+                        peer_contact_fresh: crate::ble::peer_contact_age_ms() < AWAY_GRACE_MS,
+                        // Only costs a D-Bus round-trip when a lock is possible.
+                        media_active: auto_lock_on
+                            && vortex_l3_daemon::core::media_runtime::any_player_playing().await,
                     },
                 );
                 match action {
@@ -459,7 +527,12 @@ pub(crate) fn spawn_proximity_watch(
                                 )
                                 .await;
                             }
-                            Err(e) => tracing::warn!("proximity unlock failed: {e}"),
+                            Err(e) => {
+                                tracing::warn!("proximity unlock failed: {e}");
+                                if session_lock::is_unlock_denied(&e) {
+                                    warn_unlock_denied_once().await;
+                                }
+                            }
                         }
                     }
                     Action::RelockIdle => {
@@ -490,6 +563,73 @@ pub(crate) fn spawn_proximity_watch(
 mod tests {
     use super::*;
 
+    /// The two guards that stop the laptop locking in front of its owner.
+    ///
+    /// Both were real: presence counted BLE only, so turning the phone's
+    /// Bluetooth off (or MIUI killing the app) read as "left the building" while
+    /// the laptop's own window still said Online off the LAN heartbeat; and the
+    /// idle gate reads "idle" for the whole length of a film.
+    #[test]
+    fn lan_contact_alone_counts_as_present() {
+        let mut st = ProxState { lock_armed: true, present: true, last_link_live: true, ..Default::default() };
+        let mut i = base(100_000);
+        i.link_live = false;          // BLE gone
+        i.last_presence_ms = 0;       // no advertisement either
+        i.peer_contact_fresh = true;  // …but the phone answers on the LAN
+        i.idle_ms = Some(IDLE_GATE_MS);
+        assert_eq!(step(&mut st, &i), Action::None, "a phone on the LAN is present");
+    }
+
+    #[test]
+    fn playback_blocks_the_lock() {
+        let mut st = ProxState { lock_armed: true, present: true, last_link_live: true, ..Default::default() };
+        let mut i = base(100_000);
+        i.link_live = false;
+        i.last_presence_ms = 0;
+        i.peer_contact_fresh = false; // genuinely absent
+        i.media_active = true;        // but a video is playing here
+        i.idle_ms = Some(IDLE_GATE_MS);
+        assert_eq!(step(&mut st, &i), Action::None, "must not lock mid-playback");
+
+        // …and with playback stopped, the same state DOES lock: the guard
+        // narrows the rule, it does not disable it.
+        let mut st2 = ProxState { lock_armed: true, present: true, last_link_live: true, ..Default::default() };
+        let mut i2 = base(100_000);
+        i2.link_live = false;
+        i2.last_presence_ms = 0;
+        i2.peer_contact_fresh = false;
+        i2.media_active = false;
+        i2.idle_ms = Some(IDLE_GATE_MS);
+        assert_eq!(step(&mut st2, &i2), Action::Lock, "auto-lock still works");
+    }
+
+    /// GNOME's own idle lock, with the phone on the desk, must still unlock on
+    /// return — while a DELIBERATE lock in the same conditions must not.
+    ///
+    /// Asserted on the ACTION rather than on `unlock_armed`, because the eager
+    /// unlock consumes the flag within the same step.
+    #[test]
+    fn an_idle_lock_unlocks_on_return_but_a_manual_one_does_not() {
+        for (idle_ms, should_unlock) in [(IDLE_LOCK_MIN_MS + 1, true), (1_000, false)] {
+            let mut st = ProxState {
+                present: true,
+                last_locked: Some(false),
+                ..Default::default()
+            };
+            let mut i = base(100_000);
+            i.link_live = true; // phone right here, authenticated
+            i.locked = Some(true); // …and the screen has just locked
+            i.idle_ms = Some(idle_ms);
+            let action = step(&mut st, &i);
+            let unlocked = action == Action::Unlock;
+            assert_eq!(
+                unlocked, should_unlock,
+                "a lock taken after {idle_ms}ms idle should {} unlock",
+                if should_unlock { "" } else { "NOT" }
+            );
+        }
+    }
+
     fn base(now_ms: u64) -> Inputs {
         Inputs {
             now_ms,
@@ -502,6 +642,8 @@ mod tests {
             auto_unlock_on: true,
             user_active: false,
             phone_unlocked: true,
+            peer_contact_fresh: false,
+            media_active: false,
         }
     }
 

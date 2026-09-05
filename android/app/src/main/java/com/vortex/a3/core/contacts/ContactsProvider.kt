@@ -29,6 +29,10 @@ class ContactsProvider(
     private var observer: ContentObserver? = null
 
     companion object {
+        /** Most contacts to mirror. ~120 entries is about 18 chunks — inside
+         *  the burst length this link handles without dropping notifies. */
+        private const val MAX_CONTACTS = 120
+
         /** Quiet window before re-reading + re-sending after an onChange burst. */
         private const val EMIT_DEBOUNCE_MS = 2_000L
     }
@@ -83,6 +87,13 @@ class ContactsProvider(
     private fun emitSnapshot() {
         try {
             onContacts(readContacts())
+        } catch (e: SecurityException) {
+            // Not a log line: the laptop would otherwise show an empty Contacts
+            // page forever with nothing saying why.
+            com.vortex.a3.core.notif.FeatureBlocked.report(
+                context, "Contacts", android.Manifest.permission.READ_CONTACTS,
+            )
+            Log.w(tag, "emitSnapshot: ${e.message}")
         } catch (e: Exception) {
             Log.w(tag, "emitSnapshot: ${e.message}")
         }
@@ -114,7 +125,22 @@ class ContactsProvider(
                 if (num.isEmpty()) continue
                 val entry = byId.getOrPut(id) { name to mutableListOf() }
                 if (num !in entry.second) entry.second.add(num)
+                // Cap the set that goes over BLE.
+                //
+                // The read was unbounded and the whole thing was re-sent on
+                // every change AND every reconnect. A 2000-contact address book
+                // is roughly 300 chunks at 450 bytes — about eight times the
+                // ~36-chunk run this link is documented as handling reliably.
+                // One lost notify in that burst desyncs the receive cipher,
+                // which drops the session, taking any CALL frame in flight with
+                // it; the laptop then renders a stale disk cache with no sign
+                // anything failed. A truncated list that arrives beats a
+                // complete one that never does.
+                if (byId.size >= MAX_CONTACTS) break
             }
+        }
+        if (byId.size >= MAX_CONTACTS) {
+            Log.i(tag, "contacts capped at $MAX_CONTACTS for the BLE burst")
         }
         return byId.map { (id, v) ->
             Contact(

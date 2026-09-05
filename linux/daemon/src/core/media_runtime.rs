@@ -312,6 +312,23 @@ pub(crate) async fn playing_players(conn: &Connection) -> Vec<String> {
     out
 }
 
+/// Is anything playing on this laptop right now?
+///
+/// Used by the proximity auto-lock: the idle gate only knows whether a key has
+/// been pressed, which reads "idle" for the whole length of a film. Locking the
+/// screen on someone watching something is the machine being confidently wrong
+/// about where its owner is.
+///
+/// Uses the cached session connection, and answers `false` if the bus is
+/// unreachable — which keeps the previous behaviour rather than accidentally
+/// disabling auto-lock when D-Bus is unhappy.
+pub async fn any_player_playing() -> bool {
+    let Some(conn) = session_conn().await else {
+        return false;
+    };
+    !playing_players(conn).await.is_empty()
+}
+
 /// Process-wide cached session-bus connection for callers outside this
 /// crate (the Tauri app's media remote): repeated `Connection::session()`
 /// leaks D-Bus connections — the per-tick `bluer::Session::new` trap.

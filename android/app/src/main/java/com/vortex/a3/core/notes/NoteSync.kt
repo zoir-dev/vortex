@@ -66,14 +66,28 @@ object NoteSync {
     /** Reassembles a chunked full item set. */
     private class Assembler {
         private val parts = sortedMapOf<Int, ByteArray>()
+        private var lastTotal = -1
 
         @Synchronized
         fun add(total: Int, idx: Int, data: ByteArray): List<Note>? {
             if (total <= 0 || total > 4096) return null
+            // A different `total` means a DIFFERENT set — the previous one never
+            // finished. Keeping its parts mixed old chunks into the new set and
+            // produced a buffer that was neither, so after a single dropped
+            // chunk the assembler stayed wrong until two pushes happened to
+            // share a chunk count.
+            if (total != lastTotal) {
+                parts.clear()
+                lastTotal = total
+            }
+            // Restarting at index 0 is the same signal: a fresh push of the
+            // same size.
+            if (idx == 0 && parts.isNotEmpty()) parts.clear()
             parts[idx] = data
             if (parts.size != total) return null
             val buf = parts.values.fold(ByteArray(0)) { a, b -> a + b }
             parts.clear()
+            lastTotal = -1
             return Note.listFromBytes(buf)
         }
     }
@@ -81,7 +95,24 @@ object NoteSync {
     /** Send our full set to the peer (chunked). */
     fun sendFull(items: List<Note>) {
         val s = sendChunk ?: return
-        buildChunks(items).forEach { s(it) }
+        val sc = scope
+        val chunks = buildChunks(items)
+        if (chunks.size <= 1 || sc == null) {
+            chunks.forEach { s(it) }
+            return
+        }
+        // Pace it. This went out back-to-back, which is exactly what the GATT
+        // server's own comment warns about ("back-to-back notifies overflow the
+        // stack's queue and drop") and what the clipboard path already spaces at
+        // 12 ms. Any set over ~400 bytes — two or three notes — was riding the
+        // unpaced path, and a single dropped chunk left the laptop's assembler
+        // waiting for a piece that never comes.
+        sc.launch {
+            for ((i, c) in chunks.withIndex()) {
+                if (i > 0) delay(12)
+                s(c)
+            }
+        }
     }
 
     /** Debounced push of our full set after a local edit / on connect. */

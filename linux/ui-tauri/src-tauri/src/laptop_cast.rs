@@ -113,6 +113,11 @@ static REQ_FALSE_MISSES: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomi
 /// Falses needed before we actually stop (≈ a few heartbeats of confirmed off).
 const REQ_FALSE_LIMIT: u32 = 3;
 
+/// No frame from the phone over any transport for this long → tear the cast
+/// down, virtual monitor included. Well above any normal gap: while casting,
+/// the phone is in constant contact.
+const PEER_LOST_MS: u64 = 20_000;
+
 struct CastHandle {
     /// Fire to tear the cast down (pipeline → Null, portal session closed).
     stop_tx: tokio::sync::oneshot::Sender<()>,
@@ -579,6 +584,25 @@ async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), S
                 }
             }
             if fatal {
+                break;
+            }
+            // A phone that simply VANISHES never sends the three `req=false`
+            // beats the stop path waits for. Battery dead, force-stopped,
+            // carried out of range — and in extend mode that left a virtual
+            // monitor registered with Mutter that the user cannot see: windows
+            // open on it and the pointer walks onto it and disappears, for the
+            // rest of the session.
+            //
+            // Loss of contact is the missing falling edge. The threshold is
+            // generous because the cast itself is the traffic keeping contact
+            // fresh; going this long without a single frame from the phone means
+            // it is gone, not slow.
+            if crate::ble::peer_contact_age_ms() > PEER_LOST_MS {
+                tracing::info!(
+                    "laptop-cast: no contact with the phone for over {}s — tearing down \
+                     (a virtual monitor must never outlive the device it exists for)",
+                    PEER_LOST_MS / 1000
+                );
                 break;
             }
             tokio::select! {

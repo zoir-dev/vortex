@@ -39,8 +39,18 @@ class VortexService : Service() {
             // Fast path over the already-open BLE link (~200 ms, works
             // in-pocket); LAN nudge is the fallback. Both fire; the laptop
             // dedups by latest state.
-            stack.pushStateViaBle()
-            liveLan?.nudge()
+            //
+            // Guarded: `pushStateViaBle` reads `peerStore`, which is a
+            // `lateinit` initialised by the stack. A trigger that fires before
+            // the stack is up therefore throws, and a throw here happens on a
+            // system callback thread — which takes the whole service down. The
+            // network callback added below fires the instant it registers, so
+            // it hit this immediately; the battery receiver only ever avoided
+            // it by luck of timing.
+            if (stack.isStarted()) {
+                stack.pushStateViaBle()
+                liveLan?.nudge()
+            }
         },
     )
 
@@ -64,7 +74,123 @@ class VortexService : Service() {
         } catch (e: Exception) {
             Log.w(tag, "listener requestRebind: ${e.message}")
         }
+        startListenerWatchdog()
+        cleanStaleListenerEntry()
         ensureStackStarted()
+    }
+
+    /** How often to check that the notification listener is actually bound. */
+    private val listenerCheckMs = 60_000L
+    private val listenerHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var listenerMisses = 0
+    private var listenerWarned = false
+
+    /**
+     * Keep asking until the notification listener is really bound.
+     *
+     * The single `requestRebind` in [onCreate] is not enough, because the
+     * failure it is meant to cover does not always happen at create time. MIUI's
+     * OneKeyClean kills this process while the user is elsewhere; Android brings
+     * the foreground services back but leaves the listener unbound, and there is
+     * no callback for that — the app simply never hears about notifications
+     * again. On this device it stayed that way for nearly two hours, twice in
+     * one morning, while both ends still displayed "connected".
+     *
+     * So: check on a timer. `requestRebind` is cheap and a no-op when bound. If
+     * it still has not taken after a few minutes, the binding is not something
+     * the app can repair — notification access has to be toggled by hand — so
+     * say so once, plainly, instead of leaving the user with silence.
+     */
+    private fun startListenerWatchdog() {
+        listenerHandler.removeCallbacksAndMessages(null)
+        listenerHandler.postDelayed(
+            object : Runnable {
+                override fun run() {
+                    try {
+                        checkListenerBound()
+                    } catch (t: Throwable) {
+                        Log.w(tag, "listener watchdog: ${t.message}")
+                    }
+                    listenerHandler.postDelayed(this, listenerCheckMs)
+                }
+            },
+            listenerCheckMs,
+        )
+    }
+
+    private fun checkListenerBound() {
+        val granted = try {
+            androidx.core.app.NotificationManagerCompat
+                .getEnabledListenerPackages(this)
+                .contains(packageName)
+        } catch (t: Throwable) {
+            true // can't tell — assume granted and let the rebind attempt speak
+        }
+        if (com.vortex.a3.core.media.MediaNotificationListenerService.isBound()) {
+            listenerMisses = 0
+            listenerWarned = false
+            return
+        }
+        listenerMisses++
+        if (!granted) {
+            // Access itself is off: rebinding cannot help, only the user can.
+            warnListenerDead(accessRevoked = true)
+            return
+        }
+        Log.w(tag, "notification listener not bound (miss #$listenerMisses) — requesting rebind")
+        try {
+            android.service.notification.NotificationListenerService.requestRebind(
+                android.content.ComponentName(
+                    this,
+                    com.vortex.a3.core.media.MediaNotificationListenerService::class.java,
+                ),
+            )
+        } catch (e: Exception) {
+            Log.w(tag, "listener requestRebind: ${e.message}")
+        }
+        // Three misses ≈ three minutes of asking with no bind. Past that it is
+        // not coming back on its own.
+        if (listenerMisses >= 3) {
+            warnListenerDead(accessRevoked = false)
+        }
+    }
+
+    /**
+     * Remove the obsolete `VortexService` entry from the system's enabled
+     * notification-listener list.
+     *
+     * It is a leftover from when the service itself was the listener. It does
+     * nothing — the system logs "Not registering … it does not require the
+     * permission" on every boot — but it sits in the same setting as the real
+     * listener and makes the list read as though two components are enabled,
+     * which is exactly the wrong impression while diagnosing a listener that is
+     * not bound. Best-effort: on most builds this setting is not writable
+     * without a privileged permission, so a failure is expected and silent.
+     */
+    private fun cleanStaleListenerEntry() {
+        try {
+            val key = "enabled_notification_listeners"
+            val cur = android.provider.Settings.Secure.getString(contentResolver, key) ?: return
+            val stale = "$packageName/${VortexService::class.java.name}"
+            if (!cur.split(':').contains(stale)) return
+            val cleaned = cur.split(':').filter { it.isNotEmpty() && it != stale }.joinToString(":")
+            if (android.provider.Settings.Secure.putString(contentResolver, key, cleaned)) {
+                Log.i(tag, "removed the stale VortexService notification-listener entry")
+            }
+        } catch (t: Throwable) {
+            Log.d(tag, "stale listener entry not removable: ${t.message}")
+        }
+    }
+
+    private fun warnListenerDead(accessRevoked: Boolean) {
+        if (listenerWarned) return
+        listenerWarned = true
+        Log.w(tag, "notification mirroring is dead (accessRevoked=$accessRevoked)")
+        try {
+            notification.postListenerBroken(accessRevoked)
+        } catch (t: Throwable) {
+            Log.w(tag, "listener warning notification: ${t.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -208,8 +334,16 @@ class VortexService : Service() {
             com.vortex.a3.core.clipboard.ClipboardOutgoingFile> =
             kotlinx.coroutines.flow.MutableSharedFlow(
                 replay = 0,
-                extraBufferCapacity = 4,
-                onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+                // Sized for a real multi-select share. The share sheet hands us
+                // every file at once in a tight loop, while the collector hashes
+                // each one with SHA-256 and sends a BLE offer per file — far
+                // slower than the emit. With four slots and DROP_OLDEST, a
+                // ten-photo share silently forwarded only some of them, and the
+                // toast still said "Sending 10 files to laptop…". Dropping the
+                // user's files is not a reasonable answer to back-pressure, and
+                // a queue of offers costs almost nothing to hold.
+                extraBufferCapacity = 64,
+                onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.SUSPEND,
             )
 
         /** Browsing HANDOFF (seamless-continuity): a page the phone wants to continue

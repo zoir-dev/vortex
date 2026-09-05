@@ -225,6 +225,11 @@ class SmsProvider(
     private fun emitSnapshot() {
         try {
             onSms(readSms())
+        } catch (e: SecurityException) {
+            com.vortex.a3.core.notif.FeatureBlocked.report(
+                context, "Messages", android.Manifest.permission.READ_SMS,
+            )
+            Log.w(tag, "emitSnapshot: ${e.message}")
         } catch (e: Exception) {
             Log.w(tag, "emitSnapshot: ${e.message}")
         }

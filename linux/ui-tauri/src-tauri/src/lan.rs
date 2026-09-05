@@ -32,6 +32,52 @@ use crate::lan_state::{dispatch_appstate_call, dispatch_lock_command};
 pub(crate) static LAST_GOOD_PEER_IP: std::sync::Mutex<Option<std::net::IpAddr>> =
     std::sync::Mutex::new(None);
 
+/// A peer `audio_claim_request` that landed while a switch flow was still
+/// running, and is now waiting for that flow to settle.
+///
+/// The flag is ONE-SHOT on both sides of the wire — the phone consumes it
+/// with `pendingAudioClaim.getAndSet(false)` and we consume ours with
+/// `claim_peer.swap(false, ..)` — unlike its neighbours `lockCommand` and
+/// `mediaControl`, which deliberately ride every snapshot until their TTL.
+/// So the old "we're busy; ignoring" arm didn't postpone the claim, it
+/// destroyed it: nobody ever re-sent one. That mattered most at call end,
+/// where the phone's claim is what starts the flow whose Idle transition
+/// is the ONLY thing that calls `resume_paused_for_call` — drop the claim
+/// and the laptop's media stayed paused for good. (Observed 2026-08-24:
+/// six claims ignored, one resume.)
+///
+/// This latch guarantees at most one waiter, because a claim arriving
+/// while one is armed is the same claim retried, not a new one.
+static PENDING_PEER_CLAIM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How long a deferred claim waits for the orchestrator before running
+/// anyway. Sized past the orchestrator's own ~14 s watchdog so a normal
+/// slow switch is waited out rather than raced.
+const CLAIM_DEFER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Resolve once the orchestrator is no longer mid-flow. `Failed` counts as
+/// settled — the flow is over either way, and only `Idle`-watching is what
+/// let a failed switch pin a pending claim open.
+async fn wait_for_settled(
+    mut rx: tokio::sync::watch::Receiver<
+        vortex_l3_daemon::core::audio_orchestrator::SwitchState,
+    >,
+) {
+    use vortex_l3_daemon::core::audio_orchestrator::SwitchState;
+    loop {
+        if matches!(
+            *rx.borrow_and_update(),
+            SwitchState::Idle | SwitchState::Failed(_)
+        ) {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 fn last_peer_ip_path() -> Option<std::path::PathBuf> {
     let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
     p.push(".cache/vortex/last_peer_ip");
@@ -159,6 +205,54 @@ pub(crate) fn note_peer_reported_ip(state: &AppState) {
 /// gateway (phone-as-hotspot). `fresh` skips the cached-IP probe — the
 /// one-shot retry path after a session failed on an address that answered
 /// TCP but wasn't (or no longer was) our phone.
+/// Trusted peers' PRS values, kept here because the discovery filter runs far
+/// from anywhere that holds the peer store. Refreshed by the LAN loop, which
+/// reads the store every round anyway.
+pub(crate) static TRUSTED_PRS: std::sync::Mutex<Vec<[u8; 32]>> = std::sync::Mutex::new(Vec::new());
+
+/// Record the trusted peers' PRS values for [`instance_matches_a_trusted_peer`].
+pub(crate) fn note_trusted_prs(prs: Vec<[u8; 32]>) {
+    if let Ok(mut g) = TRUSTED_PRS.lock() {
+        *g = prs;
+    }
+}
+
+/// Does this mDNS instance name carry a presence token one of our trusted
+/// peers would publish right now?
+///
+/// Same derivation and the same ±2 bucket tolerance the BLE advertisement
+/// filter uses. Unknown-shaped names are accepted rather than rejected: the
+/// token is a filter, not authentication — the IK handshake is what actually
+/// establishes trust — so being wrong here should cost a wasted dial, never a
+/// phone that cannot be found.
+fn instance_matches_a_trusted_peer(instance: &str) -> bool {
+    use vortex_l3_daemon::core::crypto::presence::{current_bucket, derive_presence_token};
+    let lower = instance.to_ascii_lowercase();
+    let head = lower.split_once('.').map(|(h, _)| h).unwrap_or(&lower);
+    let Some(hex) = head.strip_prefix("vortex-") else {
+        return true; // not a shape we can judge
+    };
+    if hex.len() != 16 {
+        return true;
+    }
+    let prs_list = TRUSTED_PRS.lock().map(|g| g.clone()).unwrap_or_default();
+    if prs_list.is_empty() {
+        return true; // nothing to compare against yet
+    }
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bucket_now = current_bucket(now_sec, 60);
+    prs_list.iter().any(|prs| {
+        [-2i64, -1, 0, 1, 2].iter().any(|d| {
+            let tok = derive_presence_token(prs, (bucket_now as i64 + *d) as u64);
+            hex == tok.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        })
+    })
+}
+
+
 pub(crate) async fn resolve_peer_addr(fresh: bool) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr};
     /// Probe with RETRIES, unlike the heartbeat's single 2 s attempt. A phone
@@ -197,7 +291,20 @@ pub(crate) async fn resolve_peer_addr(fresh: bool) -> Option<std::net::SocketAdd
     }
     match discover_first(Duration::from_secs(6)).await {
         Ok(Some(c)) => {
-            if let Some(ip) = c
+            // Is this OUR phone?
+            //
+            // The instance name carries the same PRS-derived presence token the
+            // BLE advertisement does, and the BLE path checks it — this one did
+            // not. With a second Vortex phone on the same network the laptop
+            // could pick it every tick, fail the IK handshake (which does
+            // authenticate, so nothing worse than that happens), cache its
+            // address, and try the same wrong device again.
+            if !instance_matches_a_trusted_peer(&c.instance_name) {
+                tracing::debug!(
+                    instance = %c.instance_name,
+                    "mdns: a vortex instance that is not our peer — ignoring"
+                );
+            } else if let Some(ip) = c
                 .addresses
                 .iter()
                 .find(|a| matches!(a, IpAddr::V4(_)))
@@ -302,6 +409,9 @@ pub(crate) async fn try_lan_reconnect(
     // legacy entries that may still linger (we forget on save now,
     // but be defensive — older installs may still have duplicates).
     peers.sort_by_key(|p| std::cmp::Reverse(p.paired_at));
+    // Keep the discovery filter's copy current — it runs far from here and has
+    // no access to the store.
+    note_trusted_prs(peers.iter().map(|p| p.prs).collect());
 
     // Fast path (the LAN twin of the BLE last-RPA direct-connect): most ticks
     // the phone is still at the IP that completed the previous handshake, so
@@ -905,41 +1015,84 @@ pub(crate) async fn try_lan_reconnect(
                     }
 
                     if s.audio_claim_request {
-                        let already_busy = switch_orchestrator
+                        // The peer's reclaim request. `settled` — not the
+                        // narrower `== Idle` — is what "we can act" means:
+                        // a `Failed` flow is over, and treating it as busy
+                        // used to block the reclaim behind a switch that had
+                        // already given up.
+                        let settled = switch_orchestrator
                             .as_ref()
-                            .map(|o| *o.state().borrow() != vortex_l3_daemon::core::audio_orchestrator::SwitchState::Idle)
-                            .unwrap_or(false);
-                        if already_busy {
-                            tracing::info!("peer set audio_claim_request but we're busy; ignoring");
-                        } else if let (Some(orch), Some(writers)) =
+                            .map(|o| {
+                                use vortex_l3_daemon::core::audio_orchestrator::SwitchState;
+                                matches!(*o.state().borrow(), SwitchState::Idle | SwitchState::Failed(_))
+                            })
+                            .unwrap_or(true);
+                        if let (Some(orch), Some(writers)) =
                             (switch_orchestrator.clone(), session_writers.clone())
                         {
-                            tracing::info!("peer set audio_claim_request; running initiator");
-                            let peer_c = peer.clone();
-                            let identity_priv = identity.static_priv.0;
-                            let peer_store_c = peer_store.clone();
-                            let addr_target = outcome.remote;
-                            let mac_addr = vortex_l3_daemon::core::earbuds_store::load()
-                                .map(|s| s.address)
-                                .unwrap_or_default();
-                            if mac_addr.is_empty() {
-                                tracing::warn!("audio_claim_request: no saved earbuds MAC; skipping");
+                            // Arm at most one waiter: the flag is one-shot on
+                            // the wire, so a second claim arriving while we're
+                            // already waiting is the SAME claim being retried,
+                            // not a new one.
+                            let armed = !settled
+                                && PENDING_PEER_CLAIM.swap(true, std::sync::atomic::Ordering::SeqCst);
+                            if armed {
+                                tracing::info!(
+                                    "peer set audio_claim_request while busy; waiter already armed"
+                                );
                             } else {
-                                tokio::spawn(async move {
-                                    let local_counter = peer_store_c
-                                        .load_counter(&peer_c.peer_static_pub)
-                                        .unwrap_or(0);
-                                    let _ = vortex_l3_daemon::core::audio_lan_session::start_initiator_session(
-                                        addr_target,
-                                        &identity_priv,
-                                        &peer_c.peer_static_pub,
-                                        &peer_c.prs,
-                                        local_counter,
-                                        mac_addr,
-                                        orch,
-                                        writers,
-                                    ).await;
-                                });
+                                if settled {
+                                    tracing::info!("peer set audio_claim_request; running initiator");
+                                } else {
+                                    tracing::info!(
+                                        "peer set audio_claim_request but we're mid-flow; deferring until the orchestrator settles"
+                                    );
+                                }
+                                let peer_c = peer.clone();
+                                let identity_priv = identity.static_priv.0;
+                                let peer_store_c = peer_store.clone();
+                                let addr_target = outcome.remote;
+                                let mac_addr = vortex_l3_daemon::core::earbuds_store::load()
+                                    .map(|s| s.address)
+                                    .unwrap_or_default();
+                                if mac_addr.is_empty() {
+                                    tracing::warn!("audio_claim_request: no saved earbuds MAC; skipping");
+                                    PENDING_PEER_CLAIM.store(false, std::sync::atomic::Ordering::SeqCst);
+                                } else {
+                                    tokio::spawn(async move {
+                                        if !settled {
+                                            let waited = tokio::time::timeout(
+                                                CLAIM_DEFER_TIMEOUT,
+                                                wait_for_settled(orch.state()),
+                                            )
+                                            .await;
+                                            PENDING_PEER_CLAIM
+                                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                                            match waited {
+                                                Ok(()) => tracing::info!(
+                                                    "deferred audio_claim_request: orchestrator settled, running initiator now"
+                                                ),
+                                                Err(_) => tracing::warn!(
+                                                    "deferred audio_claim_request: orchestrator still busy after {}s; running anyway",
+                                                    CLAIM_DEFER_TIMEOUT.as_secs()
+                                                ),
+                                            }
+                                        }
+                                        let local_counter = peer_store_c
+                                            .load_counter(&peer_c.peer_static_pub)
+                                            .unwrap_or(0);
+                                        let _ = vortex_l3_daemon::core::audio_lan_session::start_initiator_session(
+                                            addr_target,
+                                            &identity_priv,
+                                            &peer_c.peer_static_pub,
+                                            &peer_c.prs,
+                                            local_counter,
+                                            mac_addr,
+                                            orch,
+                                            writers,
+                                        ).await;
+                                    });
+                                }
                             }
                         }
                     }
@@ -953,7 +1106,6 @@ pub(crate) async fn try_lan_reconnect(
                     // Tray tooltip + battery menu rows: live battery + which
                     // device holds the buds (shared helper in tray.rs).
                     crate::tray::update_battery_rows(
-                        &app,
                         local_state.earbuds.as_ref(),
                         Some(&state),
                     );
@@ -1135,8 +1287,18 @@ pub(crate) fn spawn_heartbeat(
                                 .await,
                                 Ok(Some(_))
                             );
-                            *auto_last_reconnect.lock().await =
-                                Some(tokio::time::Instant::now());
+                            // Stamp only a SUCCESSFUL sync. This timestamp is
+                            // the mDNS wake-up's staleness gate, and stamping
+                            // failed attempts too made it lie in the worst
+                            // direction: while the phone was away every futile
+                            // attempt refreshed the gate, so the reconnect that
+                            // should have fired the instant it came back was
+                            // held off instead. "Last time we were actually in
+                            // sync" is the only reading that gate wants.
+                            if synced {
+                                *auto_last_reconnect.lock().await =
+                                    Some(tokio::time::Instant::now());
+                            }
                         }
                         (have_trust, synced)
                     };

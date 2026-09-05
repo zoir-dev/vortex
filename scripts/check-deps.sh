@@ -114,16 +114,41 @@ check_version() {
   return 1
 }
 
+# Probe the LIBRARY, not a Debian package name. `dpkg -s` reports EVERY lib as
+# missing on Fedora/Arch/openSUSE, where these are called something else
+# entirely (libdbus-1-dev → dbus-devel, librsvg2-dev → librsvg2-devel …) —
+# a clean Fedora box with all deps installed still scored 0/6. pkg-config
+# answers the question we actually care about ("can the build link it?") the
+# same way on every distro. Call sites keep the Debian names as labels.
 check_lib() {
-  local package
+  local package modules m
   package="$1"
 
-  if dpkg -s "$package" >/dev/null 2>&1; then
-    ok "$package"
+  case "$package" in
+    libdbus-1-dev)         modules="dbus-1" ;;
+    libwebkit2gtk-4.1-dev) modules="webkit2gtk-4.1" ;;
+    libssl-dev)            modules="openssl" ;;
+    # Ayatana on Debian/Arch, the older libappindicator on Fedora/openSUSE.
+    # Tauri links whichever is present, so either satisfies this.
+    libayatana-appindicator3-dev) modules="ayatana-appindicator3-0.1 appindicator3-0.1" ;;
+    librsvg2-dev)          modules="librsvg-2.0" ;;
+    protobuf-compiler)     modules="" ;;   # a binary, not a linkable library
+    *)                     modules="$package" ;;
+  esac
+
+  if [ -z "$modules" ]; then
+    if have_cmd protoc; then ok "$package"; return 0; fi
+  elif ! have_cmd pkg-config; then
+    warn "$package  UNKNOWN (pkg-config is not installed)"
+    return 0
   else
-    warn "$package  NOT FOUND"
-    MISSING_LIBS+=("$package")
+    for m in $modules; do
+      if pkg-config --exists "$m" 2>/dev/null; then ok "$package"; return 0; fi
+    done
   fi
+
+  warn "$package  NOT FOUND"
+  MISSING_LIBS+=("$package")
 }
 
 system_summary() {

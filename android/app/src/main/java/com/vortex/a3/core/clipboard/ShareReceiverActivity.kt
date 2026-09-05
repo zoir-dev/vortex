@@ -80,9 +80,16 @@ class ShareReceiverActivity : Activity() {
         for (uri in uris) {
             val file = ClipboardFileReader.read(this, uri)
             if (file != null) {
-                VortexService.clipboardFileBus.tryEmit(file)
-                Log.i(TAG, "share: forwarded file '${file.name}' (${file.bytes.size} bytes)")
-                sent++
+                // `tryEmit` returning false means the buffer was full and this
+                // file went nowhere — which used to happen silently, and then be
+                // counted as sent. Count only what the bus actually took, so the
+                // toast tells the truth.
+                if (VortexService.clipboardFileBus.tryEmit(file)) {
+                    Log.i(TAG, "share: forwarded file '${file.name}' (${file.bytes.size} bytes)")
+                    sent++
+                } else {
+                    Log.w(TAG, "share: bus full, dropped '${file.name}'")
+                }
             } else {
                 Log.w(TAG, "share: couldn't read $uri")
             }

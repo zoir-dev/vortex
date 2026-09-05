@@ -186,6 +186,8 @@ class Advertiser(private val context: Context) {
         prs: ByteArray,
         scope: CoroutineScope,
         rotationWindowSec: Long = 60L,
+        /** True while a peer is connected over GATT. See the rotation loop. */
+        isConnected: () -> Boolean = { false },
         onError: (String) -> Unit = {},
     ) {
         require(prs.size == 32) { "PRS must be 32 bytes" }
@@ -206,6 +208,30 @@ class Advertiser(private val context: Context) {
                 val nowSec = System.currentTimeMillis() / 1000
                 val bucket = Presence.currentBucket(nowSec, rotationWindowSec)
                 val token = Presence.deriveToken(prsCopy, bucket)
+                // Do NOT restart the advertiser while a peer is connected.
+                //
+                // Stopping and starting an advertising set makes Android hand
+                // out a fresh resolvable private address. Doing that every 60 s
+                // (and again on every characteristic subscribe) meant the
+                // laptop's cached address was ALWAYS dead by the time it tried
+                // to reconnect, so its "connect straight to the last address"
+                // fast path could never once succeed — every reconnect paid a
+                // full 15 s scan, and six such failures in a row used to make
+                // the laptop power-cycle its whole Bluetooth adapter.
+                //
+                // The rotation exists to stop a passive observer linking our
+                // advertisements over time. A connected peer is not that
+                // observer: it already knows exactly who we are, and while the
+                // link is up nobody is scanning for us. So rotate when it
+                // matters — between sessions — and hold still while connected.
+                if (isConnected() && activePayload != null) {
+                    Log.d(TAG, "presence rotation held: peer connected (keeping this RPA)")
+                    val intoBucket = nowSec % rotationWindowSec
+                    withTimeoutOrNull((rotationWindowSec - intoBucket + 5L) * 1000) {
+                        rotationKick.receive()
+                    }
+                    continue
+                }
                 stop()
                 startWith(AdvPayload.trustedPresence(token)) { result ->
                     when (result) {

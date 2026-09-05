@@ -13,11 +13,17 @@ use vortex_l3_daemon::core::storage::peers::PeerStore;
 use crate::NotifWriter;
 
 /// Consecutive connect failures (phone present, but the connect aborts —
-/// `le-connection-abort-by-local` / services-not-resolved) before we escalate
-/// to a full adapter power-cycle. The per-cycle `remove_device` cleanup clears
-/// stale RPA objects; only when that repeatedly fails to help do we assume the
-/// controller itself is wedged and reset it. ~6 cycles ≈ a few seconds of dead
-/// retries before the invisible self-heal kicks in.
+/// `le-connection-abort-by-local` / services-not-resolved) before we back off
+/// harder between attempts.
+///
+/// This used to escalate to powering the whole adapter off and on. That is
+/// removed: it takes down every other BLE device on the machine — the user's
+/// earbuds mid-stream, a Bluetooth mouse, another user's peripherals — to fix a
+/// problem with ONE link, which is exactly what vortex is not allowed to do.
+/// The log from the one time it fired shows it did not even work: the very next
+/// connect failed the same way, because the real cause was the phone handing
+/// out a fresh RPA every time (see the advertiser fix on the Android side), not
+/// a wedged controller.
 const CONNECT_WEDGE_THRESHOLD: u32 = 6;
 
 /// Early-wake for the BLE state heartbeat (the 12s loop inside the
@@ -70,6 +76,61 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Does a failed STATE write mean the LINK is gone, or only that the ATT
+/// bearer was busy?
+///
+/// The distinction decides whether we tear the session down, so it has to be
+/// conservative in the safe direction: anything we do not recognise is treated
+/// as busy and the link is kept. A link that is really dead costs us nothing
+/// to keep believing in for a few more beats — `run_listener` returns on a real
+/// disconnect and tears the session down anyway — whereas killing a live link
+/// costs a full scan, IK handshake, resubscribe and bulk re-push.
+///
+/// Matched on substrings because these arrive as D-Bus error text from BlueZ,
+/// not as typed variants.
+fn state_write_means_link_gone(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    // BlueZ says the device, the characteristic, or the D-Bus object is gone.
+    e.contains("not connected")
+        || e.contains("notconnected")
+        || e.contains("does not exist")
+        || e.contains("doesnotexist")
+        || e.contains("unknown object")
+        || e.contains("unknownobject")
+        || e.contains("no such device")
+        || e.contains("object removed")
+        // zbus's wording for UnknownObject, seen live as "the target object was
+        // either not present or removed". Missing it kept a genuinely dead link
+        // "alive" for 40 beats of pointless retries instead of reconnecting.
+        || e.contains("not present or removed")
+        || e.contains("disconnected")
+}
+
+#[cfg(test)]
+mod link_gone_tests {
+    use super::state_write_means_link_gone;
+
+    /// The exact strings observed on this deployment, so a future edit to the
+    /// list cannot silently drop one.
+    #[test]
+    fn real_bluez_errors_are_classified() {
+        for dead in [
+            "BLE write STATE to AUDIO_SIGNAL: the target object was either not present or removed",
+            "BLE write STATE to AUDIO_SIGNAL: Not connected",
+            "org.freedesktop.DBus.Error.UnknownObject: no such object",
+        ] {
+            assert!(state_write_means_link_gone(dead), "should be fatal: {dead}");
+        }
+        for busy in [
+            "BLE write STATE to AUDIO_SIGNAL: Bluetooth operation in progress: In Progress",
+            "BLE write STATE to AUDIO_SIGNAL: br-connection-busy",
+            "Method call timed out",
+        ] {
+            assert!(!state_write_means_link_gone(busy), "should be retryable: {busy}");
+        }
+    }
 }
 
 /// Find the first trusted-presence advertiser on-air whose 8-byte
@@ -541,28 +602,6 @@ pub(crate) async fn connect_bonded_or_scan(
     }
 }
 
-/// Last-resort BlueZ self-heal: power-cycle the adapter to clear a wedged
-/// controller / stale RPA device objects after repeated connect failures
-/// (`le-connection-abort-by-local`, services-not-resolved). This is exactly the
-/// manual "restart Bluetooth" that unwedges it — done invisibly so the user
-/// never sees the link as broken. Linux lets us toggle power with no prompt.
-/// Heavy hammer (it momentarily drops other BLE devices), so the caller only
-/// invokes it after [`CONNECT_WEDGE_THRESHOLD`] consecutive failures, which the
-/// natural per-cycle `remove_device` cleanup never resolved.
-async fn power_cycle_adapter(adapter: &bluer::Adapter) {
-    tracing::warn!("BLE: repeated connect failures — power-cycling adapter to clear the stack");
-    if let Err(e) = adapter.set_powered(false).await {
-        tracing::warn!("BLE power-cycle: set_powered(false) failed: {e}");
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    match adapter.set_powered(true).await {
-        Ok(()) => tracing::info!("BLE: adapter power-cycled — retrying reconnect"),
-        Err(e) => tracing::warn!("BLE power-cycle: set_powered(true) failed: {e}"),
-    }
-    // Let BlueZ re-init the controller before the next scan/connect.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-}
-
 /// Drop a failed RPA's device entry from BlueZ entirely. Without this the
 /// next discovery round re-serves the DEAD address from the adapter's
 /// advertisement cache (its stale token still validates — the ±2-bucket
@@ -739,16 +778,23 @@ pub(crate) async fn run_ble_persistent_loop(
         {
             Some(c) => c,
             None => {
-                // Invisible self-heal: the phone is present but connects keep
-                // aborting (BlueZ RPA-churn wedge) — power-cycle the adapter to
-                // clear the controller, exactly the manual "restart Bluetooth"
-                // that fixes it. Only after the per-cycle remove_device cleanup
-                // has failed CONNECT_WEDGE_THRESHOLD times in a row, so a merely
-                // absent phone (which never bumps the counter) won't trigger it.
+                // The phone is present but connects keep aborting. Drop the
+                // cached address and wait longer before trying again — the
+                // per-device `remove_device` cleanup has already run, and
+                // hammering a busy controller is what makes it worse.
+                //
+                // Deliberately NOT an adapter power-cycle any more: that fixed
+                // one link by breaking every other Bluetooth device on the
+                // machine, and the one time it fired here it did not fix even
+                // this one.
                 if consec_connect_fail >= CONNECT_WEDGE_THRESHOLD {
-                    power_cycle_adapter(&adapter).await;
+                    tracing::warn!(
+                        consec_connect_fail,
+                        "BLE: repeated connect failures — backing off (adapter left alone)"
+                    );
                     consec_connect_fail = 0;
                     last_rpa = None;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
                 // wait_for_presence already absorbed the long wait (or a
@@ -961,6 +1007,9 @@ pub(crate) async fn run_ble_persistent_loop(
                 // the session gone — see the write-error arm below.
                 const STATE_PUSH_MAX_FAILS: u32 = 6;
                 let mut consecutive_fail: u32 = 0;
+                // Busy-bearer beats, counted separately: they never tear the
+                // link down, they only decide how loudly we mention it.
+                let mut busy_fail: u32 = 0;
                 loop {
                     let mut state = vortex_l3_daemon::core::appstate::AppState::now_laptop();
                     // Attach the laptop's currently-connected earbuds so the
@@ -1022,6 +1071,36 @@ pub(crate) async fn run_ble_persistent_loop(
                             // race. Retry on a short delay; only give up once the
                             // link is genuinely gone (run_listener also returns on
                             // a real disconnect and tears the session down).
+                            //
+                            // "Genuinely gone" is the load-bearing word. A BUSY
+                            // bearer is not a dead link, and counting it as one is
+                            // how vortex used to tear down its own healthy
+                            // connection: a clipboard image push occupies the ATT
+                            // bearer with thousands of chunks, every STATE write
+                            // comes back "In Progress", six of those hit the cap,
+                            // `remove_device` fired — and the phone recorded the
+                            // result as HCI 0x13, "remote user terminated". Every
+                            // long-lived session that ended on this machine ended
+                            // that way. So only escalate on errors that mean the
+                            // device or characteristic is actually gone.
+                            if !state_write_means_link_gone(&e) {
+                                busy_fail += 1;
+                                // Back off hard rather than hammering: each retry
+                                // re-seals the frame and therefore burns a Noise
+                                // nonce whether or not the bytes ever leave, and
+                                // the phone has to resync past every one of them.
+                                if busy_fail == 1 {
+                                    tracing::debug!("BLE state write: bearer busy, backing off: {e}");
+                                } else if busy_fail % 20 == 0 {
+                                    tracing::info!(
+                                        "BLE state heartbeat: bearer busy for {busy_fail} beats \
+                                         (bulk transfer in flight?) — link kept: {e}"
+                                    );
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                continue;
+                            }
+                            busy_fail = 0;
                             consecutive_fail += 1;
                             if consecutive_fail >= STATE_PUSH_MAX_FAILS {
                                 tracing::info!(

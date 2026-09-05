@@ -59,7 +59,9 @@ mod tray;
 mod universal_control;
 mod virtual_display;
 mod voice_settings;
+mod window;
 mod worker;
+mod x11_focus;
 
 // Re-exports for items that moved out of lib.rs in the module split, so
 // existing `crate::Item` references across the feature modules keep
@@ -201,8 +203,7 @@ pub fn run() {
                     // Surface the open thread too, so the sent bubble is visible.
                     if let Some(w) = app.get_webview_window("main") {
                         let _ = w.emit("vortex:open-sms", serde_json::json!({ "number": number }));
-                        let _ = w.show();
-                        let _ = w.set_focus();
+                        window::present(&w);
                     }
                     tauri::async_runtime::spawn(async move { call::send_sms(number, body).await });
                 }
@@ -211,8 +212,7 @@ pub fn run() {
                 if let Some(number) = argv.get(pos + 1).cloned() {
                     if let Some(w) = app.get_webview_window("main") {
                         let _ = w.emit("vortex:open-sms", serde_json::json!({ "number": number }));
-                        let _ = w.show();
-                        let _ = w.set_focus();
+                        window::present(&w);
                     }
                 }
             } else if argv.iter().any(|a| a == "--clipboard") {
@@ -234,16 +234,17 @@ pub fn run() {
                 // Continuity camera on/off, the same request the "use phone as
                 // webcam" toggle makes. Same reason as `--mirror`: it is the
                 // only way to exercise the path without a hand on the UI.
-                camera::set_camera_request(true);
+                if let Err(e) = camera::set_camera_request(true) {
+                    tracing::warn!("--camera: {e}");
+                }
             } else if argv.iter().any(|a| a == "--camera-stop") {
-                camera::set_camera_request(false);
+                let _ = camera::set_camera_request(false);
             } else if argv.iter().any(|a| a == "--mirror-stop") {
                 if let Some(ch) = app.try_state::<ipc::CmdChannel>() {
                     let _ = ch.0.send(ipc::UiCmd::StopMirror);
                 }
-            } else if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
+            } else {
+                window::present_main(app);
             }
         }))
         // Window persistence: remember only the POSITION across launches, so
@@ -277,14 +278,10 @@ pub fn run() {
             // no need to pop a window on every boot). --clipboard/--share open
             // their own surfaces, handled below / by single-instance.
             {
-                use tauri::Manager;
                 let special = std::env::args()
                     .any(|a| a == "--hidden" || a == "--clipboard" || a == "--share");
                 if !special {
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.show();
-                        let _ = w.set_focus();
-                    }
+                    window::present_main(app.handle());
                 }
             }
 
@@ -302,6 +299,7 @@ pub fn run() {
             // Universal Control is the one switch that used to forget itself: it
             // lives entirely in this process, so a reboot or a quit left the edge
             // unarmed with the switch showing off. Put it back the way it was.
+            universal_control::ensure_bt_hid();
             universal_control::restore(app.handle().clone());
 
             // The popup when THIS launch came from the GNOME shortcut (the
@@ -399,6 +397,21 @@ pub fn run() {
             universal_control::uc_set_placement,
             universal_control::uc_get_placement,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Vortex Tauri");
+        .build(tauri::generate_context!())
+        .expect("error while building Vortex Tauri")
+        .run(|_app, event| {
+            // Clean up what outlives this process.
+            //
+            // `app.exit(0)` from the tray went straight out with no hook, so
+            // every quit left the phone's injector running, an `adb forward`
+            // bound, an orphaned `adb shell` child, and an in-flight Wi-Fi
+            // Direct join that only the phone's own 60 s teardown would undo.
+            // None of it is ours to leave behind on the user's machine or on
+            // their phone.
+            if matches!(event, tauri::RunEvent::Exit) {
+                tracing::info!("shutting down — releasing the injector and adb forward");
+                crate::mirror_inject::stop();
+                crate::laptop_cast::dispatch_request(false, None);
+            }
+        });
 }

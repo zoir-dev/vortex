@@ -1,5 +1,6 @@
 package com.vortex.a3.ui
 
+import android.util.Log
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -197,10 +198,21 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { granted ->
         val denied = granted.filterValues { !it }.keys
-        if (denied.isEmpty()) {
+        // Only a denied BLUETOOTH permission can stop us: without the radio
+        // there is nothing to advertise on. Declining SMS or call-log access
+        // costs the user those features, not the ability to pair — which is
+        // what the old "any denial is an error" check took away from them.
+        val blocking = denied.intersect(pairingCriticalPermissions().toSet())
+        if (blocking.isEmpty()) {
+            if (denied.isNotEmpty()) {
+                Log.i(
+                    "MainActivity",
+                    "pairing on without optional permissions: ${denied.joinToString()}",
+                )
+            }
             startAdvertising()
         } else {
-            state.value = AdvertiseState.Error("permissions denied: ${denied.joinToString()}")
+            state.value = AdvertiseState.Error("permissions denied: ${blocking.joinToString()}")
         }
     }
 

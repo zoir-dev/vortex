@@ -16,6 +16,9 @@ import kotlinx.coroutines.launch
 /** True when the call-flow GRABBED the buds from the laptop for the current
  *  call → onCallEnd hands them back. False when the buds were already on the
  *  phone (no grab, no hand-back — handing back would yank them off the phone). */
+/** Persisted, because MIUI restarts this service mid-call and a
+ *  process-lifetime flag would come back false — so the call would end with
+ *  nothing handing the earbuds back. */
 @Volatile private var callGrabbedBuds = false
 
 /** Copy a CallEvent with a fresh send timestamp (clock-skew-proof laptop
@@ -76,6 +79,37 @@ internal fun VortexStack.handleCallControl(ctrl: com.vortex.a3.core.call.CallCon
         handleLoadThread(ctrl.arg)
         return
     }
+    // Actions that act on A CALL must act on the call the laptop was LOOKING AT.
+    //
+    // The laptop has always stamped `ctrl.id` with the call its banner was
+    // showing; this side simply never read it, so every accept/decline/end was
+    // applied to "whatever is ringing right now". That is not the same call
+    // whenever the command is delayed — and it routinely is: BLE writes are
+    // dropped while a call is up, so the command waits for the next LAN
+    // heartbeat. Caller A gives up, B rings three seconds later, and B is the
+    // one that gets declined. With LAN down it could sit for minutes and fire
+    // on an entirely unrelated call.
+    val callTargeted = ctrl.action in setOf(
+        com.vortex.a3.core.call.CallControl.Action.ACCEPT,
+        com.vortex.a3.core.call.CallControl.Action.DECLINE,
+        com.vortex.a3.core.call.CallControl.Action.END,
+        com.vortex.a3.core.call.CallControl.Action.MUTE,
+        com.vortex.a3.core.call.CallControl.Action.UNMUTE,
+        com.vortex.a3.core.call.CallControl.Action.SILENCE,
+        com.vortex.a3.core.call.CallControl.Action.SPEAKER_ON,
+        com.vortex.a3.core.call.CallControl.Action.SPEAKER_OFF,
+    )
+    if (callTargeted && ctrl.id.isNotEmpty()) {
+        val live = VortexService.currentCall
+        if (live == null || live.id != ctrl.id) {
+            Log.w(
+                VortexStack.TAG,
+                "dropping stale call-control action=${ctrl.action} for call ${ctrl.id} " +
+                    "(current call is ${live?.id ?: "none"})",
+            )
+            return
+        }
+    }
     callController.handle(ctrl)
     // Mute/Speaker changed the audio state → re-push the call so the pill's
     // toggles (Mute↔Unmute, Speaker on/off) update on the laptop at once.
@@ -119,11 +153,26 @@ internal fun VortexStack.startCallFlow(): com.vortex.a3.core.call.CallFlowOrches
                 // Mark call_phase in the next outgoing AppState so Linux
                 // pauses media + disconnects. Nudge so the heartbeat fires
                 // within ~1 s instead of waiting the 12 s tick.
-                VortexService.pendingCallPhase = "ringing"
-                lanServer?.nudge()
-                // Grab the buds — the SAME path as a smart-switch grab. Only
-                // hand them back at call-end if the grab actually started.
+                // Grab the buds FIRST, and only tell the laptop a call is
+                // taking them if that actually started.
+                //
+                // The order used to be the other way round. `pendingCallPhase`
+                // went out regardless, so a grab that never started — the
+                // orchestrator busy, its Failed window, the switch holder not
+                // initialised — still made the laptop pause its media and let
+                // the earbuds go, for a hand-off that was not happening. At
+                // call end `callGrabbedBuds` was false, so nothing handed them
+                // back either: media paused, earbuds on nobody.
                 callGrabbedBuds = grabBudsToPhone()
+                if (callGrabbedBuds) {
+                    // Mark call_phase in the next outgoing AppState so Linux
+                    // pauses media + disconnects. Nudge so the heartbeat fires
+                    // within ~1 s instead of waiting the 12 s tick.
+                    VortexService.pendingCallPhase = "ringing"
+                    lanServer?.nudge()
+                } else {
+                    Log.w(VortexStack.TAG, "call grab did not start — not asking the laptop to release")
+                }
             }
             // True → a grab is in flight → the orchestrator arms its 2 s
             // speakerphone fallback for the route gap. False → the current

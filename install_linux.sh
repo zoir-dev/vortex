@@ -31,6 +31,7 @@
 #
 # Re-run any time to update; it replaces the binary and restarts the app.
 set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 UI="$REPO/linux/ui-tauri"
@@ -241,6 +242,11 @@ echo "▶ restarting the app on the installed binary…"
 # this script's own command line and kill the wrong thing.
 pkill -9 -x vortex-ui-tauri 2>/dev/null || true
 sleep 1
+# Same environment as the .desktop entries above — GDK_BACKEND=x11 included.
+# Leaving it out here meant the freshly installed app ran on native Wayland
+# while every later launch ran on XWayland, so anything that depends on the
+# X11 path (raising the window to the front from the tray) silently did
+# nothing until the user next logged out and back in.
 setsid env GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 "$BIN_DST" >/dev/null 2>&1 < /dev/null &
 disown 2>/dev/null || true
 
@@ -250,3 +256,16 @@ case ":$PATH:" in
 esac
 
 echo "✓ installed. Running now, and it will auto-start on every login."
+
+# Remote UNLOCK (phone-presence unlock, and the phone's unlock button) is the
+# one feature that needs a system-level permission: logind gates Session.Unlock
+# behind polkit. We never write to /etc behind the user's back — everything
+# above this line lives under $HOME — so it stays opt-in and is named here
+# instead. Locking works without it.
+if [ ! -f /etc/polkit-1/rules.d/49-vortex-unlock.rules ]; then
+  echo
+  echo "ℹ Unlocking the laptop from the phone needs a one-time permission."
+  echo "  Without it the laptop still LOCKS, but never unlocks. To enable it:"
+  echo "      sudo $REPO/linux/packaging/install-unlock-rule.sh"
+  echo "  (it prints exactly what it grants, and --remove undoes it)"
+fi

@@ -98,10 +98,36 @@ pub async fn wait_for_route(mac: &str) -> RouteOutcome {
     let appear_deadline = started + SINK_APPEAR_TIMEOUT;
     let mut rounds: u32 = 0;
     let mut a2dp_forced = false;
+    // Does this device even have an A2DP profile? Headsets that are HFP-only
+    // legitimately never reach one, and for those the HFP sink IS the answer —
+    // so the profile gate below must not lock them out forever.
+    let has_a2dp = !crate::core::audio_switch::card_a2dp_profiles(mac)
+        .await
+        .is_empty();
+
     while Instant::now() < appear_deadline {
         if let Some(found) = find_sink_for(&[underscored.as_str(), colon_form.as_str()]).await {
-            sink = Some(found);
-            break;
+            // A sink existing is NOT the same as the audio being ready.
+            // The card publishes a sink on the HFP profile too, so this test
+            // used to pass while the buds were still in hands-free mode — and
+            // WirePlumber stores volume PER PROFILE. On this deployment the
+            // HFP route sits at 0.15 linear (~53%) and the A2DP route at
+            // 0.001 (~10%), so starting playback here meant the first second
+            // or two came out roughly five times too loud, in telephone-grade
+            // mono, before the profile settled onto A2DP and the volume
+            // dropped. Wait for the profile the audio is actually meant for.
+            if !has_a2dp || crate::core::audio_switch::a2dp_card_active(mac).await {
+                sink = Some(found);
+                break;
+            }
+            // Sink is up but we're on HFP: nudge the card over once, then keep
+            // waiting for the profile rather than accepting this sink.
+            if !a2dp_forced {
+                a2dp_forced = true;
+                let _ = force_a2dp_card_profile(&underscored).await;
+            }
+            tokio::time::sleep(POLL).await;
+            continue;
         }
         rounds += 1;
         // If the sink hasn't appeared after ~160ms (8 polls @ 20ms), the

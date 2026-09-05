@@ -42,6 +42,10 @@ const SHELL_XML = `
       <arg type="i" name="y" direction="out"/>
       <arg type="b" name="on" direction="out"/>
     </method>
+    <method name="ActivateWindow">
+      <arg type="s" name="wm_class" direction="in"/>
+      <arg type="b" name="ok" direction="out"/>
+    </method>
   </interface>
 </node>`;
 
@@ -130,6 +134,54 @@ export default class VortexLiveExtension extends Extension {
             logError(e, 'vortex-live: pointer');
         }
         return [0, 0, false];
+    }
+
+    /**
+     * Bring the app's window to the front, from INSIDE the compositor.
+     *
+     * Nothing the app can do from outside achieves this on a Wayland session.
+     * Wayland has no "raise me" for ordinary clients by design — the only
+     * sanctioned route is an xdg-activation token, and a token is issued for a
+     * real user action delivered TO that app. A tray click goes to the shell,
+     * not to Vortex, and the appindicator protocol carries no token, so the app
+     * has nothing to present.
+     *
+     * The X11 route does not help either, even though the app runs on
+     * XWayland: `_NET_ACTIVE_WINDOW` arbitrates the X stacking order, and on
+     * this desktop Vortex is the ONLY X client — every other window is a native
+     * Wayland one that EWMH cannot reach. Mutter answers the request with its
+     * focus-stealing policy instead, which is the "Vortex is ready" notice
+     * users see while the window stays behind the terminal.
+     *
+     * An extension runs inside Mutter, so `activate()` here is the compositor
+     * raising its own window: no policy stands between the request and the
+     * result. This is why the shell extension — already installed for the live
+     * pills — is the right place for it.
+     */
+    ActivateWindow(wmClass) {
+        try {
+            const want = (wmClass || '').toLowerCase();
+            const now = global.get_current_time();
+            for (const actor of global.get_window_actors()) {
+                const w = actor.meta_window;
+                if (!w) continue;
+                const cls = (w.get_wm_class() || '').toLowerCase();
+                const inst = (w.get_wm_class_instance() || '').toLowerCase();
+                if (cls !== want && inst !== want) continue;
+                // Follow it to its workspace rather than yanking the window
+                // across — the same thing clicking it in the overview does.
+                const ws = w.get_workspace();
+                if (ws && ws !== global.workspace_manager.get_active_workspace()) {
+                    ws.activate(now);
+                }
+                if (w.minimized) w.unminimize();
+                w.activate(now);
+                return true;
+            }
+        } catch (e) {
+            logError(e, 'vortex-live: activate');
+        }
+        return false;
     }
 
     _ucConnect() {

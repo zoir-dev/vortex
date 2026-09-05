@@ -35,6 +35,19 @@ const POLL_MS: u64 = 700;
 /// History caps: entries and total on-disk bytes (images dominate).
 const MAX_ENTRIES: usize = 1000;
 const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+/// How long an unpinned clip is kept.
+///
+/// The caps above are about disk, not about time, so without this an entry
+/// survived until a thousand newer ones pushed it out — which on normal use is
+/// months. People copy passwords, one-time codes, private URLs and card numbers,
+/// and the phone's own password-manager flag cannot be read below Android 13, so
+/// on this deployment those DO arrive here and get written to disk. Keeping them
+/// for months is not a history feature, it is a liability.
+///
+/// Seven days keeps Super+V genuinely useful — you can still fetch what you
+/// copied last week — while making the store forget on its own. Pinning is the
+/// deliberate way to keep something longer.
+const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Per-item guards: a copied novel is truncated, a >20MB image skipped.
 /// Matches the sync cap (`clipboard_mirror::MAX_CLIPBOARD_TEXT_CHARS`) so the
 /// watcher doesn't truncate text below what the long-text path can carry.
@@ -170,10 +183,35 @@ pub(crate) fn store_capture(kind: &str, text: Option<String>, png: Option<Vec<u8
     })
 }
 
-/// Enforce the count/bytes caps, oldest-unpinned first. Deletes the
+/// Enforce the age and count/bytes caps, oldest-unpinned first. Deletes the
 /// evicted images' PNG files.
 fn evict(entries: &mut Vec<ClipEntry>) {
     let dir = clip_dir();
+    // Age first: expiry is about not holding on to sensitive content, so it
+    // must not depend on the disk caps ever being reached.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now > 0 {
+        let mut expired = Vec::new();
+        entries.retain(|e| {
+            // A clock that jumped backwards must not wipe the history, so only
+            // an entry genuinely older than the window goes.
+            let keep = e.pinned || e.ts_ms > now.saturating_sub(MAX_AGE_MS);
+            if !keep {
+                if let Some(f) = e.file.clone() {
+                    expired.push(f);
+                }
+            }
+            keep
+        });
+        if let Some(d) = &dir {
+            for f in expired {
+                let _ = std::fs::remove_file(d.join(f));
+            }
+        }
+    }
     loop {
         let total: u64 = entries.iter().map(|e| e.bytes).sum();
         let over = entries.len() > MAX_ENTRIES || total > MAX_TOTAL_BYTES;
@@ -641,16 +679,51 @@ pub fn clipboard_get(id: String) -> Option<ClipEntryDto> {
 mod tests {
     use super::*;
 
+    fn now_ms_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Fresh by default: these fixtures exercise the SIZE caps, so they must
+    /// not also be expired by the age cap (`ts_ms: 0` meant 1970).
     fn text_entry(id: &str, bytes: u64, pinned: bool) -> ClipEntry {
+        text_entry_at(id, bytes, pinned, now_ms_test())
+    }
+
+    fn text_entry_at(id: &str, bytes: u64, pinned: bool, ts_ms: u64) -> ClipEntry {
         ClipEntry {
             id: id.into(),
             kind: "text".into(),
             text: Some("x".into()),
             file: None,
             bytes,
-            ts_ms: 0,
+            ts_ms,
             pinned,
         }
+    }
+
+    #[test]
+    fn evict_drops_entries_past_the_age_cap() {
+        let now = now_ms_test();
+        let mut v = vec![
+            text_entry_at("fresh", 1, false, now),
+            text_entry_at("old", 1, false, now - MAX_AGE_MS - 1),
+            text_entry_at("old_but_pinned", 1, true, now - MAX_AGE_MS - 1),
+        ];
+        evict(&mut v);
+        let ids: Vec<&str> = v.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"fresh"), "a fresh clip must survive");
+        assert!(
+            ids.contains(&"old_but_pinned"),
+            "pinning is the way to keep something past the window"
+        );
+        assert!(
+            !ids.contains(&"old"),
+            "an unpinned clip older than the window must be forgotten \
+             even though the size caps are nowhere near"
+        );
     }
 
     #[test]

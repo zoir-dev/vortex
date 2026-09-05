@@ -66,8 +66,17 @@ class NotificationOutbox {
         Log.i(TAG, "flushing ${pending.size} buffered notification(s) to ${peerHex.take(8)}…")
         val leftover = ArrayList<Entry>()
         var stalled = false
+        var first = true
         for (e in pending) {
             if (stalled) { leftover.add(e); continue }
+            // Pace the backlog like every other burst on this link. The whole
+            // queue used to go out back-to-back, which is the shape that
+            // overruns the BLE stack, loses a notify, and desyncs the receive
+            // cipher — the very failure the 12 ms discipline exists for
+            // everywhere else, and the reason the contacts burst has a settle
+            // delay in front of it.
+            if (!first) kotlinx.coroutines.delay(12)
+            first = false
             val ok = try { send(e.mirror) } catch (ex: Exception) {
                 Log.w(TAG, "flush send threw: ${ex.message}"); false
             }

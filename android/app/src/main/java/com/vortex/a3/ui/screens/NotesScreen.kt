@@ -421,7 +421,20 @@ private fun NoteEditor(note: Note, onClose: () -> Unit, onDelete: () -> Unit) {
     var dueAt by remember(note.id) { mutableStateOf(note.dueAt) }
 
     // Debounced auto-save: persist ~400ms after the last change.
+    //
+    // "After the last CHANGE" is the point. LaunchedEffect also runs on first
+    // composition, with the values it was just given — so merely OPENING a note
+    // used to write it back, and `upsert` stamps `updatedAt = now()` and pushes.
+    // Sync is last-writer-wins on that timestamp, so reading a note here could
+    // silently overwrite a real edit made on the laptop while this device was
+    // offline: the laptop's text lost to the phone's identical copy, no
+    // conflict, no warning. Only save once something actually differs from what
+    // we opened.
+    val opened = androidx.compose.runtime.remember(note.id) {
+        Triple(note.title, note.body, note.dueAt)
+    }
     androidx.compose.runtime.LaunchedEffect(title, body, dueAt) {
+        if (Triple(title, body, dueAt) == opened) return@LaunchedEffect
         delay(400)
         NoteStore.upsert(note.copy(title = title, body = body, dueAt = dueAt))
     }

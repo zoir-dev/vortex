@@ -199,7 +199,7 @@ fun SettingsScreen(
                 AdbHintCard(
                     title = str("settings.clipboard_adb_title"),
                     body = str("settings.clipboard_adb_body"),
-                    command = "adb shell appops set com.vortex.a3 READ_CLIPBOARD allow",
+                    command = "adb shell appops set ${com.vortex.a3.BuildConfig.APPLICATION_ID} READ_CLIPBOARD allow",
                 )
             }
 

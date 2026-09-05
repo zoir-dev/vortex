@@ -282,6 +282,82 @@ pub async fn show(notif: &NotificationMirror, replaces_id: u32) -> Result<u32, S
 /// Close a desktop notification we previously showed (the phone dismissed
 /// its original, so drop our mirrored copy). Emits a NotificationClosed
 /// signal with reason=3 (closed-by-call), which the watcher ignores.
+/// Where we remember the ids of notifications we have posted, so a later run
+/// can take down what this one left behind.
+fn live_ids_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("vortex").join("live_notif_ids.json"))
+}
+
+/// Remember that we posted `id`.
+pub fn remember_live_id(id: u32) {
+    let Some(p) = live_ids_path() else { return };
+    let mut ids: Vec<u32> = std::fs::read(&p)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if ids.contains(&id) {
+        return;
+    }
+    ids.push(id);
+    // Bounded: this is a crash-recovery hint, not a log.
+    while ids.len() > 64 {
+        ids.remove(0);
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(b) = serde_json::to_vec(&ids) {
+        let _ = std::fs::write(&p, b);
+    }
+}
+
+/// Forget `id` — it has been closed, by us or by the user.
+pub fn forget_live_id(id: u32) {
+    let Some(p) = live_ids_path() else { return };
+    let Some(mut ids) = std::fs::read(&p)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<u32>>(&b).ok())
+    else {
+        return;
+    };
+    ids.retain(|v| *v != id);
+    if let Ok(b) = serde_json::to_vec(&ids) {
+        let _ = std::fs::write(&p, b);
+    }
+}
+
+/// Close every notification a PREVIOUS run left on screen.
+///
+/// Notifications are posted through a detached `gdbus` child precisely so
+/// gnome-shell does not auto-dismiss them — which also means they outlive the
+/// process that posted them. The map from notification id to phone key lives
+/// only in memory, so after a restart those survivors are inert: clicking an
+/// action finds no mapping and silently does nothing, the body click is read as
+/// a dismiss, and a dismissal from the phone can no longer close them. The user
+/// is left with fully-formed buttons that do not work.
+///
+/// Anything still up from a previous run cannot be honoured, so take it down.
+pub async fn sweep_stale() {
+    let Some(p) = live_ids_path() else { return };
+    let Some(ids) = std::fs::read(&p)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<u32>>(&b).ok())
+    else {
+        return;
+    };
+    if ids.is_empty() {
+        return;
+    }
+    for id in &ids {
+        let _ = close(*id).await;
+    }
+    tracing::info!(count = ids.len(), "closed notifications left over from a previous run");
+    let _ = std::fs::write(&p, b"[]");
+}
+
 pub async fn close(id: u32) -> Result<(), String> {
     notifications_proxy()
         .await?

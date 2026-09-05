@@ -61,6 +61,57 @@ pub fn stop_screen_mirror(state: State<'_, CmdChannel>) -> Result<(), String> {
 // layer can render reactively.
 // --------------------------------------------------------------------------
 
+/// Retry a startup step that can legitimately fail because something else on
+/// the machine is not ready yet, instead of giving up on the whole worker.
+///
+/// Every use of this replaced a bare `return`, and that `return` was the bug:
+/// the worker exits, `cmd_rx` is dropped, and from then on every command the UI
+/// sends fails with "sending on a closed channel" — while the tray, the window
+/// and the settings carry on working, so the app looks perfectly healthy with a
+/// phone that simply reads "Offline" forever. Nothing retried, and nothing told
+/// the user; the fix was to restart the app, if you thought of it.
+///
+/// The causes are all transient. The autostart entry fires eight seconds into
+/// the session, which is a guess rather than a guarantee: on a cold boot
+/// bluetoothd may still be starting, a keyring on an autologin session may not
+/// be unlocked yet, a Bluetooth dongle may not be plugged in yet.
+///
+/// Backs off 2s → 30s for [`STARTUP_RETRY_WINDOW_SECS`] — long enough to
+/// outlast a slow boot or someone typing their keyring password — and only then
+/// calls it fatal, out loud.
+macro_rules! retry_startup {
+    ($app:expr, $what:expr, $call:expr) => {{
+        let started = std::time::Instant::now();
+        let mut delay = std::time::Duration::from_secs(2);
+        loop {
+            match $call {
+                Ok(v) => break Some(v),
+                Err(err) => {
+                    let waited = started.elapsed().as_secs();
+                    if waited >= STARTUP_RETRY_WINDOW_SECS {
+                        tracing::error!("FATAL: {} unavailable after {waited}s: {err}", $what);
+                        let _ = $app.emit(
+                            "vortex:fatal",
+                            format!(
+                                "{} is unavailable ({err}). Vortex cannot reach your phone until \
+                                 this is fixed.",
+                                $what
+                            ),
+                        );
+                        break None;
+                    }
+                    tracing::warn!("{} not ready ({err}) — retrying in {delay:?}", $what);
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+    }};
+}
+
+/// How long [`retry_startup`] keeps trying before calling a step fatal.
+const STARTUP_RETRY_WINDOW_SECS: u64 = 300;
+
 pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
     // Prime the LAN fast-path from disk so the first heartbeat after a restart
     // reuses the last-known phone IP instead of guessing the gateway.
@@ -113,31 +164,35 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         let _ = app.emit("vortex:identity", IdentityInfo { ready: true });
 
         // Peer store.
-        let peer_store: Arc<dyn PeerStore> = match SecretServicePeerStore::new() {
-            Ok(s) => Arc::new(s),
-            Err(err) => {
-                tracing::error!("secret-service peer store unavailable: {err}");
-                let _ = app.emit::<Vec<TrustedPeerDto>>("vortex:peers", Vec::new());
-                return;
-            }
-        };
+        let peer_store: Arc<dyn PeerStore> =
+            match retry_startup!(app, "Secure storage", SecretServicePeerStore::new()) {
+                Some(s) => Arc::new(s),
+                None => {
+                    let _ = app.emit::<Vec<TrustedPeerDto>>("vortex:peers", Vec::new());
+                    return;
+                }
+            };
         emit_peers(&app, peer_store.clone()).await;
         let _have_trust = !peer_store.list().unwrap_or_default().is_empty();
 
         // BLE adapter.
-        let session = match bluer::Session::new().await {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::error!("BLE session init failed: {err}");
-                return;
-            }
+        // BlueZ is very often not ready yet at this point. The autostart entry
+        // fires eight seconds into the session, which is a guess, not a
+        // guarantee: on a cold boot bluetoothd may still be coming up, and with
+        // a USB dongle the adapter appears whenever it is plugged in. Both used
+        // to `return` straight out of the worker — and everything below here,
+        // the BLE loop, the LAN heartbeat and the proximity watcher, never
+        // started. The tray, the window and the settings all kept working, so
+        // the app looked perfectly healthy with a phone that was simply
+        // "Offline" forever, until the user thought to restart it.
+        let Some(session) = retry_startup!(app, "Bluetooth service", bluer::Session::new().await)
+        else {
+            return;
         };
-        let adapter = match session.default_adapter().await {
-            Ok(a) => a,
-            Err(err) => {
-                tracing::error!("BLE adapter init failed: {err}");
-                return;
-            }
+        let Some(adapter) =
+            retry_startup!(app, "Bluetooth adapter", session.default_adapter().await)
+        else {
+            return;
         };
         let _ = adapter.set_powered(true).await;
 
@@ -157,9 +212,21 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // session would prompt the user).
         let _agent_handle = match session
             .register_agent(bluer::agent::Agent {
-                request_default: false,
+                request_default: true,
                 request_authorization: Some(Box::new(|_req| {
                     Box::pin(async move { Ok(()) })
+                })),
+                authorize_service: Some(Box::new(|_req| {
+                    Box::pin(async move { Ok(()) })
+                })),
+                request_confirmation: Some(Box::new(|_req| {
+                    Box::pin(async move { Ok(()) })
+                })),
+                request_passkey: Some(Box::new(|_req| {
+                    Box::pin(async move { Ok(0) })
+                })),
+                request_pin_code: Some(Box::new(|_req| {
+                    Box::pin(async move { Ok("0000".into()) })
                 })),
                 ..Default::default()
             })
@@ -216,7 +283,12 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // gone longer than the cooldown.
         let last_reconnect_at: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>> =
             Arc::new(tokio::sync::Mutex::new(None));
-        const MDNS_RECONNECT_COOLDOWN: Duration = Duration::from_secs(10);
+        // Two gates, matching the heartbeat's own cadence (lan.rs): with
+        // the BLE link live it carries liveness, state pushes and the
+        // ~200 ms call signal, so LAN only keeps the cached-IP path warm;
+        // with BLE down LAN is the sole liveness path and must stay brisk.
+        const MDNS_COOLDOWN_BLE_LIVE: Duration = Duration::from_secs(240);
+        const MDNS_COOLDOWN_LAN_ONLY: Duration = Duration::from_secs(12);
 
         // Event-driven push: a local state change (laptop charging flip or a
         // meaningful battery-level delta) fires this Notify to wake the
@@ -477,15 +549,36 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                         Ok(g) => g,
                         Err(_) => continue,
                     };
-                    // Cooldown: mdns-sd re-resolves the service every
-                    // few seconds even while we're already connected.
-                    // Skip if any path reconnected within the cooldown
-                    // so those re-resolves don't snowball into a fresh
-                    // TCP+IK storm (the wedge documented at auto_lock).
+                    let ble_live = !auto_ble_writers.lock().await.is_empty();
+                    // Cooldown: mdns-sd re-resolves the service every few
+                    // seconds even while we're already connected, so this
+                    // gate — not the resolve rate — is what decides how
+                    // often we handshake. It has to track the heartbeat's
+                    // OWN adaptive cadence, because both are answering the
+                    // same question: how stale may the LAN link get?
+                    //
+                    // A flat 10 s gate ignored that. While BLE was live the
+                    // heartbeat backed off to 240 s (BLE carries liveness),
+                    // but mDNS still forced a full TCP+IK every ~10 s
+                    // anyway: 267 handshakes in two hours on 2026-08-24,
+                    // essentially all of them redundant, each one burning a
+                    // trust counter and hammering libsecret/BlueZ D-Bus —
+                    // the very load the auto_lock note warns wedges the
+                    // executor.
+                    //
+                    // Gating on the last SUCCESSFUL sync keeps the useful
+                    // half: when the phone has genuinely been away the gate
+                    // is long expired, so its reappearance still reconnects
+                    // on the first resolve.
                     {
+                        let cooldown = if ble_live {
+                            MDNS_COOLDOWN_BLE_LIVE
+                        } else {
+                            MDNS_COOLDOWN_LAN_ONLY
+                        };
                         let last = mdns_last_reconnect.lock().await;
                         if let Some(t) = *last {
-                            if t.elapsed() < MDNS_RECONNECT_COOLDOWN {
+                            if t.elapsed() < cooldown {
                                 drop(g);
                                 continue;
                             }
@@ -501,8 +594,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                     };
                     if have_trust {
                         tracing::info!("mDNS wake-up: triggering immediate reconnect");
-                        let ble_live = !auto_ble_writers.lock().await.is_empty();
-                        let _ = try_lan_reconnect(
+                        let outcome = try_lan_reconnect(
                             &auto_app,
                             &auto_identity,
                             auto_peer_store.clone(),
@@ -516,8 +608,15 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                             Some(auto_media_in_call.clone()),
                         )
                         .await;
-                        *mdns_last_reconnect.lock().await =
-                            Some(tokio::time::Instant::now());
+                        // Success only — see the matching note in the
+                        // heartbeat. A failed attempt must not refresh the
+                        // staleness gate, or a phone that is merely
+                        // unreachable would keep pushing back the reconnect
+                        // that is supposed to catch it coming back.
+                        if matches!(outcome, Ok(Some(_))) {
+                            *mdns_last_reconnect.lock().await =
+                                Some(tokio::time::Instant::now());
+                        }
                     }
                     drop(g);
                 }

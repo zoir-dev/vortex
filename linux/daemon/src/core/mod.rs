@@ -38,3 +38,4 @@ pub mod pairing;
 pub mod session_lock;
 pub mod status;
 pub mod storage;
+pub mod bt_hid;

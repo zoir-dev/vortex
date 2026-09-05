@@ -268,7 +268,28 @@ pub fn spawn(
             // straggler still playing through the laptop speakers.
             if last_own && !own {
                 suppress_until = Some(now + LOSS_SUPPRESS);
-                if last_playing && !have_paused {
+                // Did the buds go TO THE PEER, or did they just go away?
+                //
+                // The difference decides whether we hold our media for a
+                // hand-off that is actually happening. Without it, switching
+                // the earbuds off or dropping them in the case looked identical
+                // to the phone grabbing them: we remembered the players, and
+                // the enforcer below then re-paused the user's own Play every
+                // 200 ms for the next 90 seconds. Continuing on the laptop
+                // speakers — the obvious thing to do when your earbuds die —
+                // became impossible, and the machine was visibly fighting the
+                // person using it.
+                let peer_took_them = watch
+                    .peer_holds_buds_seen
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(|t| t.elapsed() < PEER_FRESH)
+                    .unwrap_or(false);
+                if last_playing && !have_paused && !peer_took_them {
+                    info!("media-watch: buds left but no peer holds them — leaving media alone");
+                }
+                if last_playing && !have_paused && peer_took_them {
                     let _ = pause_all_playing(&conn).await;
                     paused = last_playing_set.clone();
                     info!(
@@ -309,7 +330,25 @@ pub fn spawn(
             // stays silent until the buds return or we resume — the laptop
             // equivalent of the phone's pause-enforcer.
             if have_paused && !own && playing {
-                let _ = pause_all_playing(&conn).await;
+                // Only while the hand-off is still real. `have_paused` can
+                // outlive the peer that caused it (its link drops, its media
+                // stops, it hands the buds to nobody), and re-pausing past that
+                // point is just silencing the user for no reason.
+                let peer_still_has_them = watch
+                    .peer_holds_buds_seen
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(|t| t.elapsed() < PEER_FRESH)
+                    .unwrap_or(false);
+                if peer_still_has_them {
+                    let _ = pause_all_playing(&conn).await;
+                } else if have_paused {
+                    info!("media-watch: peer no longer holds the buds — releasing the pause hold");
+                    have_paused = false;
+                    paused.clear();
+                    paused_at = None;
+                }
             }
 
             // Resume what we paused once the buds are ours (or on timeout).
@@ -496,7 +535,18 @@ pub fn spawn(
             // suppress is honored (NOT pierced by a fresh edge): a player
             // that auto-pauses/plays on every route change (firefox) would
             // otherwise oscillate grab↔return and orphan the buds.
-            if LAPTOP_AUTO_GRAB && playing && !own {
+            //
+            // `have_paused && grabbing` is what makes the retry the comment
+            // below promises actually happen. Gating on `playing` alone could
+            // not: the first thing a grab does is pause the local media, so by
+            // the next tick `playing` is false and the block was never
+            // re-entered. A grab that failed — the orchestrator busy, its
+            // three-second Failed window, the buds refusing to answer a page —
+            // was therefore attempted exactly once and then abandoned, with the
+            // media still held and the buds on nobody. The `grabbing` flag is
+            // only set by this path (the loss-remember clears it), so this
+            // re-enters for OUR unfinished grab and not for a yield hold.
+            if LAPTOP_AUTO_GRAB && (playing || (have_paused && grabbing)) && !own {
                 let suppressed = suppress_until.map(|s| now < s).unwrap_or(false);
                 let cooling = last_grab
                     .map(|g| now.duration_since(g) < GRAB_COOLDOWN)

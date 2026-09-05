@@ -259,7 +259,14 @@ impl VortexClient {
         let bytes = frame.encode();
         let req = CharacteristicWriteRequest {
             offset: 0,
-            op_type: WriteOp::Command,
+            // Request, not Command: a handshake message is the one thing on
+            // this link that cannot be re-sent cheaply. A Write Command has no
+            // acknowledgement, so a single lost PDU turned into a 10 s wait for
+            // a msg2 notify that was never coming, then the 3/10/30/60 s
+            // reconnect backoff — thirteen seconds of dead link from one
+            // dropped packet. A Write Request costs one round-trip and is
+            // retried by L2CAP itself.
+            op_type: WriteOp::Request,
             prepare_authorize: false,
             ..Default::default()
         };
@@ -269,12 +276,14 @@ impl VortexClient {
 
     /// Write a frame to the Reconnect Control characteristic.
     ///
-    /// Same write-without-response rationale as `write_pairing_control`.
+    /// Acknowledged, same reasoning as `write_pairing_control`: this carries
+    /// the IK handshake, so a silently dropped PDU is the most expensive
+    /// packet loss on the link.
     pub async fn write_reconnect_control(&self, frame: &Frame) -> Result<(), ClientError> {
         let bytes = frame.encode();
         let req = CharacteristicWriteRequest {
             offset: 0,
-            op_type: WriteOp::Command,
+            op_type: WriteOp::Request,
             prepare_authorize: false,
             ..Default::default()
         };

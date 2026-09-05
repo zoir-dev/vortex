@@ -307,7 +307,19 @@ export const activeEarbuds = computed<
 // Coarse reactive clock so the freshness checks below re-evaluate as time
 // passes (a bare Date.now() in a computed never re-runs on its own, so a card
 // could stay "online" forever after frames stop — the user then had to reload).
-// One app-lifetime ticker; 10 s is plenty for a 180 s window.
+// One app-lifetime ticker; 10 s is plenty for the window below.
+
+/**
+ * How recently we must have heard from the phone to call it online.
+ *
+ * Was 180 s here while the phone's UI used 30, its notification 30, and the
+ * proximity watcher 25 — four answers to one question, and they disagreed
+ * visibly: the laptop would auto-lock at ~27 s because the phone had gone,
+ * while this window still said "Online" for another two and a half minutes.
+ * 35 s matches the threshold the mirror pills already use for "we are in
+ * contact", and is comfortably above the 12 s heartbeat.
+ */
+const PEER_ONLINE_SECS = 35;
 const nowTick = ref(Math.floor(Date.now() / 1000));
 setInterval(() => (nowTick.value = Math.floor(Date.now() / 1000)), 10_000);
 
@@ -315,7 +327,7 @@ setInterval(() => (nowTick.value = Math.floor(Date.now() / 1000)), 10_000);
 export const phoneOnline = computed(() => {
   const s = primaryPeerState.value;
   if (!s) return false;
-  return nowTick.value - s.ts < 180;
+  return nowTick.value - s.ts < PEER_ONLINE_SECS;
 });
 
 // Wall-clock (epoch seconds) of the last successful pair. After pairing, the

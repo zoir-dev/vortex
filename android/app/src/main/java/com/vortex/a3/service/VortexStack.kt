@@ -6,7 +6,9 @@ import android.os.Build
 import android.util.Log
 import com.vortex.a3.core.ble.Advertiser
 import com.vortex.a3.core.ble.GattServer
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import com.vortex.a3.core.identity.IdentityRecord
 import com.vortex.a3.core.identity.Platform
 import com.vortex.a3.core.lan.LanServer
@@ -40,7 +42,29 @@ import kotlinx.coroutines.launch
 class VortexStack(internal val service: Service) : VortexNotification.Host {
 
     internal val ctx: Context get() = service.applicationContext
-    internal val scope: CoroutineScope = CoroutineScope(SupervisorJob())
+    /**
+     * Scope for every long-lived feature collector.
+     *
+     * The handler is not optional. A bare `SupervisorJob` keeps a failing child
+     * from cancelling its siblings, but it does NOT catch the exception: with no
+     * handler installed, kotlinx hands it to the thread's default handler, which
+     * on Android kills the process. Fourteen unguarded `collect { }` bodies feed
+     * this scope, so one malformed frame or one ContentProvider hiccup took the
+     * whole service down — and MIUI's restart is the thing that leaves the
+     * notification listener unbound afterwards. Log it and let the other
+     * features carry on.
+     */
+    internal val scope: CoroutineScope = CoroutineScope(
+        SupervisorJob() +
+            kotlinx.coroutines.CoroutineExceptionHandler { ctx, t ->
+                android.util.Log.e(
+                    "VortexStack",
+                    "feature coroutine crashed (${ctx[kotlinx.coroutines.CoroutineName]?.name ?: "unnamed"}) — " +
+                        "other features keep running",
+                    t,
+                )
+            },
+    )
 
     private var advertiser: Advertiser? = null
     internal var gattServer: GattServer? = null
@@ -199,19 +223,26 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             return false
         }
 
+        // Each feature is started behind its own guard. They run in a fixed
+        // order and used to run unguarded, so a throw in one skipped every
+        // feature after it — startContacts() failing took SMS, HID and the
+        // whole LAN server down with it — and `isStarted()` was already true,
+        // so nothing ever retried. One broken feature should cost that feature,
+        // not the ones behind it in the list.
         val callFlow = startCallFlow()        // Phase 2 — call hand-off
-        startMediaFollow()                    // Phase 3 — smart audio-follow
-        registerFakeCallReceiver(callFlow)    // debug-only test hook
-        registerWifiDirectReceiver()          // debug-only Wi-Fi Direct validation
-        watchSwitchStateForCall(callFlow)     // cancel speakerphone on connect
-        forwardNotifications()                // phone notifications → laptop over BLE
-        startClipboardOutbound()              // clipboard text/image + shared file → laptop
-        forwardLiveActivities()               // ride/nav ETA pills → laptop top bar
-        forwardCallEvents()                   // call banner + in-call pill → laptop
-        forwardHandoff()                      // shared page (Handoff) → laptop opens it
-        startContacts()                       // phone contacts → laptop Contacts page
-        startCallLog()                        // phone call log → laptop Recents page
-        startSms()                            // phone SMS → laptop Messages page
+        feature("mediaFollow") { startMediaFollow() }          // Phase 3 — smart audio-follow
+        feature("fakeCallReceiver") { registerFakeCallReceiver(callFlow) }
+        feature("wifiDirectReceiver") { registerWifiDirectReceiver() }
+        feature("switchStateForCall") { watchSwitchStateForCall(callFlow) }
+        feature("notifications") { forwardNotifications() }     // phone notifications → laptop
+        feature("clipboard") { startClipboardOutbound() }       // clipboard + shared file → laptop
+        feature("liveActivities") { forwardLiveActivities() }   // ETA pills → laptop top bar
+        feature("callEvents") { forwardCallEvents() }           // call banner + in-call pill
+        feature("handoff") { forwardHandoff() }                 // shared page → laptop opens it
+        feature("contacts") { startContacts() }                 // → laptop Contacts page
+        feature("callLog") { startCallLog() }                   // → laptop Recents page
+        feature("sms") { startSms() }                           // → laptop Messages page
+        feature("hidHost") { startHidHostAutoConnect() }        // Classic BT HID to laptop
 
         // Laptop→phone screen mirror: when the user toggles "view laptop screen"
         // (or closes the viewer), ship our AppState NOW over both transports so
@@ -245,8 +276,54 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             }
         }
 
-        startLanServer(identity)              // mDNS + TCP IK + AppState sync
+        feature("lanServer") { startLanServer(identity) }      // mDNS + TCP IK + AppState sync
+        feature("outboxDrain") { startOutboxDrain() }
         return true
+    }
+
+    /** Send anything buffered for each trusted peer. Returns immediately when
+     *  there is nothing queued. */
+    internal suspend fun flushNotificationOutbox() {
+        for (peer in peerStore.list()) {
+            val peerPub = peer.peerStaticPub
+            notificationOutbox.flush(peerPub.notifHex()) { mirror ->
+                gattServer?.sendNotificationEncrypted(peerPub, mirror.toJsonBytes()) ?: false
+            }
+        }
+    }
+
+    /**
+     * Drain the notification outbox on a timer, not only when the laptop
+     * re-subscribes.
+     *
+     * Re-subscribe was the ONLY trigger, and on a healthy link that can be
+     * hours away — so a notification buffered because one notify was refused
+     * under queue pressure sat there, silently, until something unrelated
+     * happened to reconnect the session. Worse, the next notification went out
+     * immediately and overtook it, so what did eventually arrive arrived out of
+     * order. A link that is up should deliver within a beat of being able to.
+     */
+    private fun startOutboxDrain() {
+        scope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(OUTBOX_DRAIN_MS)
+                if (gattServer?.hasActiveConnection() != true) continue
+                try {
+                    flushNotificationOutbox()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "outbox drain: ${t.message}")
+                }
+            }
+        }
+    }
+
+    /** Start one feature; a failure is logged and the rest still start. */
+    private inline fun feature(name: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            android.util.Log.e("VortexStack", "feature '$name' failed to start", t)
+        }
     }
 
     /** Tear the stack down (service onDestroy). */
@@ -592,15 +669,32 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             // on Wi-Fi that blocks device-to-device traffic (AP isolation),
             // where the LAN heartbeat never completes.
             pushStateViaBle()
+            autoConnectHidHost()
             // Push our notes/todos set on (re)connect so the laptop merges +
             // replies — converges both sides after an offline edit. Debounced.
             com.vortex.a3.core.notes.NoteSync.markDirty()
             // A file offer that couldn't go out while the link was down can go
             // now — this is the whole reason it was kept.
             kickOfferRetry()
-            // Re-send app icons after a reconnect (until the laptop has them
-            // cached) and flush any notifications buffered during the outage.
-            sentIconPkgs.clear()
+            // Do NOT wipe the icon memory on every reconnect.
+            //
+            // Clearing it meant every app's logo was pushed again on each
+            // re-subscribe — and a 64px PNG is 17-45 sealed notifies, launched
+            // concurrently with the outbox flush and the live-activity re-push
+            // in this same callback. That burst is precisely the shape that
+            // drops a notify and desyncs the receive cipher, which drops the
+            // session, which causes another re-subscribe. With the link
+            // re-establishing as often as it does here, the icons alone could
+            // keep that loop fed.
+            //
+            // The laptop caches icons on disk across restarts, so what it has
+            // is not lost when the link is. Re-sending is for a laptop that
+            // genuinely lacks one, and it already asks for those: an unknown
+            // app id arrives with the notification, and the icon request rides
+            // the normal path from there.
+            if (sentIconPkgs.size > ICON_MEMORY_MAX) {
+                sentIconPkgs.clear()
+            }
             // Re-push every active live activity so its laptop tray reappears
             // after a reconnect even if its content didn't change meanwhile.
             for (la in com.vortex.a3.core.media.MediaNotificationListenerService.activeLiveActivities()) {
@@ -621,14 +715,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 callLogProvider?.refresh()
                 smsProvider?.refresh()
             }
-            scope.launch {
-                for (peer in peerStore.list()) {
-                    val peerPub = peer.peerStaticPub
-                    notificationOutbox.flush(peerPub.notifHex()) { mirror ->
-                        gattServer?.sendNotificationEncrypted(peerPub, mirror.toJsonBytes()) ?: false
-                    }
-                }
-            }
+            scope.launch { flushNotificationOutbox() }
         }
 
         // P2.13 — every successful BLE-IK reconnect carries a fresh Noise
@@ -681,6 +768,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 prs = firstPeer.prs,
                 scope = scope,
                 rotationWindowSec = 60L,
+                isConnected = { gattServer?.hasActiveConnection() == true },
                 onError = { reason -> Log.w(TAG, "presence adv error: $reason") },
             )
             Log.i(TAG, "trusted-presence advertising started (have ${peerStore.list().size} peer(s))")
@@ -918,6 +1006,48 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     internal fun isBluetoothOn(): Boolean =
         service.getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
 
+    private var hidHostProxy: BluetoothProfile? = null
+
+    private fun startHidHostAutoConnect() {
+        try {
+            val adapter = service.getSystemService(BluetoothManager::class.java)?.adapter ?: return
+            adapter.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                    if (profile == 4 /* HID_HOST */) {
+                        hidHostProxy = proxy
+                        autoConnectHidHost()
+                    }
+                }
+                override fun onServiceDisconnected(profile: Int) {
+                    if (profile == 4) hidHostProxy = null
+                }
+            }, 4)
+        } catch (e: Exception) {
+            Log.w(TAG, "getProfileProxy(HID_HOST) failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Auto-connects the phone's HID Host (input client) to the paired laptop so
+     * cursor crossing over Bluetooth works seamlessly without manual clicks.
+     */
+    fun autoConnectHidHost() {
+        val proxy = hidHostProxy ?: return
+        val adapter = service.getSystemService(BluetoothManager::class.java)?.adapter ?: return
+        for (dev in adapter.bondedDevices.orEmpty()) {
+            val name = dev.name.orEmpty().lowercase()
+            if (name.contains("fedora") || name.contains("vortex") || name.contains("linux")) {
+                try {
+                    val method = proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
+                    method.invoke(proxy, dev)
+                    Log.i(TAG, "Auto-connecting Bluetooth HID Host to ${dev.name} (${dev.address})")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not invoke HID connect: ${e.message}")
+                }
+            }
+        }
+    }
+
     companion object {
         internal const val TAG = "VortexStack"
         /** How long after losing the laptop link the phone keeps
@@ -928,6 +1058,14 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
          *  companion mirror burst (contacts/recents/SMS, ~37 chunks) fires.
          *  Guards the desync feedback loop — see onAudioSignalSubscribed. */
         internal const val MIRROR_REFRESH_SETTLE_MS = 3_000L
+        /** How often to drain the notification outbox while the link is up.
+         *  Short enough that a buffered notification is not noticeably late,
+         *  long enough that the check itself costs nothing when the queue is
+         *  empty (which is almost always). */
+        internal const val OUTBOX_DRAIN_MS = 20_000L
+        /** Cap on the "already sent this app's icon" set, so it cannot grow
+         *  without bound over a long-running process. */
+        internal const val ICON_MEMORY_MAX = 200
         /** How long a peer AppState stays "fresh" before we treat the link
          *  as down for hand-off purposes. The heartbeat lands every ~12 s,
          *  so 30 s tolerates one missed beat without false-positives. */

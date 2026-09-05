@@ -241,18 +241,58 @@ fn parse_chunk(p: &[u8]) -> Option<(u16, u16, Vec<u8>)> {
 #[derive(Default)]
 struct Assembler {
     parts: std::collections::BTreeMap<u16, Vec<u8>>,
+    /// Chunk count of the set currently being assembled (0 = none in flight).
+    last_total: u16,
 }
 impl Assembler {
     fn add(&mut self, total: u16, idx: u16, data: Vec<u8>) -> Option<Vec<Item>> {
         if total == 0 || total > 4096 {
             return None;
         }
+        // A different chunk count means a DIFFERENT set, and the previous one
+        // never completed. Without this the leftovers were mixed into the new
+        // set and produced a buffer belonging to neither — so one dropped chunk
+        // corrupted every later push until two happened to share a count.
+        if total != self.last_total {
+            self.parts.clear();
+            self.last_total = total;
+        }
+        // Index 0 arriving again is the same signal at the same size.
+        if idx == 0 && !self.parts.is_empty() {
+            self.parts.clear();
+        }
         self.parts.insert(idx, data);
         if self.parts.len() as u16 != total {
             return None;
         }
+        self.last_total = 0;
         let buf: Vec<u8> = std::mem::take(&mut self.parts).into_values().flatten().collect();
         serde_json::from_slice::<Vec<Item>>(&buf).ok()
+    }
+}
+
+#[cfg(test)]
+mod assembler_tests {
+    use super::Assembler;
+
+    /// A dropped chunk must not poison the next set.
+    #[test]
+    fn a_new_set_discards_an_unfinished_one() {
+        let mut a = Assembler::default();
+        // Set A: three chunks, the middle one never arrives.
+        assert!(a.add(3, 0, b"[".to_vec()).is_none());
+        assert!(a.add(3, 2, b"]".to_vec()).is_none());
+        // Set B: a complete, different-sized set must parse on its own.
+        assert!(a.add(1, 0, b"[]".to_vec()).is_some_and(|v| v.is_empty()));
+    }
+
+    #[test]
+    fn a_restarted_set_of_the_same_size_discards_the_old_parts() {
+        let mut a = Assembler::default();
+        assert!(a.add(2, 1, b"junk".to_vec()).is_none());
+        // Sender restarts at idx 0 with the same chunk count.
+        assert!(a.add(2, 0, b"[".to_vec()).is_none());
+        assert!(a.add(2, 1, b"]".to_vec()).is_some_and(|v| v.is_empty()));
     }
 }
 

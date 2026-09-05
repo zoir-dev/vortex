@@ -19,7 +19,7 @@ pub(crate) async fn refresh_state(ctx: &WorkerCtx) {
     let _ = app.emit("vortex:identity", IdentityInfo { ready: true });
     emit_peers(app, ctx.peer_store.clone()).await;
     let local = vortex_l3_daemon::core::earbuds::scan_local_earbuds(&ctx.adapter).await;
-    crate::tray::update_battery_rows(app, local.as_ref(), None);
+    crate::tray::update_battery_rows(local.as_ref(), None);
     let _ = app.emit("vortex:local_earbuds", local.map(EarbudsDto::from));
     // Also re-emit Idle for the switch state so the card doesn't sit on a stale
     // "Switching…" after reload.
@@ -33,7 +33,7 @@ pub(crate) async fn refresh_state(ctx: &WorkerCtx) {
 /// Shared by the worker's refresh handler and the post-toggle nudge below.
 pub(crate) async fn rescan_and_publish(app: &tauri::AppHandle, adapter: &bluer::Adapter) {
     let local = vortex_l3_daemon::core::earbuds::scan_local_earbuds(adapter).await;
-    crate::tray::update_battery_rows(app, local.as_ref(), None);
+    crate::tray::update_battery_rows(local.as_ref(), None);
     let _ = app.emit("vortex:local_earbuds", local.map(EarbudsDto::from));
 }
 

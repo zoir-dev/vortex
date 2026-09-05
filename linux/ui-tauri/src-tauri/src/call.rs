@@ -57,6 +57,12 @@ pub(crate) static CALL_WRITER: std::sync::OnceLock<Arc<tokio::sync::Mutex<Option
 /// Stable pill key for the in-call live activity (one call at a time).
 pub(crate) const CALL_PILL_KEY: &str = "vortex-call";
 
+/// How long without a single frame from the phone before a ringing banner is
+/// taken down. Matches the pill sweeper's disconnect threshold — while a call
+/// is mirrored the LAN heartbeat is pinned to 2s, so 35s of silence is a real
+/// loss of contact, not an inter-beat gap.
+const BANNER_STALE_MS: u64 = 35_000;
+
 /// True while a call is mirrored on the laptop (ringing banner or in-call pill
 /// up). The LAN heartbeat reads this to poll briskly (≈2 s) while it's set so
 /// the call-END — which arrives as `call=None` on the next AppState — clears the
@@ -249,11 +255,46 @@ pub(crate) async fn call_decline() {
 /// to the phone (BLE fast-path, AppState/LAN fallback) carrying the number. The
 /// phone dials it and the normal in-call pill appears. The number is never
 /// logged.
+/// Is this a plain phone number, rather than a control sequence?
+///
+/// `*` and `#` are not dialling digits on a mobile: they open MMI/USSD codes
+/// that the network executes the moment the call is placed, with no dialog and
+/// no undo. `*21*<number>#` switches on unconditional call forwarding;
+/// `**04*old*new*new#` changes the SIM PIN. Numbers reaching `dial` are not all
+/// typed by the user — Recents, "Call back" on a missed call, and the Call
+/// button on an SMS thread all pass through whatever the other end supplied,
+/// and an SMS sender ID can legitimately be an 11-character alphanumeric
+/// string. So the shape of the number is checked here, where it is about to
+/// leave the laptop.
+///
+/// Deliberately permissive about everything harmless: `+`, spaces, dashes,
+/// brackets and dots are all normal ways to write a number.
+fn is_plain_number(s: &str) -> bool {
+    let mut digits = 0usize;
+    for c in s.chars() {
+        match c {
+            '0'..='9' => digits += 1,
+            '+' | ' ' | '-' | '(' | ')' | '.' => {}
+            _ => return false,
+        }
+    }
+    digits > 0
+}
+
 #[tauri::command]
 pub(crate) async fn dial(number: String) {
     let number = number.trim().to_string();
     if number.is_empty() {
         tracing::warn!("dial: empty number");
+        return;
+    }
+    if !is_plain_number(&number) {
+        // Not logged verbatim: it may be exactly the sort of string worth
+        // keeping out of a log.
+        tracing::warn!(
+            len = number.len(),
+            "dial refused: not a plain phone number (MMI/USSD control codes are not dialled)"
+        );
         return;
     }
     let seq = crate::CALL_CONTROL_SEQ.fetch_add(1, Ordering::SeqCst);
@@ -434,6 +475,49 @@ pub(crate) async fn spawn_consumer(
     // Bumped on every phase change; the in-call timer ticker stops once its
     // captured generation is stale (call answered again / ended).
     let tick_gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+    // ── Banner watchdog ──────────────────────────────────────────────────
+    // Close the ringing banner when the phone stops answering.
+    //
+    // Everything else that clears the banner needs a message FROM the phone —
+    // an `active` or an `ended`. So walking out of range while the phone rings,
+    // and answering it there, left an urgency-critical "Incoming call" banner on
+    // the laptop with live Accept and Decline buttons, for as long as the laptop
+    // stayed up. Dismissing it did not help either: that is read as the silence
+    // gesture and the banner comes straight back. Pressing Accept on it queued a
+    // command that fired on the NEXT call.
+    //
+    // The pill sweeper next door already treats a stale peer contact as "clear
+    // the mirrors"; the banner simply was not wired to it.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if crate::ble::peer_contact_age_ms() <= BANNER_STALE_MS {
+                    continue;
+                }
+                let id = {
+                    let mut s = state.lock().await;
+                    let id = s.banner_id;
+                    if id != 0 {
+                        s.banner_id = 0;
+                        s.call_id.clear();
+                    }
+                    id
+                };
+                if id != 0 {
+                    tracing::info!(
+                        "call banner closed: no contact with the phone for over {}s — \
+                         its buttons could not have worked",
+                        BANNER_STALE_MS / 1000
+                    );
+                    let _ = notification_display::close(id).await;
+                }
+            }
+        });
+    }
 
     // ── Banner + pill driver: ringing → banner; active → in-call pill with a
     //    ticking timer; ended → clear both. ────────────────────────────────
@@ -907,4 +991,25 @@ pub(crate) async fn spawn_consumer(
     }
 
     (call_tx, call_writer)
+}
+
+#[cfg(test)]
+mod dial_guard_tests {
+    use super::is_plain_number;
+
+    #[test]
+    fn accepts_real_numbers_and_refuses_control_codes() {
+        for ok in ["+998901234567", "0555 123 456", "(212) 555-0100", "555.0100"] {
+            assert!(is_plain_number(ok), "should dial: {ok}");
+        }
+        for bad in [
+            "*21*555123#",
+            "**04*1111*2222*2222#",
+            "#31#0555123456",
+            "*#06#",
+            "PAYPAL",
+        ] {
+            assert!(!is_plain_number(bad), "must not dial: {bad}");
+        }
+    }
 }

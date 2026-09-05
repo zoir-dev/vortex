@@ -25,6 +25,26 @@ internal fun Context.isNotificationAccessGranted(): Boolean =
         .getEnabledListenerPackages(this)
         .contains(packageName)
 
+/**
+ * The permissions WITHOUT which pairing cannot happen at all.
+ *
+ * Everything else in [requiredPermissions] is a companion feature — the call
+ * mirror, contacts, SMS — and the comments there already say so ("All optional
+ * — the mirror degrades without them"). The permission RESULT handler did not
+ * agree: one denial anywhere in that list and advertising never started, so a
+ * user who declined SMS access could not pair at all, and the screen told them
+ * only "permissions denied".
+ *
+ * Bluetooth is genuinely different. Without it there is no radio to advertise
+ * on, so there is nothing to degrade to.
+ */
+internal fun pairingCriticalPermissions(): List<String> = buildList {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        add(Manifest.permission.BLUETOOTH_ADVERTISE)
+        add(Manifest.permission.BLUETOOTH_CONNECT)
+    }
+}
+
 internal fun requiredPermissions(): List<String> = buildList {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         add(Manifest.permission.BLUETOOTH_ADVERTISE)

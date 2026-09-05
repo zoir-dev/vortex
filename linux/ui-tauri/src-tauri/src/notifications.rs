@@ -180,9 +180,39 @@ pub(crate) type NotifWriter = Arc<
 
 /// Monotonic id for a laptop→phone action INVOKE. Stamped on each invoke so the
 /// phone dedups the SAME invoke arriving over BOTH the BLE fast-path and the
-/// LAN backstop below. Starts at 1 (0 means "not an invoke").
+/// LAN backstop below. 0 means "not an invoke".
 pub(crate) static NOTIF_INVOKE_SEQ: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The next invoke id — monotonic ACROSS RESTARTS, which is the whole point.
+///
+/// This used to start at 1 every launch while the phone keeps its high-water
+/// mark for the life of its own process and drops anything `<=` it. So after
+/// five actions, restarting the laptop app (an update, a crash, a re-login)
+/// made every button and every typed reply silently do nothing: the phone
+/// discarded them as already-seen, with no log and no error, and GNOME had
+/// already closed the notification. It stayed dead until the laptop's counter
+/// climbed past the phone's mark or the phone's process died.
+///
+/// Seeding from the wall clock fixes it without a state file: unix
+/// milliseconds only ever go up, so a fresh process always starts above
+/// anything the previous one sent. The counter then increments normally within
+/// the run, so ids stay unique even if two invokes land in the same
+/// millisecond.
+fn next_invoke_seq() -> u64 {
+    use std::sync::atomic::Ordering;
+    let cur = NOTIF_INVOKE_SEQ.load(Ordering::SeqCst);
+    if cur == 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        // Only the first caller seeds; a racing caller just falls through to
+        // the fetch_add below and still gets a unique, higher id.
+        let _ = NOTIF_INVOKE_SEQ.compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    NOTIF_INVOKE_SEQ.fetch_add(1, Ordering::SeqCst)
+}
 
 /// LAN backstop for a notification action/reply invoke: the next outgoing
 /// AppState carries this so the invoke reaches the phone even when the BLE
@@ -336,8 +366,21 @@ pub(crate) fn spawn_subsystem(
             // in a catch-up request so the phone re-sends ONLY what we're missing (a
             // notify dropped in-air that the user never saw) — never re-popping a
             // notification already shown.
-            let delivered_keys: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-                Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+            // Newest-last, and BOUNDED. It was an unbounded HashSet, which is
+            // what broke the catch-up request: the whole set was packed into a
+            // single sealed frame — one ATT write, 512 bytes at this MTU — and
+            // an Android SBN key runs about 45 bytes, so past roughly eight
+            // displayed notifications the request no longer fit and BlueZ
+            // refused it. The success timestamp is only stamped on a send that
+            // went out, so every later nudge retried the same oversized frame
+            // and failed identically: the recovery path was dead within an hour
+            // of each session, permanently and silently.
+            //
+            // A deque also gives the order a HashSet never had, so "the keys
+            // worth reconciling" means the most recent ones rather than
+            // whichever the hasher happened to yield.
+            let delivered_keys: Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>> =
+                Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
             // Debounce: coalesce a burst of drop nudges into ONE catch-up request.
             let catch_up_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // Hard rate-limit on catch-up requests. A catch-up makes the phone
@@ -352,6 +395,11 @@ pub(crate) fn spawn_subsystem(
             ));
             const CATCH_UP_MIN_INTERVAL: std::time::Duration =
                 std::time::Duration::from_secs(90);
+            /// Most keys we track, and therefore the most a catch-up request can
+            /// carry. Sized to stay inside a single 512-byte ATT write with the
+            /// JSON envelope: ~170 bytes of boilerplate leaves room for six
+            /// ~45-byte keys with margin.
+            const CATCH_UP_MAX_KEYS: usize = 6;
 
             {
                 let links = notif_links.clone();
@@ -361,6 +409,9 @@ pub(crate) fn spawn_subsystem(
                 let pending = catch_up_pending.clone();
                 let catch_up_last = catch_up_last.clone();
                 tokio::spawn(async move {
+                    // Take down anything a previous run left on screen before
+                    // we post anything new — see `sweep_stale`.
+                    vortex_l3_daemon::core::notification_display::sweep_stale().await;
                     while let Some(notif) = ble_notif_rx.recv().await {
                         // Laptop-internal nudge (a BLE frame dropped, or we
                         // (re)connected): ask the phone to re-send any active
@@ -397,6 +448,23 @@ pub(crate) fn spawn_subsystem(
                                     }
                                     // Link down → next drop/reconnect retries.
                                     let Some(w) = writer_h.lock().await.clone() else { return };
+                                    // Cap the key list. It rides in ONE sealed
+                                    // frame, which is one ATT write — 512 bytes
+                                    // at this MTU. `delivered_keys` was never
+                                    // pruned and was sent whole, and an Android
+                                    // SBN key runs ~45 bytes, so past roughly
+                                    // eight displayed notifications the request
+                                    // simply exceeded the write and BlueZ
+                                    // refused it. The timestamp is only stamped
+                                    // on success, so every later nudge retried
+                                    // the same oversized frame and failed the
+                                    // same way: the whole recovery mechanism was
+                                    // dead within an hour of each session.
+                                    //
+                                    // The newest keys are the ones worth
+                                    // reconciling anyway — an older notification
+                                    // the user never saw is not worth popping up
+                                    // now.
                                     let known: Vec<String> =
                                         delivered.lock().await.iter().cloned().collect();
                                     let req = vortex_l3_daemon::core::notif_mirror::NotificationMirror {
@@ -435,6 +503,7 @@ pub(crate) fn spawn_subsystem(
                             };
                             if let Some(id) = id {
                                 let _ = vortex_l3_daemon::core::notification_display::close(id).await;
+                                vortex_l3_daemon::core::notification_display::forget_live_id(id);
                             }
                             continue;
                         }
@@ -484,6 +553,16 @@ pub(crate) fn spawn_subsystem(
                         {
                             Ok(id) => {
                                 tracing::info!(app = %notif.app, id, replaces_id, "notif: shown on desktop");
+                                // Remember it on disk: gdbus posts these
+                                // detached so they outlive us, and only this
+                                // record lets a later run take down survivors
+                                // whose action mappings died with the process.
+                                vortex_l3_daemon::core::notification_display::remember_live_id(id);
+                                if replaces_id != 0 && replaces_id != id {
+                                    vortex_l3_daemon::core::notification_display::forget_live_id(
+                                        replaces_id,
+                                    );
+                                }
                                 if !notif.key.is_empty() {
                                     // Re-key under the (possibly new) id; drop the
                                     // old mapping if the id changed on replace.
@@ -507,7 +586,15 @@ pub(crate) fn spawn_subsystem(
                                 // links lock is dropped — never hold a mutex across
                                 // this .await) so a catch-up won't re-request it.
                                 if !notif.key.is_empty() {
-                                    delivered.lock().await.insert(notif.key.clone());
+                                    {
+                                        let mut g = delivered.lock().await;
+                                        if !g.contains(&notif.key) {
+                                            g.push_back(notif.key.clone());
+                                            while g.len() > CATCH_UP_MAX_KEYS {
+                                                g.pop_front();
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => tracing::warn!("desktop notification failed: {e}"),
@@ -647,12 +734,8 @@ pub(crate) fn spawn_subsystem(
                             // focus onto Vortex.
                             match resolve_notif_click(&app_id, &app_label, &title) {
                                 ClickAction::Page(kind) => {
-                                    use tauri::{Emitter, Manager};
-                                    if let Some(w) = app_open.get_webview_window("main") {
-                                        let _ = w.show();
-                                        let _ = w.unminimize();
-                                        let _ = w.set_focus();
-                                    }
+                                    use tauri::Emitter;
+                                    crate::window::present_main(&app_open);
                                     tracing::info!(%app_id, kind, "notif click: open laptop page");
                                     let _ = app_open.emit(
                                         "vortex:open-chat",
@@ -712,8 +795,7 @@ pub(crate) fn spawn_subsystem(
                             } else {
                                 String::new()
                             };
-                            let seq = NOTIF_INVOKE_SEQ
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let seq = next_invoke_seq();
                             let invoke = vortex_l3_daemon::core::notif_mirror::NotificationMirror {
                                 key,
                                 invoke_index: idx,

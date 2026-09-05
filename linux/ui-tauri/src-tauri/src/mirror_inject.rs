@@ -195,7 +195,19 @@ fn redial() -> bool {
         let target = format!("{ip}:{port}");
         // `adb connect` exits 0 even when it fails ("failed to connect to …"), so
         // the stdout text is the only honest signal. "already connected to" counts.
-        let ok = Command::new("adb")
+        //
+        // Timed out like every other adb call, and for the sharpest reason: this
+        // is the one measured blocking for 100+ seconds against a phone asleep on
+        // Wi-Fi — and with several ports to try, an untimed call would multiply
+        // that by the number of candidates.
+        let mut cmd = if have_timeout_bin() {
+            let mut c = Command::new("timeout");
+            c.args(["--kill-after=1", ADB_TIMEOUT_SECS, "adb"]);
+            c
+        } else {
+            Command::new("adb")
+        };
+        let ok = cmd
             .args(["connect", &target])
             .output()
             .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("connected to"));
@@ -246,9 +258,43 @@ fn forget_adb_serial() {
     }
 }
 
+/// Seconds any single adb call may take before it is killed.
+///
+/// adb has no timeout of its own, and the failure that matters is not slow but
+/// INFINITE: `adb connect <ip>` to a phone that is asleep on Wi-Fi leaves the
+/// SYN unanswered, and a measured redial to a stale address blocked for over
+/// 100 seconds. `adb shell` against a transport that has silently gone away can
+/// hang longer still. Six seconds is far above a healthy call (measured 5-93 ms
+/// on this deployment) and far below anything a person would sit through.
+const ADB_TIMEOUT_SECS: &str = "6";
+
+/// Is coreutils `timeout` available to wrap adb in? Resolved once.
+fn have_timeout_bin() -> bool {
+    static HAVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAVE.get_or_init(|| {
+        Command::new("timeout")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+/// `adb …`, wrapped in a hard timeout so no adb call can ever hang a caller.
+/// Falls back to a bare invocation where coreutils `timeout` is missing.
 fn adb_command(args: &[&str]) -> Command {
-    let mut cmd = Command::new("adb");
-    if let Some(s) = adb_serial() {
+    let serial = adb_serial();
+    let mut cmd = if have_timeout_bin() {
+        let mut c = Command::new("timeout");
+        // --kill-after: adb ignoring TERM must not survive as a zombie holding
+        // the transport we are about to re-scan.
+        c.args(["--kill-after=1", ADB_TIMEOUT_SECS, "adb"]);
+        c
+    } else {
+        Command::new("adb")
+    };
+    if let Some(s) = serial {
         cmd.arg("-s").arg(s);
     }
     cmd.args(args);
@@ -281,19 +327,29 @@ fn adb(args: &[&str]) -> bool {
 /// Control needs it to know where the phone's cursor actually is: we only ever
 /// send relative deltas, so without the bounds we cannot tell "at the edge"
 /// from "somewhere in the middle".
-///
-/// Prefers an `Override size:` line when one is present — that is the size
-/// Android is actually running at. Reports the PHYSICAL (portrait) bounds, so a
-/// rotated phone will have its axes swapped relative to this.
+static CACHED_SIZE: Mutex<(i32, i32)> = Mutex::new((1080, 2340));
+
 pub(crate) fn display_size() -> Option<(i32, i32)> {
-    let out = adb_capture(&["shell", "wm", "size"])?;
-    let pick = out
-        .lines()
-        .find(|l| l.contains("Override size:"))
-        .or_else(|| out.lines().find(|l| l.contains("Physical size:")))?;
-    let (w, h) = pick.rsplit_once(':')?.1.trim().split_once('x')?;
-    let (w, h) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
-    if w > 0 && h > 0 { Some((w, h)) } else { None }
+    if let Some(out) = adb_capture(&["shell", "wm", "size"]) {
+        if let Some(pick) = out
+            .lines()
+            .find(|l| l.contains("Override size:"))
+            .or_else(|| out.lines().find(|l| l.contains("Physical size:")))
+        {
+            if let Some((w, h)) = pick.rsplit_once(':').and_then(|(_, s)| s.trim().split_once('x')) {
+                if let (Ok(w), Ok(h)) = (w.trim().parse(), h.trim().parse()) {
+                    if w > 0 && h > 0 {
+                        if let Ok(mut g) = CACHED_SIZE.lock() {
+                            *g = (w, h);
+                        }
+                        return Some((w, h));
+                    }
+                }
+            }
+        }
+    }
+    let cached = CACHED_SIZE.lock().map(|g| *g).unwrap_or((1080, 2340));
+    Some(cached)
 }
 
 /// The phone's current display rotation as a quarter-turn count (0–3).
@@ -694,10 +750,103 @@ fn on_injector_lost() {
     });
 }
 
-/// True when the real-touch injector is live, so input capture routes here
-/// instead of the AccessibilityService control plane.
+static BT_HID: Mutex<Option<vortex_l3_daemon::core::bt_hid::BtHidServer>> = Mutex::new(None);
+
+/// Register the Bluetooth HID server for ADB-free Universal Control fallback.
+pub fn set_bt_hid(server: vortex_l3_daemon::core::bt_hid::BtHidServer) {
+    if let Ok(mut g) = BT_HID.lock() {
+        *g = Some(server);
+    }
+}
+
+/// True when the ADB real-touch injector is currently active.
+/// Bring the injector up WITHOUT blocking the caller.
+///
+/// [`start`] is a long chain of blocking adb calls — push the binary, set up a
+/// port forward, probe /dev/uinput, open a socket. Universal Control's capture
+/// loop used to call it inline at the moment a push committed, which is the
+/// moment the compositor is already holding the pointer and every keystroke for
+/// us. With the phone unreachable that chain ran for seconds (100+ in the worst
+/// case here), and for its whole length the pointer was pinned to the screen
+/// edge, Esc did nothing, and the loop's own 60 ms and 6 s failsafes could not
+/// fire because they live on the same thread. The user's only way out was to
+/// lock the laptop from their phone.
+///
+/// So: never from the capture thread. Kick it off here and let the crossing be
+/// abandoned; by the next push it is usually up (a healthy start measured
+/// 236-513 ms). One at a time — a push that repeats must not stack up starts.
+pub fn start_async() {
+    static STARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let ok = start();
+        STARTING.store(false, std::sync::atomic::Ordering::SeqCst);
+        if !ok {
+            tracing::debug!("mirror inject: background start did not come up");
+        }
+    });
+}
+
+/// True when either the ADB real-touch injector or Bluetooth HID server is live.
 pub fn active() -> bool {
-    INJECT.lock().map(|g| g.is_some()).unwrap_or(false)
+    if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return true;
+    }
+    if let Ok(g) = BT_HID.lock() {
+        if let Some(hid) = g.as_ref() {
+            return hid.is_connected();
+        }
+    }
+    false
+}
+
+/// Proactively connect paired Bluetooth devices when approaching screen edge.
+pub fn trigger_bt_connect() {
+    if let Ok(g) = BT_HID.lock() {
+        if let Some(hid) = g.as_ref() {
+            if !hid.is_connected() {
+                let hid_clone = hid.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(conn) = zbus::connection::Connection::system().await {
+                        hid_clone.try_connect_paired_devices(&conn).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// True when input can ACTUALLY be delivered to the phone right now — the ADB
+/// uinput daemon is up, or the Bluetooth HID link is connected.
+///
+/// `is_registered()` is deliberately NOT accepted here. Registering the HID
+/// profile only tells BlueZ that we exist; it says nothing about the phone
+/// being on the other end. Counting it made this return true with no link at
+/// all, which let the crossing guard in `universal_control` wave the pointer
+/// through: the cursor left the laptop and never appeared on the phone —
+/// stranded on a screen showing nothing, the exact failure the guard exists to
+/// prevent. Observed 2026-08-24 with adb offline and BT HID registered but
+/// unconnected.
+///
+/// Use `is_registered()` for "is the fallback wired up at all" questions, not
+/// for "can we send".
+pub fn has_transport() -> bool {
+    if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
+        return true;
+    }
+    if let Ok(g) = BT_HID.lock() {
+        if let Some(hid) = g.as_ref() {
+            return hid.is_connected();
+        }
+    }
+    false
+}
+
+/// Get a clone of the registered Bluetooth HID server, if any.
+pub fn get_bt_hid() -> Option<vortex_l3_daemon::core::bt_hid::BtHidServer> {
+    BT_HID.lock().ok().and_then(|g| g.clone())
 }
 
 /// Send one protocol line (`D slot nx ny`, `M slot nx ny`, `U slot`,
@@ -708,6 +857,51 @@ pub fn send(line: &str) {
         if let Some(inj) = g.as_ref() {
             // Non-blocking: just enqueue. The writer thread does the socket I/O.
             let _ = inj.tx.send(Cmd::Line(line.to_string()));
+            return;
+        }
+    }
+    // Fallback: Bluetooth HID report dispatch
+    if let Ok(g) = BT_HID.lock() {
+        if let Some(hid) = g.as_ref() {
+            let line_str = line.trim();
+            let mut parts = line_str.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            match cmd {
+                "P" => {
+                    let dx: i32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let dy: i32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let dx_i8 = dx.clamp(-127, 127) as i8;
+                    let dy_i8 = dy.clamp(-127, 127) as i8;
+                    let hid_clone = hid.clone();
+                    tauri::async_runtime::spawn(async move {
+                        hid_clone.send_mouse(dx_i8, dy_i8, 0).await;
+                    });
+                }
+                "B" => {
+                    let btn: u8 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let val: u8 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let hid_clone = hid.clone();
+                    tauri::async_runtime::spawn(async move {
+                        hid_clone.send_button(btn, val == 1).await;
+                    });
+                }
+                "W" => {
+                    let dy: i8 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let hid_clone = hid.clone();
+                    tauri::async_runtime::spawn(async move {
+                        hid_clone.send_mouse(0, 0, dy).await;
+                    });
+                }
+                "E" => {
+                    let code: u16 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let val: u8 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let hid_clone = hid.clone();
+                    tauri::async_runtime::spawn(async move {
+                        hid_clone.send_key(code, val == 1).await;
+                    });
+                }
+                _ => {}
+            }
         }
     }
 }

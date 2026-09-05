@@ -281,10 +281,24 @@ class CameraStreamService : Service() {
 
     private fun acceptLoop() {
         val srv = server ?: return
-        while (running && client == null) {
+        // Keep accepting, not just once.
+        //
+        // The laptop tears its pipe down and dials again whenever the lens is
+        // flipped — front and back sensors have different orientations, so the
+        // pipeline has to be rebuilt. With `client == null` in the loop
+        // condition this thread had already exited by then, so the second
+        // connect sat unaccepted in the kernel backlog while the write to the
+        // closed first socket set `running = false` and ended the encoder. One
+        // tap on "flip camera" killed the webcam until it was toggled off and
+        // on again.
+        while (running) {
             try {
                 val s = srv.accept()
                 s.tcpNoDelay = true
+                // A new connection replaces the old one: the laptop only ever
+                // has one pipe open, so an arriving socket means the previous
+                // one is finished with.
+                runCatching { client?.close() }
                 client = s
                 out = BufferedOutputStream(s.getOutputStream())
                 Log.i(tag, "laptop connected ${s.inetAddress?.hostAddress}")
@@ -309,8 +323,13 @@ class CameraStreamService : Service() {
             o.write(s.sealAccessUnit(au))
             o.flush()
         } catch (e: Exception) {
+            // Drop THIS connection and wait for the next one, rather than
+            // ending the service. A failed write usually means the laptop
+            // closed its side — which is exactly what a lens flip does.
             Log.w(tag, "video write failed: ${e.message}")
-            running = false
+            runCatching { client?.close() }
+            client = null
+            out = null
         }
     }
 

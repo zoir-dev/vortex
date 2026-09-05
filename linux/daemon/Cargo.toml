@@ -28,6 +28,16 @@ name = "vortex-switch-bench"
 path = "src/bin/switch_bench.rs"
 required-features = ["dev-tools"]
 
+[[bin]]
+name = "vortex-bt-hid-test"
+path = "src/bin/hid_test.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "vortex-hogp-test"
+path = "src/bin/hogp_test.rs"
+required-features = ["dev-tools"]
+
 [dependencies]
 hmac = "0.12"
 sha2 = "0.10"
@@ -52,6 +62,7 @@ mdns-sd = "0.13"
 # Re-use the zbus that secret-service already pulls in for direct
 # MPRIS calls (call-handoff media pause/resume).
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+libc = "0.2"
 
 
 [dev-dependencies]

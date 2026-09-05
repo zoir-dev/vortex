@@ -61,7 +61,14 @@ pub(crate) fn dispatch_lock_command(state: &vortex_l3_daemon::core::appstate::Ap
         };
         match res {
             Ok(()) => tracing::info!(%cmd, seq, "remote lock command executed"),
-            Err(e) => tracing::warn!(%cmd, seq, "remote lock command failed: {e}"),
+            Err(e) => {
+                tracing::warn!(%cmd, seq, "remote lock command failed: {e}");
+                // The phone's unlock button hits the same polkit gate as
+                // proximity unlock; tell the user rather than dropping it.
+                if vortex_l3_daemon::core::session_lock::is_unlock_denied(&e) {
+                    crate::proximity::warn_unlock_denied_once().await;
+                }
+            }
         }
     });
 }
@@ -232,7 +239,6 @@ pub(crate) fn spawn_state_consumer(
                             None => None,
                         };
                         crate::tray::update_battery_rows(
-                            &app_state,
                             local_earbuds.as_ref(),
                             Some(&state),
                         );

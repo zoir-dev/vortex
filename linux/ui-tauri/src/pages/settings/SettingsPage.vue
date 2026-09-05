@@ -56,10 +56,22 @@ onMounted(() => {
     ucEnabled.value = false;
     ucError.value = e.payload;
   }).then((un) => (unlistenUc = un));
+  // …and the running state itself, which changes without any error at all: the
+  // compositor drops the capture session on every screen lock and suspend.
+  // `uc_running` was read once on mount, so the switch went stale the first
+  // time that happened and stayed stale.
+  void listen<boolean>("vortex:uc-state", (e) => {
+    ucEnabled.value = e.payload;
+    if (e.payload) ucError.value = "";
+  }).then((un) => (unlistenUcState = un));
 });
 
 let unlistenUc: UnlistenFn | undefined;
-onUnmounted(() => unlistenUc?.());
+let unlistenUcState: UnlistenFn | undefined;
+onUnmounted(() => {
+  unlistenUc?.();
+  unlistenUcState?.();
+});
 
 // Universal Control: the laptop cursor + keyboard cross the screen edge onto
 // the phone (drives its native cursor). Toggling on arms the edge barrier;

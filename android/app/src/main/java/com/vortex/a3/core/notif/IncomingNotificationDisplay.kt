@@ -17,6 +17,14 @@ import java.util.concurrent.atomic.AtomicInteger
 object IncomingNotificationDisplay {
     private const val CHANNEL_ID = "vortex_mirror"
     private val seq = AtomicInteger(20_000)
+
+    /** Notification id per laptop-side key, so an update replaces its previous
+     *  copy in place. Bounded LRU: one session does not produce unbounded
+     *  distinct conversations, and a stale entry costs one integer. */
+    private val idsByKey = object : LinkedHashMap<String, Int>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Int>?): Boolean =
+            size > 200
+    }
     @Volatile private var channelReady = false
 
     fun show(context: Context, m: NotificationMirror) {
@@ -27,7 +35,14 @@ object IncomingNotificationDisplay {
             m.title.isNotBlank() -> m.title
             else -> m.app.ifBlank { "Notification" }
         }
-        val id = seq.incrementAndGet()
+        // Reuse the id for a given key, so an updated laptop notification
+        // REPLACES its previous copy instead of stacking a new one. A chat that
+        // updated five times used to leave five notifications on the phone.
+        val id = if (m.key.isNotEmpty()) {
+            idsByKey.getOrPut(m.key) { seq.incrementAndGet() }
+        } else {
+            seq.incrementAndGet()
+        }
         // A no-op contentIntent so a TAP dismisses the mirror. We can't run a
         // laptop notification's action from here (we're not its owner), but
         // setAutoCancel only fires when there IS a contentIntent — this gives

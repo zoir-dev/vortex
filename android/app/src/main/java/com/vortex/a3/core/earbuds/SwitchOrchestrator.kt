@@ -71,6 +71,23 @@ class SwitchOrchestrator(
     private val flowState = MutableStateFlow<SwitchState>(SwitchState.Idle)
     val state: StateFlow<SwitchState> = flowState.asStateFlow()
 
+    /** The buds we last handed to the peer with [claim], and when. */
+    @Volatile private var lastClaimMac: String? = null
+    @Volatile private var lastClaimAtMs: Long = 0L
+
+    /** Did we ourselves hand [mac] over in the last few seconds?
+     *
+     *  Window sized off the thing that made this necessary: the call gate holds
+     *  for ~6 s after a call ends, and the laptop's Request lands within a
+     *  second or two of our Claim. Ten seconds covers that with room for a slow
+     *  link, and is short enough that it cannot excuse an unrelated Request
+     *  arriving during a genuinely live call later on. */
+    private fun recentlyClaimed(mac: String): Boolean {
+        val m = lastClaimMac ?: return false
+        if (!m.equals(mac, ignoreCase = true)) return false
+        return android.os.SystemClock.elapsedRealtime() - lastClaimAtMs < CLAIM_HONOUR_MS
+    }
+
     /** Set when an initiator flow is in-flight. The matching peer +
      *  mac + nonce live here so an arriving `Approve` / `Released`
      *  knows which flow it belongs to. */
@@ -103,6 +120,10 @@ class SwitchOrchestrator(
      *  end. The laptop will fire its own `Request` if it needs to
      *  confirm; we just announce + release. */
     fun claim(peerStaticPub: ByteArray, mac: String) {
+        // Remember that WE handed these buds over, so the peer's answering
+        // Request cannot be refused by a gate meant for unsolicited ones.
+        lastClaimMac = mac
+        lastClaimAtMs = android.os.SystemClock.elapsedRealtime()
         scope.launch {
             // Fire the BLE claim notification first — best to have it
             // on the wire before we drop our own connection, otherwise
@@ -341,6 +362,19 @@ class SwitchOrchestrator(
         }
         var lastErr = "connect not attempted"
         for (attempt in 1..CONNECT_RETRY_COUNT) {
+            // We handed these buds to the peer while this loop was running.
+            //
+            // `claim()` is deliberately outside the state machine — the phone
+            // stays Idle on its own end — so nothing here noticed, and an
+            // attempt already in flight went on to CONNECT the buds back to
+            // this phone AFTER the hand-over. The user declines a call two
+            // seconds in, the laptop is told to take the earbuds, and the
+            // phone's own retry quietly takes them again.
+            if (recentlyClaimed(mac)) {
+                Log.i(TAG, "attemptConnect: we just claimed $mac for the peer — abandoning")
+                failInitiator(peerPub, "handed to peer")
+                return
+            }
             // Bail on terminal states. AlmostDone is NOT terminal — BT
             // is still meant to run; the state just signals "UI thinks
             // we're done already".
@@ -398,7 +432,23 @@ class SwitchOrchestrator(
     // ---- Responder flow ----
 
     private fun startResponderFlow(peerPub: ByteArray, mac: String) {
-        when (val accept = acceptanceProvider()) {
+        // A Request that answers our OWN Claim is never refused.
+        //
+        // This is the post-call hand-back, and it was failing every time. At
+        // call end the phone claims the buds for the laptop; the laptop answers
+        // with a Request; and the phone rejected it `InCall`, because the call
+        // gate reads `currentCall`, which deliberately lingers ~6 s on
+        // PHASE_ENDED so the laptop can clear its pill promptly. So the phone
+        // refused the very hand-off it had just asked for. On this deployment
+        // that was 19 of 20 switch failures, and the laptop treats the reject as
+        // terminal, so the earbuds ended up on nobody.
+        //
+        // Checked here rather than in the acceptance provider because this is
+        // where the MAC is known, and the rule is about THIS device's own
+        // recent request, not about any caller's policy.
+        if (recentlyClaimed(mac)) {
+            Log.i(TAG, "responder: honouring peer Request for our own recent claim of $mac")
+        } else when (val accept = acceptanceProvider()) {
             is Acceptance.Reject -> {
                 scope.launch {
                     val nonce = peerStore.nextAudioOutNonce(peerPub)
@@ -551,6 +601,10 @@ class SwitchOrchestrator(
     }
 
     companion object {
+        /** How long a Claim we sent keeps the peer's answering Request
+         *  exempt from the acceptance gate. See [recentlyClaimed]. */
+        private const val CLAIM_HONOUR_MS: Long = 10_000
+
         private const val TAG = "VortexSwitch"
 
         /** Hard ceiling on a non-terminal flow before the watchdog forces

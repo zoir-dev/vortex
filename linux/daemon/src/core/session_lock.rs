@@ -8,17 +8,20 @@
 //! is logind's `Session.Unlock` on the system bus, which GNOME Shell honors
 //! by dismissing the shield without a password. That call is gated by the
 //! polkit action `org.freedesktop.login1.lock-sessions` (auth_admin_keep by
-//! default), so remote unlock needs a one-time rule allowing this user:
+//! default), so remote unlock needs a one-time rule allowing this user.
+//!
+//! That rule is NOT hand-written and NOT installed by `install_linux.sh` —
+//! it writes to /etc and changes what the system authorises, so it is opt-in:
 //!
 //! ```text
-//! /etc/polkit-1/rules.d/49-vortex-unlock.rules
-//! polkit.addRule(function(action, subject) {
-//!     if (action.id == "org.freedesktop.login1.lock-sessions" &&
-//!         subject.user == "<user>") {
-//!         return polkit.Result.YES;
-//!     }
-//! });
+//! sudo linux/packaging/install-unlock-rule.sh            # install
+//! sudo linux/packaging/install-unlock-rule.sh --remove   # undo
+//!      linux/packaging/install-unlock-rule.sh --status   # is it on?
 //! ```
+//!
+//! Until it is installed `unlock()` fails with an access-denied error and
+//! [`is_unlock_denied`] identifies that case, so callers can say so out loud
+//! instead of leaving a toggle that silently does nothing.
 //!
 //! Security model: the command only ever arrives over the Noise-
 //! authenticated transport from an already-trusted peer, and the caller
@@ -95,8 +98,27 @@ pub async fn lock() -> Result<(), String> {
         .map_err(|e| format!("logind Lock: {e}"))
 }
 
+/// True when an `unlock()` error is polkit REFUSING the call rather than a
+/// transport or session-lookup problem — i.e. the one-time rule (see module
+/// doc) was never installed. The distinction matters to callers: a refusal is
+/// permanent and actionable by the user, everything else is worth a retry.
+///
+/// Matched on substrings because the exact wording differs between the D-Bus
+/// error name, polkit's own message, and older systemd versions.
+pub fn is_unlock_denied(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("accessdenied")
+        || e.contains("access denied")
+        || e.contains("interactiveauthorizationrequired")
+        || e.contains("interactive authentication")
+        || e.contains("notauthorized")
+        || e.contains("not authorized")
+        || e.contains("permission denied")
+}
+
 /// Unlock the desktop session via logind. Fails with an access-denied
-/// error until the one-time polkit rule is installed (see module doc).
+/// error until the one-time polkit rule is installed (see module doc);
+/// [`is_unlock_denied`] recognises exactly that failure.
 pub async fn unlock() -> Result<(), String> {
     let conn = Connection::system()
         .await
@@ -105,7 +127,12 @@ pub async fn unlock() -> Result<(), String> {
     session
         .call::<_, _, ()>("Unlock", &())
         .await
-        .map_err(|e| format!("logind Unlock: {e} (one-time polkit rule missing? see session_lock.rs doc)"))
+        .map_err(|e| {
+            format!(
+                "logind Unlock: {e} (missing the one-time rule? \
+                 run: sudo linux/packaging/install-unlock-rule.sh)"
+            )
+        })
 }
 
 /// Current `LockedHint` of the graphical session — what we report to the

@@ -345,9 +345,22 @@ class AudioDeviceController(private val appContext: Context) : AudioDeviceHandle
         // a duplicate pair drifted (350 vs 280) and was never used.
 
         /** Window for the connection state to transition to CONNECTED
-         *  after a successful reflection-based connect call. Most buds
-         *  flip within 400-800 ms; 1500 ms is a generous ceiling. */
-        const val CONNECT_SETTLE_MS: Long = 1_500
+         *  after a successful reflection-based connect call.
+         *
+         *  It was 1500 ms, described as "a generous ceiling" on the belief that
+         *  buds flip within 400-800 ms. Measured against the real hardware here,
+         *  the laptop's own connects to these same earbuds took 3.2-4.8 s in 14
+         *  of 18 cases. So the ceiling sat well BELOW the normal case, and the
+         *  phone declared failure while Android was still connecting — the OS
+         *  then finished the job, leaving the buds on the phone while the app
+         *  believed it had none. Seen 12 times in a week, and it feeds straight
+         *  into the failed post-call hand-back.
+         *
+         *  4.5 s covers the measured range. Nothing waits on this synchronously
+         *  from a user's point of view: the switch is already asynchronous, so
+         *  the cost of being generous is a slower FAILURE report, while the cost
+         *  of being tight is a wrong one. */
+        const val CONNECT_SETTLE_MS: Long = 4_500
 
         /** Same idea for disconnect — usually faster than connect. */
         const val DISCONNECT_SETTLE_MS: Long = 1_000

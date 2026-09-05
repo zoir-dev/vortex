@@ -128,7 +128,16 @@ pub(crate) fn queue_clipboard_image_for_sync(sig: String, png: &[u8]) {
     if !CLIPBOARD_SYNC.load(Ordering::Relaxed) {
         return;
     }
-    if png.len() > vortex_l3_daemon::core::clipboard_mirror::MAX_BLE_IMAGE_BYTES {
+    let cap = vortex_l3_daemon::core::clipboard_mirror::MAX_BLE_IMAGE_BYTES;
+    if png.len() > cap {
+        // Say so. This used to be a bare `return`: the image never reached the
+        // phone and nothing anywhere recorded why, so the feature looked simply
+        // unreliable — copy a big screenshot, nothing arrives, no error.
+        tracing::info!(
+            bytes = png.len(),
+            cap,
+            "clipboard image too large for the BLE link — not synced to the phone"
+        );
         return;
     }
     if let Some(tx) = CLIPBOARD_IMG_SEND_TX.get() {
@@ -177,13 +186,22 @@ pub(crate) fn set_system_text(text: String) -> Result<(), String> {
     with_clip_setter(|cb| cb.set_text(text).map_err(|e| format!("set_text: {e}")))
 }
 
-/// Put text on the clipboard for a local reason — i.e. it did NOT come from
-/// the phone and must not be sent back there.
+/// Put text on the clipboard for a local reason — it did NOT come from the
+/// phone and must not be sent back there. Arms the same loop guard the sync
+/// path uses, so the watcher recognises its own capture instead of bouncing the
+/// text to the phone.
 ///
-/// Arms the same loop guard the sync path uses before writing, so the watcher
-/// recognises its own capture instead of bouncing the text to the phone, and
-/// files it in the clipboard history the way any other copy would be.
-pub(crate) fn set_local_text(text: &str) -> Result<(), String> {
+/// The text is a one-time credential: put it on the clipboard and do NOT file
+/// it in the history.
+///
+/// A login code is useful for about thirty seconds and sensitive for much
+/// longer. Storing it meant every OTP of the past weeks was browsable in the
+/// Super+V popup — the opposite of what a one-time code is for.
+pub(crate) fn set_local_secret(text: &str) -> Result<(), String> {
+    set_local_text_inner(text, false)
+}
+
+fn set_local_text_inner(text: &str, remember: bool) -> Result<(), String> {
     let text = tidy_text(text);
     if text.is_empty() {
         return Ok(());
@@ -192,7 +210,9 @@ pub(crate) fn set_local_text(text: &str) -> Result<(), String> {
         *g = sync_sig(&text);
     }
     set_system_text(text.clone())?;
-    crate::clipboard::store_capture("text", Some(text), None);
+    if remember {
+        crate::clipboard::store_capture("text", Some(text), None);
+    }
     Ok(())
 }
 
@@ -574,7 +594,25 @@ pub(crate) async fn apply_synced_file(
     let saved = tokio::task::spawn_blocking(move || -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(&dir)?;
         let path = unique_path(&dir, &safe2);
-        std::fs::write(&path, &bytes)?;
+        // Write to a temporary name, then rename into place.
+        //
+        // Writing straight to the final name means a failure part-way — the
+        // disk filling up is the realistic one — leaves a TRUNCATED file
+        // sitting under the name the user expects, looking complete. A rename
+        // within the same directory is atomic, so the file either appears whole
+        // or does not appear at all.
+        let tmp = path.with_extension(format!(
+            "{}.vortex-part",
+            path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default()
+        ));
+        if let Err(e) = std::fs::write(&tmp, &bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(path)
     })
     .await;

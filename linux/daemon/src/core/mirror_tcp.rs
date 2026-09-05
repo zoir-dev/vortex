@@ -53,6 +53,11 @@ pub const CAMERA_VIDEO_PORT: u16 = 51824;
 /// turning into a multi-GB allocation).
 const MAX_AU_LEN: usize = 8 * 1024 * 1024;
 
+/// How long one video write may block before the connection is treated as dead.
+/// Generous next to a frame interval (~16-33 ms), far below the minutes a
+/// stalled TCP send would otherwise take to surface.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 12-byte nonce from the 8-byte counter (high 4 bytes zero) — matches the
 /// phone's `MirrorTcpSealer` and the old UDP scheme.
 #[inline]
@@ -280,9 +285,26 @@ pub async fn run_tcp_video_client(
             match au_rx.recv().await {
                 Some(au) => {
                     let msg = sealer.seal(&au);
-                    if let Err(e) = stream.write_all(&msg).await {
-                        tracing::info!(sent, "laptop-cast: phone viewer dropped ({e}) — reconnecting");
-                        continue 'session; // self-heal: dial again
+                    // Bounded. With no timeout, a phone that stops draining —
+                    // screen off, a route that went away, AP isolation changing
+                    // under us — parks this task in the kernel send buffer for
+                    // the TCP retransmit lifetime, which is minutes. The cast
+                    // simply appears frozen and the reconnect below never runs.
+                    // The phone grew a write watchdog for exactly this in the
+                    // other direction; this side had none.
+                    match tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(&msg)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::info!(sent, "laptop-cast: phone viewer dropped ({e}) — reconnecting");
+                            continue 'session; // self-heal: dial again
+                        }
+                        Err(_) => {
+                            tracing::info!(
+                                sent,
+                                "laptop-cast: video write stalled past {WRITE_TIMEOUT:?} — reconnecting"
+                            );
+                            continue 'session;
+                        }
                     }
                     sent += 1;
                 }

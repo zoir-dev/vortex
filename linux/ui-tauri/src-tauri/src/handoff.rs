@@ -117,18 +117,49 @@ fn domain_of(url: &str) -> Option<String> {
     let after = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let host = after
-        .split('/')
-        .next()?
+    // The authority ends at the FIRST of `/`, `?` or `#`. Splitting on `/`
+    // alone left the query string in, and `rsplit('@')` then treated anything
+    // after a `@` in it as the host: `https://evil.com?r=@paypal.com` displayed
+    // "paypal.com", with paypal's favicon, on a pill that opens evil.com.
+    let authority = after
+        .split(['/', '?', '#'])
+        .next()?;
+    let host = authority
         .rsplit('@')
         .next()? // strip any userinfo
         .split(':')
         .next()?; // strip port
     let host = host.strip_prefix("www.").unwrap_or(host);
-    if host.is_empty() {
+    // A host is a domain, not a sentence: anything outside the character set a
+    // hostname can contain means we could not parse this and should say so
+    // rather than display something misleading.
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
         None
     } else {
         Some(host.to_string())
+    }
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::domain_of;
+
+    #[test]
+    fn the_query_string_cannot_forge_the_host() {
+        assert_eq!(domain_of("https://evil.com?r=@paypal.com").as_deref(), Some("evil.com"));
+        assert_eq!(domain_of("https://evil.com/#@paypal.com").as_deref(), Some("evil.com"));
+    }
+
+    #[test]
+    fn ordinary_urls_still_parse() {
+        assert_eq!(domain_of("https://www.bbc.co.uk/news").as_deref(), Some("bbc.co.uk"));
+        assert_eq!(domain_of("http://example.org:8080/x").as_deref(), Some("example.org"));
+        assert_eq!(domain_of("https://user:pw@example.org/x").as_deref(), Some("example.org"));
+        assert_eq!(domain_of("ftp://example.org"), None);
     }
 }
 
