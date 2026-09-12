@@ -118,12 +118,14 @@ class SmsProvider(
         val skip = offset.coerceAtLeast(0)
         return querySms(
             cols, sel, args,
-            "${Telephony.Sms.DATE} DESC LIMIT $cap OFFSET $skip",
+            "${Telephony.Sms.DATE} DESC",
             // Some ROMs leave ADDRESS blank on sent rows; fall back to the
             // requested address so the laptop's thread merge (keyed by
             // address) doesn't silently drop them.
             fallbackAddress = address.trim(),
             logTag = "loadThread",
+            cap = cap,
+            skip = skip,
         )
     }
 
@@ -149,8 +151,9 @@ class SmsProvider(
             cols,
             "${Telephony.Sms.DATE} > ?",
             arrayOf(sinceMs.toString()),
-            "${Telephony.Sms.DATE} ASC LIMIT $cap",
+            "${Telephony.Sms.DATE} ASC",
             logTag = "readHistorySince",
+            cap = cap,
         )
     }
 
@@ -181,6 +184,23 @@ class SmsProvider(
     }
 
     /** Shared cursor loop for the thread/history readers. */
+    /**
+     * Run an SMS query and window the result in Kotlin.
+     *
+     * [cap] and [skip] are applied HERE rather than as `LIMIT`/`OFFSET` in
+     * [sortOrder]. A provider is free to validate that argument and reject the
+     * clause: the call-log provider does exactly that on Android 16
+     * (`Invalid token LIMIT`), which silently broke every call-log read until
+     * it was moved Kotlin-side. `content://sms` happens to tolerate it today,
+     * so this is prophylactic — but the failure mode there would be worse than
+     * the call log's, because callers rely on the window for correctness and
+     * not merely for size: [loadThread] pages with it, and an unwindowed
+     * [readHistorySince] would ship the whole message store in one batch.
+     *
+     * Cost of doing it here: [skip] is a cursor walk instead of a SQL OFFSET,
+     * so deep paging is O(offset). Thread pages cap at 200, so this is a walk
+     * over a lazily-filled cursor window, not per-row I/O.
+     */
     private fun querySms(
         cols: Array<String>,
         selection: String,
@@ -188,8 +208,10 @@ class SmsProvider(
         sortOrder: String,
         fallbackAddress: String = "",
         logTag: String,
+        cap: Int,
+        skip: Int = 0,
     ): List<SmsMessage> {
-        val out = ArrayList<SmsMessage>()
+        val out = ArrayList<SmsMessage>(minOf(cap, LIMIT))
         try {
             context.contentResolver.query(
                 Uri.parse("content://sms"), cols, selection, args, sortOrder,
@@ -201,7 +223,14 @@ class SmsProvider(
                 val dateIdx = c.getColumnIndex(Telephony.Sms.DATE)
                 val threadIdx = c.getColumnIndex(Telephony.Sms.THREAD_ID)
                 val readIdx = c.getColumnIndex(Telephony.Sms.READ)
+                var skipped = 0
                 while (c.moveToNext()) {
+                    // Window in this order: drop `skip` rows, then take `cap`.
+                    if (skipped < skip) {
+                        skipped++
+                        continue
+                    }
+                    if (out.size >= cap) break
                     out.add(
                         SmsMessage(
                             id = if (idIdx >= 0) c.getString(idIdx).orEmpty() else "",
@@ -251,7 +280,7 @@ class SmsProvider(
             cols,
             null,
             null,
-            "${Telephony.Sms.DATE} DESC LIMIT $LIMIT",
+            "${Telephony.Sms.DATE} DESC",
         )?.use { c ->
             val idIdx = c.getColumnIndex(Telephony.Sms._ID)
             val addrIdx = c.getColumnIndex(Telephony.Sms.ADDRESS)
@@ -261,7 +290,7 @@ class SmsProvider(
             val threadIdx = c.getColumnIndex(Telephony.Sms.THREAD_ID)
             val readIdx = c.getColumnIndex(Telephony.Sms.READ)
             while (c.moveToNext()) {
-                if (out.size >= LIMIT) break // guard if the SQL LIMIT is ignored
+                if (out.size >= LIMIT) break // sole row limit: see querySms
                 out.add(
                     SmsMessage(
                         id = if (idIdx >= 0) c.getString(idIdx).orEmpty() else "",

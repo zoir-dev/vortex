@@ -63,6 +63,8 @@ class MainUiState(
     val showAutostartDialog: MutableStateFlow<Boolean>,
     /** Bluetooth adapter is off/absent → drives the home "turn on BT" banner. */
     val bluetoothOff: StateFlow<Boolean>,
+    /** A "switch laptop" seek window is open. */
+    val seekingLaptop: StateFlow<Boolean>,
 )
 
 /**
@@ -75,6 +77,14 @@ class MainUiState(
  */
 class VortexActions(
     val onForgetPeer: (TrustedPeer) -> Unit,
+    /** Open a pairing window while trust already exists, so this phone
+     *  can be offered to a second laptop without forgetting the first. */
+    val onAddPair: () -> Unit,
+    val onCancelAddPair: () -> Unit,
+    /** Look for another remembered laptop while staying on this one. */
+    val onSwitchLaptop: () -> Unit,
+    /** Switch to one NAMED laptop; lets the seek advertise a single token. */
+    val onSwitchToPeer: (TrustedPeer) -> Unit,
     val onOpenAutostart: () -> Unit,
     val onDismissAutostartHint: () -> Unit,
     val onRequestBatteryWhitelist: () -> Unit,
@@ -257,6 +267,11 @@ fun VortexRoot(
                         pickerState = ui.picker.collectAsState().value,
                         switchState = EarbudsSwitchHolder.state.collectAsState().value,
                         onForgetPeer = actions.onForgetPeer,
+                        onAddPair = actions.onAddPair,
+                        onCancelAddPair = actions.onCancelAddPair,
+                        onSwitchLaptop = actions.onSwitchLaptop,
+                        onSwitchToPeer = actions.onSwitchToPeer,
+                        seekingLaptop = ui.seekingLaptop.collectAsState().value,
                         onOpenAutostart = actions.onOpenAutostart,
                         onDismissAutostartHint = actions.onDismissAutostartHint,
                         onRequestBatteryWhitelist = actions.onRequestBatteryWhitelist,

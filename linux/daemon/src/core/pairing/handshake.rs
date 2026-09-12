@@ -334,7 +334,7 @@ const PEER_NAME_MAX_CHARS: usize = 64;
 ///   * trim surrounding whitespace.
 ///
 /// Returns an empty string if everything was filtered out.
-pub(crate) fn sanitize_peer_name(input: &str) -> String {
+pub fn sanitize_peer_name(input: &str) -> String {
     let cleaned: String = input
         .chars()
         .filter(|c| {

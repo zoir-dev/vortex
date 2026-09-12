@@ -141,6 +141,25 @@ interface PeerStore {
         commitAudioInNonce(peerStaticPub, nonce)
         return true
     }
+
+    /**
+     * The laptop's Bluetooth address (BD_ADDR string), learned from the
+     * connected central during pairing and refreshed on every reconnect.
+     *
+     * Exists so [forget] can hand it to
+     * [com.vortex.a3.core.ble.BondCleaner.removeBond]. Vortex itself never
+     * bonds — Linux deliberately skips `Device::pair()` — but a bond can
+     * still appear via the desktop's Bluetooth panel or an older build, and
+     * Android hides such profile-less LE bonds from Settings, so the user
+     * cannot clear them by hand. Without this the phone keeps its half of a
+     * bond the laptop has dropped, and the next pairing dies during
+     * encryption with `timeout: service discovery`.
+     *
+     * Laptops use a public static address, so one value per peer is stable —
+     * unlike the phone's own rotating RPA.
+     */
+    fun loadPeerBtAddr(peerStaticPub: ByteArray): String? = null
+    fun savePeerBtAddr(peerStaticPub: ByteArray, addr: String) {}
 }
 
 /** EncryptedSharedPreferences-backed Trusted Peer store. */
@@ -182,6 +201,13 @@ class EncryptedPrefsPeerStore(context: Context) : PeerStore {
                 runCatching { TrustedPeer.decode(Base64.decode(s, Base64.NO_WRAP)) }.getOrNull()
             }
             .filterNotNull()
+            // Deterministic order. `prefs.all` is a HashMap, so without this the
+            // sequence follows hash order — and every `list().firstOrNull()`
+            // caller silently means "an arbitrary peer". That showed up as the
+            // phone's home card displaying whichever laptop hashed first
+            // instead of the one it was actually connected to. Most recently
+            // paired first, so "the one peer" degrades to something sensible.
+            .sortedByDescending { it.pairedAt }
             .toList()
     }
 
@@ -192,7 +218,15 @@ class EncryptedPrefsPeerStore(context: Context) : PeerStore {
             .remove("counter-$hex")
             .remove("audio_out_nonce-$hex")
             .remove("audio_in_nonce-$hex")
+            .remove("btaddr-$hex")
             .apply()
+    }
+
+    override fun loadPeerBtAddr(peerStaticPub: ByteArray): String? =
+        prefs.getString("btaddr-${peerStaticPub.toHex()}", null)
+
+    override fun savePeerBtAddr(peerStaticPub: ByteArray, addr: String) {
+        prefs.edit().putString("btaddr-${peerStaticPub.toHex()}", addr).apply()
     }
 
     override fun loadCounter(peerStaticPub: ByteArray): Long {

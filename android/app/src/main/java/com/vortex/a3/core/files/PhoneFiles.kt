@@ -185,7 +185,7 @@ object PhoneFiles {
      */
     fun read(context: Context, raw: String): com.vortex.a3.core.clipboard.ClipboardOutgoingFile? {
         val uri = resolve(context, raw) ?: return null
-        return com.vortex.a3.core.clipboard.ClipboardFileReader.read(context, uri)
+        return com.vortex.a3.core.clipboard.ClipboardFileReader.readOrNull(context, uri)
     }
 
     /** `primary:Download` reads better as `Download`. */

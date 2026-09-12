@@ -68,7 +68,12 @@
     "offline": "Offline",
     "forget_title": "Forget device",
     "forget_body": "Stop trusting {name}? You'll need to re-pair to connect again.",
-    "forget_confirm": "Forget"
+    "forget_confirm": "Forget",
+    "switch_tip": "Switch to another paired phone",
+    "switch_scanning": "Looking for your other phones…",
+    "switch_pick": "Switch to which phone?",
+    "switch_none": "No other paired phone nearby.",
+    "switch_cancel": "Cancel"
   },
   "discover": {
     "looking": "Looking for nearby devices…",

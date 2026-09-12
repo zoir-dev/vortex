@@ -64,6 +64,16 @@ class MainActivity : ComponentActivity() {
      *  once when the LanServer enters PairingWindow mode. */
     internal var pairingInstanceId: ByteArray? = null
 
+    /** Drives a user-opened "pair another laptop" window: the advertise +
+     *  bounded-close sequence in [startPairingWindow]. Cancelled when the
+     *  window is closed early (user Cancel, or a successful pair). */
+    internal var pairingWindowJob: kotlinx.coroutines.Job? = null
+
+    /** Set when [onAddPairClicked] had to ask for permissions first, so the
+     *  grant callback opens a pairing window instead of falling through to
+     *  the default (trusted-presence) advertising mode. */
+    internal var pendingPairingWindow = false
+
     internal val state = MutableStateFlow<AdvertiseState>(AdvertiseState.Idle)
     internal val identityState = MutableStateFlow<IdentityRecord?>(null)
     internal val handshakeState = MutableStateFlow<PairingOrchestrator.HandshakeOutcome?>(null)
@@ -167,6 +177,12 @@ class MainActivity : ComponentActivity() {
      *  back on. */
     internal val bluetoothOff = MutableStateFlow(false)
 
+    /** True while a "switch laptop" seek window is open. Mirrored from the
+     *  service (which owns the window and its expiry) by the same 3 s
+     *  ticker that refreshes staleness, so a window that times out on its
+     *  own stops showing as busy without needing a callback. */
+    internal val seekingLaptop = MutableStateFlow(false)
+
     /** True while [btStateReceiver] is registered, so onPause unregisters
      *  exactly once (double-unregister throws). */
     private var btReceiverRegistered = false
@@ -198,6 +214,8 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { granted ->
         val denied = granted.filterValues { !it }.keys
+        val wantWindow = pendingPairingWindow
+        pendingPairingWindow = false
         // Only a denied BLUETOOTH permission can stop us: without the radio
         // there is nothing to advertise on. Declining SMS or call-log access
         // costs the user those features, not the ability to pair — which is
@@ -210,7 +228,9 @@ class MainActivity : ComponentActivity() {
                     "pairing on without optional permissions: ${denied.joinToString()}",
                 )
             }
-            startAdvertising()
+            // "Add pair" asked for these; honour that instead of
+            // startAdvertising(), which would pick trusted-presence.
+            if (wantWindow) startPairingWindow() else startAdvertising()
         } else {
             state.value = AdvertiseState.Error("permissions denied: ${blocking.joinToString()}")
         }
@@ -345,6 +365,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             while (isActive) {
                 nowTickState.value = System.currentTimeMillis()
+                // The service owns the seek window and its 45 s expiry, so mirror
+                // it rather than tracking a second copy here — otherwise a window
+                // that times out on its own would keep showing as busy.
+                seekingLaptop.value = VortexService.isSeeking()
                 delay(3_000)
             }
         }
@@ -416,11 +440,16 @@ class MainActivity : ComponentActivity() {
         showNotifAccessDialog = showNotifAccessDialog,
         showAutostartDialog = showAutostartDialog,
         bluetoothOff = bluetoothOff,
+        seekingLaptop = seekingLaptop,
     )
 
     /** Bundle the activity's callbacks for the root composable. */
     private fun buildActions(): VortexActions = VortexActions(
         onForgetPeer = ::onForgetPeerClicked,
+        onAddPair = ::onAddPairClicked,
+        onCancelAddPair = ::endPairingWindow,
+        onSwitchLaptop = ::onSwitchLaptopClicked,
+        onSwitchToPeer = ::onSwitchToPeerClicked,
         onOpenAutostart = ::onOpenAutostartSettings,
         onDismissAutostartHint = ::dismissAutostartHint,
         onRequestBatteryWhitelist = ::onRequestBatteryWhitelist,

@@ -111,7 +111,13 @@ class Advertiser(private val context: Context) {
         // ~1.5s screen-on — MIUI throttles background advertising hard,
         // and a LOW_LATENCY request lands in a faster throttle tier).
         // Re-evaluated at every 60s token rotation.
+        // `seeking` has to be its own term: [fastModeProvider] means "link is
+        // DOWN and was lost recently", but a seek deliberately keeps the
+        // current link UP (seek before release), so it evaluates false exactly
+        // when we most want the dense schedule — the user is walking to
+        // another machine right now. This is the first rung of the §D5 ladder.
         val advertiseMode = if (payload.flags.isPairable ||
+            seeking ||
             fastModeProvider?.invoke() == true
         ) {
             AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY
@@ -174,13 +180,143 @@ class Advertiser(private val context: Context) {
     }
 
     /**
-     * Start trusted-presence advertising with a rotating token derived
-     * from [prs] per spec §7.3. The token rotates every
-     * [rotationWindowSec] seconds so passive observers cannot link
-     * sightings across windows.
+     * True while a peer session is live. When it is, the presence loop
+     * advertises **nothing**: the session itself is the proof of presence, so
+     * a beacon on top of it is pure battery cost. Wired by VortexStack to the
+     * GATT server's connection state.
      *
-     * The supplied [scope] owns the rotation job. Cancel the scope (or
-     * call [stop]) to end advertising.
+     * This is the biggest saving in the whole state machine — the phone is
+     * connected most of the time, and it used to beacon 24/7 regardless. It is
+     * safe for the laptop's proximity auto-lock precisely because that treats
+     * "authenticated session OR token-validated advertisement" as presence,
+     * and on a drop [kickRotation] puts us back on air immediately.
+     */
+    var linkedProvider: (() -> Boolean)? = null
+
+    /**
+     * The PRS of every peer whose token we may advertise, most-recently-used
+     * first. Returning several enables token multiplexing (below).
+     */
+    var presencePeersProvider: (() -> List<ByteArray>)? = null
+
+    /**
+     * Set while the user is looking for a *different* laptop ("Switch").
+     * Forces advertising even though a session is live, so the other laptop
+     * can see us without dropping the one we are on first.
+     */
+    @Volatile
+    var seeking: Boolean = false
+
+    /**
+     * Presence + seeking loop (spec §7.3, design doc §D1/§D5).
+     *
+     * One advertising set, driven through three phases:
+     *
+     *  * **Active** — a session is live and we are not seeking: advertise
+     *    nothing, and re-check often enough that a missed disconnect callback
+     *    self-heals in seconds rather than a full rotation window.
+     *  * **Seeking / Dark** — no session (or the user pressed Switch):
+     *    advertise `TRUSTED_PRESENCE`. [fastModeProvider] already supplies the
+     *    ladder — LOW_LATENCY while the link was recently lost, BALANCED after
+     *    that. BALANCED is the floor rather than silence on purpose: the
+     *    laptop's proximity confirmation scan is short, and a present-but-
+     *    silent phone would be mistaken for one that walked away.
+     *
+     * **Token multiplexing.** The advertisement carries exactly one 8-byte
+     * token and the ADV_IND is already at the legacy 31-byte ceiling, so N
+     * remembered laptops cannot be addressed at once. With more than one peer
+     * the loop cycles them, dwelling [MULTIPLEX_DWELL_MS] on each, so any of
+     * them sees us within N × dwell — a few seconds, which is nothing on a
+     * deliberate walk-up. With a single peer it does NOT cycle: restarting the
+     * advertiser needlessly churns the RPA and costs battery, so the common
+     * case keeps exactly the old one-advertise-per-bucket behaviour.
+     */
+    fun startPresenceLoop(
+        scope: CoroutineScope,
+        rotationWindowSec: Long = 60L,
+        onError: (String) -> Unit = {},
+    ) {
+        presenceJob?.cancel()
+        stop()
+        presenceJob = scope.launch {
+            // Consecutive start failures. Each round retries regardless
+            // (restarting an advertiser is cheap and the radio may have just
+            // come back), but a persistent failure must not stay silent —
+            // the phone is INVISIBLE over BLE while this fails. Surface it
+            // once via onError after a few misses, then again only if it
+            // keeps failing after a recovery.
+            var consecFails = 0
+            var wasSilent = false
+            while (isActive) {
+                val linked = linkedProvider?.invoke() == true
+                if (linked && !seeking) {
+                    if (!wasSilent) {
+                        Log.i(TAG, "presence: session live — advertising suspended")
+                        wasSilent = true
+                    }
+                    stop()
+                    // Short re-check, not a full bucket: if a disconnect
+                    // callback is ever dropped we would otherwise stay dark
+                    // (and invisible) for up to a whole rotation window.
+                    withTimeoutOrNull(ACTIVE_RECHECK_MS) { rotationKick.receive() }
+                    continue
+                }
+                if (wasSilent) {
+                    Log.i(TAG, "presence: link down or seeking — advertising resumed")
+                    wasSilent = false
+                }
+
+                val peers = presencePeersProvider?.invoke().orEmpty()
+                if (peers.isEmpty()) {
+                    stop()
+                    withTimeoutOrNull(ACTIVE_RECHECK_MS) { rotationKick.receive() }
+                    continue
+                }
+
+                val nowSec = System.currentTimeMillis() / 1000
+                val bucket = Presence.currentBucket(nowSec, rotationWindowSec)
+                val onStart: (StartResult) -> Unit = { result ->
+                    when (result) {
+                        is StartResult.Started -> consecFails = 0
+                        is StartResult.Failed -> {
+                            consecFails++
+                            Log.w(TAG, "presence advertise failed (${consecFails}x): ${result.reason}")
+                            if (consecFails == PRESENCE_FAIL_ALERT_AT) onError(result.reason)
+                        }
+                    }
+                }
+
+                if (peers.size == 1) {
+                    stop()
+                    startWith(AdvPayload.trustedPresence(Presence.deriveToken(peers[0], bucket)), onStart)
+                    // Sleep until ~5s past the next bucket boundary so we
+                    // refresh just inside the new window — OR until a kick
+                    // (connect/disconnect edge) asks for an immediate
+                    // re-advertise with a re-evaluated mode. Receivers
+                    // tolerate ±1 bucket so a small drift is fine.
+                    val sleepSec = rotationWindowSec - (nowSec % rotationWindowSec) + 5L
+                    withTimeoutOrNull(sleepSec * 1000) { rotationKick.receive() }
+                } else {
+                    // Multiplex one pass over the peers, then re-evaluate the
+                    // phase from the top (the session may have come back, or
+                    // the peer set changed).
+                    for (prs in peers) {
+                        if (!isActive) break
+                        stop()
+                        startWith(AdvPayload.trustedPresence(Presence.deriveToken(prs, bucket)), onStart)
+                        val kicked = withTimeoutOrNull(MULTIPLEX_DWELL_MS) { rotationKick.receive() }
+                        // A kick means the phase changed — abandon the pass
+                        // instead of finishing a cycle nobody is waiting for.
+                        if (kicked != null) break
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Single-peer entry point, kept for the pairing-completion path which has
+     * exactly one peer and no service running yet.
      */
     fun startTrustedPresence(
         prs: ByteArray,
@@ -191,68 +327,9 @@ class Advertiser(private val context: Context) {
         onError: (String) -> Unit = {},
     ) {
         require(prs.size == 32) { "PRS must be 32 bytes" }
-        // Cancel any existing rotation before starting a new one. Stop
-        // current adv too so we start the new mode cleanly.
-        presenceJob?.cancel()
-        stop()
-        val prsCopy = prs.copyOf()
-        presenceJob = scope.launch {
-            // Consecutive start failures. Each bucket retries regardless
-            // (restarting an advertiser is cheap and the radio may have just
-            // come back), but a persistent failure must not stay silent —
-            // the phone is INVISIBLE over BLE while this fails. Surface it
-            // once via onError after a few misses, then again only if it
-            // keeps failing after a recovery.
-            var consecFails = 0
-            while (isActive) {
-                val nowSec = System.currentTimeMillis() / 1000
-                val bucket = Presence.currentBucket(nowSec, rotationWindowSec)
-                val token = Presence.deriveToken(prsCopy, bucket)
-                // Do NOT restart the advertiser while a peer is connected.
-                //
-                // Stopping and starting an advertising set makes Android hand
-                // out a fresh resolvable private address. Doing that every 60 s
-                // (and again on every characteristic subscribe) meant the
-                // laptop's cached address was ALWAYS dead by the time it tried
-                // to reconnect, so its "connect straight to the last address"
-                // fast path could never once succeed — every reconnect paid a
-                // full 15 s scan, and six such failures in a row used to make
-                // the laptop power-cycle its whole Bluetooth adapter.
-                //
-                // The rotation exists to stop a passive observer linking our
-                // advertisements over time. A connected peer is not that
-                // observer: it already knows exactly who we are, and while the
-                // link is up nobody is scanning for us. So rotate when it
-                // matters — between sessions — and hold still while connected.
-                if (isConnected() && activePayload != null) {
-                    Log.d(TAG, "presence rotation held: peer connected (keeping this RPA)")
-                    val intoBucket = nowSec % rotationWindowSec
-                    withTimeoutOrNull((rotationWindowSec - intoBucket + 5L) * 1000) {
-                        rotationKick.receive()
-                    }
-                    continue
-                }
-                stop()
-                startWith(AdvPayload.trustedPresence(token)) { result ->
-                    when (result) {
-                        is StartResult.Started -> consecFails = 0
-                        is StartResult.Failed -> {
-                            consecFails++
-                            Log.w(TAG, "trusted-presence advertise failed (${consecFails}x): ${result.reason}")
-                            if (consecFails == PRESENCE_FAIL_ALERT_AT) onError(result.reason)
-                        }
-                    }
-                }
-                // Sleep until ~5s past the next bucket boundary so we
-                // refresh just inside the new window — OR until a kick
-                // (connect/disconnect edge) asks for an immediate
-                // re-advertise with a re-evaluated mode. Receivers
-                // tolerate ±1 bucket so a small drift is fine.
-                val secondsIntoBucket = nowSec % rotationWindowSec
-                val sleepSec = rotationWindowSec - secondsIntoBucket + 5L
-                withTimeoutOrNull(sleepSec * 1000) { rotationKick.receive() }
-            }
-        }
+        val only = listOf(prs.copyOf())
+        presencePeersProvider = { only }
+        startPresenceLoop(scope, rotationWindowSec, onError)
     }
 
     fun stop() {
@@ -290,9 +367,24 @@ class Advertiser(private val context: Context) {
     companion object {
         private const val TAG = "VortexAdv"
 
-        /** Consecutive trusted-presence start failures before [startTrustedPresence]'s
+        /** Consecutive trusted-presence start failures before [startPresenceLoop]'s
          *  onError fires (the loop itself keeps retrying every bucket). */
         private const val PRESENCE_FAIL_ALERT_AT = 3
+
+        /** How long each peer's token stays on air during multiplexing.
+         *
+         *  Long enough for a scanning laptop to catch several advertising
+         *  events (LOW_LATENCY ≈ 100 ms, BALANCED ≈ 250 ms), short enough that
+         *  N peers all get seen within a few seconds. Also the floor on how
+         *  often we restart the advertising set, which re-randomises the RPA —
+         *  cheaper dwells would inflate the laptop's BlueZ device cache and
+         *  feed the stale-RPA connect wedge. */
+        private const val MULTIPLEX_DWELL_MS = 1_500L
+
+        /** Re-check interval while advertising is suspended (session live) or
+         *  there is nothing to advertise. Bounds how long a *dropped*
+         *  disconnect callback can leave us silent and therefore invisible. */
+        private const val ACTIVE_RECHECK_MS = 15_000L
     }
 }
 

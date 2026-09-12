@@ -424,7 +424,7 @@ async fn send_full(writer: &Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>
 pub(crate) fn spawn_sync(
     app: AppHandle,
     writer: Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>,
-) -> tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)> {
+) -> tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let _ = NOTES_DIRTY.set(notify.clone());
 
@@ -440,10 +440,12 @@ pub(crate) fn spawn_sync(
         });
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<([u8; 32], u8, Vec<u8>)>();
     tokio::spawn(async move {
         let mut asm = Assembler::default();
-        while let Some((ty, payload)) = rx.recv().await {
+        // Notes are one shared list across devices, so WHICH peer sent a
+        // chunk does not change the merge — ignore the identity here.
+        while let Some((_peer_pub, ty, payload)) = rx.recv().await {
             if ty != NOTES_FRAME {
                 continue; // the raw channel is generic — ignore other features
             }

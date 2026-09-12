@@ -11,9 +11,7 @@ use vortex_l3_daemon::core::contacts::{Contact, ContactsAssembler};
 /// `~/.cache/vortex/contacts.json` — survives a daemon restart so the page
 /// shows the last-known list instantly while a fresh sync arrives.
 fn cache_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/contacts.json");
-    Some(p)
+    crate::peer_cache::peer_file("contacts.json")
 }
 
 /// Validate a complete contacts JSON blob, persist it to the disk cache and

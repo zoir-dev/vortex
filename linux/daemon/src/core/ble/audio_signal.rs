@@ -127,10 +127,18 @@ pub async fn run_listener(
     // from phone" pill. `None` drops them. Never touches the audio handoff.
     handoff_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::core::handoff::HandoffEvent>>,
     // Generic additive-frame channel: any allowed frame WITHOUT a dedicated
-    // handler above is forwarded raw as (frame_ty, decrypted_payload) here, so
-    // a new feature (e.g. notes) routes it entirely in its OWN module — no
-    // per-feature code in this transport file. `None` drops them.
-    raw_frame_tx: Option<tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>>,
+    // handler above is forwarded raw as (peer_pub, frame_ty,
+    // decrypted_payload) here, so a new feature (e.g. notes, peer handoff)
+    // routes it entirely in its OWN module — no per-feature code in this
+    // transport file. `None` drops them.
+    //
+    // The peer identity is part of the tuple because a frame's meaning can
+    // depend on WHO sent it: `PEER_HANDOFF` says "you are no longer my active
+    // peer", which is unactionable without knowing whose statement it is.
+    // Inferring it from "whoever is active right now" would be a guess.
+    raw_frame_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
+    >,
 ) -> Result<(), String> {
     let char = client
         .audio_signal
@@ -227,6 +235,7 @@ pub async fn run_listener(
             && frame.ty != ty::WIFI_DIRECT_OFFER
             && frame.ty != ty::HANDOFF
             && frame.ty != ty::NOTES_SYNC
+            && frame.ty != ty::PEER_HANDOFF
         {
             warn!(
                 "audio-signal unexpected frame ty=0x{:02x}; ignoring",
@@ -586,7 +595,7 @@ pub async fn run_listener(
         // forward it raw to its own module. No feature logic in this file.
         if frame.ty != ty::AUDIO_OP {
             if let Some(tx) = raw_frame_tx.as_ref() {
-                let _ = tx.send((frame.ty, plain[..n].to_vec()));
+                let _ = tx.send((peer_pub, frame.ty, plain[..n].to_vec()));
             }
             continue;
         }

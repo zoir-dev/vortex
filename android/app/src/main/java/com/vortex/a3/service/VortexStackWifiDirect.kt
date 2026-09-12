@@ -16,6 +16,26 @@ import kotlinx.coroutines.launch
  *  to join; tear it down after an idle window (reset on each big file). */
 internal fun VortexStack.maybeStartWifiDirect() {
     com.vortex.a3.core.lan.WifiDirect.start(ctx) {
+        // COALESCE the offer. `WifiDirect.start` is idempotent for the group but
+        // re-invokes this callback on every call (`if (isUp) onReady()`), and
+        // this runs once per big file in a share. A 65-file batch therefore sent
+        // 65 offers in about a second, and each one makes the laptop join the P2P
+        // group and then restore its normal Wi-Fi — a single adapter, so that is
+        // a full disconnect/reconnect cycle per offer. The user got a storm of
+        // Wi-Fi notifications and pulls kept getting cut off mid-transfer, which
+        // is also where the duplicate files came from.
+        //
+        // Not "only on transition": a LATER batch, arriving while the group is
+        // still up but after the laptop restored its Wi-Fi, does need telling
+        // again. A time gap satisfies both, and sits well inside the idle
+        // teardown window so a genuinely new batch is never starved.
+        val now = android.os.SystemClock.elapsedRealtime()
+        val since = now - lastWifiDirectOfferAtMs
+        if (lastWifiDirectOfferAtMs != 0L && since < VortexStack.WIFI_DIRECT_OFFER_MIN_GAP_MS) {
+            Log.d(VortexStack.TAG, "wifi-direct: offer suppressed (sent ${since}ms ago)")
+            return@start
+        }
+        lastWifiDirectOfferAtMs = now
         val o = org.json.JSONObject()
         o.put("ssid", com.vortex.a3.core.lan.WifiDirect.SSID)
         o.put("pass", com.vortex.a3.core.lan.WifiDirect.PASS)
@@ -29,6 +49,9 @@ internal fun VortexStack.maybeStartWifiDirect() {
     wifiDirectTeardownJob = scope.launch {
         kotlinx.coroutines.delay(60_000)
         com.vortex.a3.core.lan.WifiDirect.stop()
+        // Group is gone, so the next batch must be free to offer at once
+        // rather than waiting out the coalescing gap.
+        lastWifiDirectOfferAtMs = 0L
         Log.i(VortexStack.TAG, "wifi-direct: GO torn down (idle)")
     }
 }

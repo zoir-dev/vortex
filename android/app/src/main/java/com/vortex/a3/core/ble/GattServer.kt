@@ -169,6 +169,18 @@ class GattServer(
     @Volatile var onCallControlReceived: (peerStaticPub: ByteArray, jsonBytes: ByteArray) -> Unit =
         { _, _ -> }
 
+    /**
+     * Invoked when the laptop WRITES a PEER_HANDOFF frame: it has handed
+     * session ownership to a different phone, so we are no longer its active
+     * peer. `kind` is the [FrameSub] code, `successorName` the display name of
+     * whoever took over (empty when unknown — the kind carries the meaning).
+     */
+    @Volatile var onPeerHandoffReceived: (
+        peerStaticPub: ByteArray,
+        kind: Byte,
+        successorName: String,
+    ) -> Unit = { _, _, _ -> }
+
     /** Invoked when the laptop WRITES a NOTES_SYNC chunk (`[total][idx][data]`):
      *  reassembled + LWW-merged into the local notes store. */
     @Volatile var onNotesSyncReceived: (peerStaticPub: ByteArray, chunk: ByteArray) -> Unit =
@@ -529,6 +541,30 @@ class GattServer(
     fun sendNotesSyncEncrypted(peerStaticPub: ByteArray, chunkPayload: ByteArray): Boolean =
         sealAndNotify(peerStaticPub, FrameType.NOTES_SYNC, chunkPayload, "sendNotesSync")
 
+    /**
+     * Session-ownership handoff (PEER_HANDOFF 0x4F) — tell [peerStaticPub] it is
+     * no longer our active peer, so its UI stops claiming a live link instead of
+     * finding out on next contact (design doc §D4).
+     *
+     * [kind] is a [FrameSub] HANDOFF_* code, carried as the FIRST PAYLOAD BYTE
+     * rather than in Frame.sub: the laptop's generic sealed-frame writer only
+     * takes a frame type, so both sides agreed on this placement.
+     * [successorName] is advisory, for the receiver's UI ("moved to <name>").
+     */
+    fun sendPeerHandoffEncrypted(
+        peerStaticPub: ByteArray,
+        kind: Byte,
+        successorName: String = "",
+    ): Boolean {
+        val name = successorName.toByteArray(Charsets.UTF_8)
+        val body = ByteArray(name.size + 1)
+        body[0] = kind
+        name.copyInto(body, 1)
+        return sealAndNotify(
+            peerStaticPub, FrameType.PEER_HANDOFF, body, "sendPeerHandoff", logSuccess = true,
+        )
+    }
+
     /** Clipboard sync (CLIPBOARD 0x40) → peer's system clipboard. */
     fun sendClipboardEncrypted(peerStaticPub: ByteArray, clipJson: ByteArray): Boolean =
         sealAndNotify(peerStaticPub, FrameType.CLIPBOARD, clipJson, "sendClipboardEncrypted", logSuccess = true)
@@ -731,6 +767,20 @@ class GattServer(
 
     fun hasActiveConnection(): Boolean = connectedAddrs.isNotEmpty()
 
+    /**
+     * True when a peer has SUBSCRIBED to AUDIO_SIGNAL, i.e. the notify path is
+     * actually deliverable.
+     *
+     * Distinct from [hasActiveConnection], which only says some central holds
+     * an ACL link. Those come apart in practice: BlueZ owns the ACL, so it
+     * survives the laptop app being restarted or killed, leaving a connection
+     * with no Vortex session behind it. Treating that as "connected" made the
+     * phone suppress its presence advertising while being unreachable — the
+     * laptop could not find it to re-establish, and neither side broke the tie.
+     */
+    fun hasAudioSignalSubscriber(): Boolean =
+        synchronized(audioSignalSubscribers) { audioSignalSubscribers.isNotEmpty() }
+
     private val callback = object : BluetoothGattServerCallback() {
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
             // Track the negotiated ATT MTU per device: the notify payload
@@ -787,6 +837,18 @@ class GattServer(
                 // state is preserved; reconnect state is dead either way.)
                 pairingOrchestrator?.forgetDeviceOnDisconnect(device)
                 reconnectOrchestrator?.forgetDevice(device)
+                // A CCCD subscription dies with the link: the central never gets
+                // to write 0x0000 on its way out. Leaving the device in these
+                // sets is not merely untidy — `linkedProvider` is keyed on
+                // [hasAudioSignalSubscriber], so a phantom subscriber makes the
+                // presence loop suspend advertising FOREVER. The phone then
+                // cannot be found by the very laptop it is waiting for, and
+                // only an app restart (which calls stop()) breaks the tie.
+                // Observed live: laptop app restarted at 20:08, phone silent
+                // for the next ten hours while LAN heartbeats kept flowing.
+                pairingSubscribers.remove(device)
+                reconnectSubscribers.remove(device)
+                audioSignalSubscribers.remove(device)
                 try { onPeerDisconnected(device) } catch (e: Exception) {
                     Log.w(TAG, "onPeerDisconnected hook threw: ${e.message}")
                 }
@@ -1077,6 +1139,26 @@ class GattServer(
                                 onNotesSyncReceived(peerPub, jsonBytes)
                             } catch (e: Exception) {
                                 Log.w(TAG, "onNotesSyncReceived threw: ${e.message}")
+                            }
+                        }
+                        FrameType.PEER_HANDOFF -> {
+                            // The kind rides as the first payload byte rather
+                            // than Frame.sub: the laptop's generic sealed-frame
+                            // writer only takes a frame type, so both sides
+                            // agree to carry it here. An empty payload is
+                            // malformed — ignore rather than guess a kind.
+                            if (jsonBytes.isEmpty()) {
+                                Log.w(TAG, "PEER_HANDOFF with empty payload — ignored")
+                            } else {
+                                val kind = jsonBytes[0]
+                                val name = runCatching {
+                                    String(jsonBytes, 1, jsonBytes.size - 1, Charsets.UTF_8)
+                                }.getOrDefault("")
+                                try {
+                                    onPeerHandoffReceived(peerPub, kind, name)
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "onPeerHandoffReceived threw: ${e.message}")
+                                }
                             }
                         }
                     }

@@ -890,16 +890,23 @@ class LanServer(
                                 }
                                 if (historyFrameType != null) {
                                     val since = req.optString(key, "").toLongOrNull() ?: 0L
-                                    // A denied READ_SMS / READ_CALL_LOG throws here
-                                    // (ContentResolver read). Catch it so ONE missing
-                                    // permission can't kill the whole bulk-sync
-                                    // connection (which left the laptop on stale data
-                                    // with a repeating "early eof"): mark this dataset
-                                    // errored and move on, still reaching the done frame.
+                                    // Any ContentResolver read can throw here — a denied
+                                    // READ_SMS / READ_CALL_LOG, but also a query the
+                                    // provider itself refuses. Catch it so ONE failing
+                                    // dataset can't kill the whole bulk-sync connection
+                                    // (which left the laptop on stale data with a
+                                    // repeating "early eof"): mark this dataset errored
+                                    // and move on, still reaching the done frame.
                                     val json = try {
                                         historyProvider(key, since)
                                     } catch (e: Exception) {
-                                        Log.w(TAG, "bulk-sync: $key history provider threw (permission denied?): ${e.message}")
+                                        // Name the exception class instead of guessing a
+                                        // cause: a denied permission is a
+                                        // SecurityException, a rejected query an
+                                        // IllegalArgumentException. Logging both as
+                                        // "permission denied?" sent us hunting the wrong
+                                        // bug for a sortOrder the provider wouldn't take.
+                                        Log.w(TAG, "bulk-sync: $key history provider threw ${e.javaClass.simpleName}: ${e.message}")
                                         status.put(key, "error")
                                         continue
                                     }

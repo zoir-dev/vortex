@@ -43,6 +43,9 @@ message VortexMessage {
     Ping       ping  = 20;
     Pong       pong  = 21;
     ErrorFrame error = 22;
+
+    // --- Multi-peer session ownership (30–39) ---
+    PeerHandoff peer_handoff = 30;
   }
 }
 
@@ -187,6 +190,44 @@ message ErrorFrame {
   }
   Code   code    = 1;
   string message = 2;  // diagnostics only; must not leak secrets
+}
+
+// ============================================================================
+// 3b. Multi-peer session ownership
+// ============================================================================
+
+// Transfers or refuses ownership of the single active session.
+//
+// A device may TRUST many peers but is ACTIVE with only one at a time. This
+// frame is how the two sides agree on which. It is additive: a peer that does
+// not advertise CAP_PEER_HANDOFF in `capability_flags` never receives one, and
+// an older build ignores the unknown oneof field rather than failing.
+//
+// `RELEASE` is sent by the side giving up ownership — the user pressed
+// "Switch" and a replacement peer has already been chosen. Ownership flips
+// atomically when it is sent; the transport link may linger and drop on its
+// own afterwards. That ordering matters: while two links overlap, only one
+// side may be active, or both laptops mirror notifications and sync clipboard
+// at once.
+//
+// `BUSY` is a refusal, sent when a peer asks to become active while another
+// already is. Without an explicit refusal a rejected peer cannot distinguish
+// "no" from packet loss, and retries in a tight loop against the phone's
+// single GATT link.
+message PeerHandoff {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    RELEASE          = 1;  // you are no longer the active peer
+    BUSY             = 2;  // refused: another peer is active
+    CLAIM            = 3;  // request to become the active peer
+  }
+  Kind   kind   = 1;
+  // Why ownership moved, for the UI ("switched to <name>") and for logs.
+  // Diagnostics only — never secrets, per the ErrorFrame.message rule.
+  string reason = 2;
+  // Display name of the peer taking over, when known. Sanitised by the
+  // receiver before it reaches any UI (it is peer-supplied text).
+  string successor_name = 3;
 }
 
 // ============================================================================

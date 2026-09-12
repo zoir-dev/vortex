@@ -184,6 +184,16 @@ pub mod ty {
     pub const PHONE_FILES: u8 = 0x4F;
 
     pub const FRAG: u8 = 0x4E;
+    /// Session-ownership handoff (design doc §D4). A device may TRUST many
+    /// peers but is ACTIVE with exactly one; this frame is how the two sides
+    /// agree which. `sub` carries the kind ([`sub::HANDOFF_RELEASE`] etc.) and
+    /// the AEAD payload an optional UTF-8 successor name for the UI (peer-
+    /// supplied, so sanitise before display).
+    ///
+    /// Additive by design: both sides log-and-ignore an unknown frame type, so
+    /// a peer without this build is unaffected. Mirrors Kotlin
+    /// `FrameType.PEER_HANDOFF`.
+    pub const PEER_HANDOFF: u8 = 0x4F;
     pub const ERROR: u8 = 0x7F;
 }
 
@@ -193,6 +203,18 @@ pub mod sub {
     pub const PONG: u8 = 0x02;
     pub const ECHO_REQUEST: u8 = 0x01;
     pub const ECHO_RESPONSE: u8 = 0x02;
+    /// `PEER_HANDOFF` kinds. Mirror Kotlin `FrameSub.HANDOFF_*`.
+    ///
+    /// RELEASE: "you are no longer my active peer" — sent by the side handing
+    /// ownership over, so the receiver stops presenting itself as connected
+    /// instead of discovering it on the next contact.
+    pub const HANDOFF_RELEASE: u8 = 0x01;
+    /// BUSY: refused, another peer is already active. Explicit so a rejected
+    /// peer can back off; silence is indistinguishable from packet loss and
+    /// invites a retry loop against the phone's single GATT link.
+    pub const HANDOFF_BUSY: u8 = 0x02;
+    /// CLAIM: request to become the active peer.
+    pub const HANDOFF_CLAIM: u8 = 0x03;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

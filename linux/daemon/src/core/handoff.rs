@@ -21,6 +21,18 @@ pub struct HandoffEvent {
     /// pill the user clicks to open.
     #[serde(default)]
     pub open_now: bool,
+    /// Identity of an `open_now` request, so the laptop opens it EXACTLY once.
+    ///
+    /// The event also rides the phone's AppState snapshot as a LAN/BLE-STATE
+    /// backstop, and a snapshot is republished on every heartbeat. Without an
+    /// identity the consumer cannot tell "the share I already opened" from
+    /// "open this URL again", so it re-opened the browser every ~12s for as
+    /// long as the phone app stayed up.
+    ///
+    /// Empty on the live-read path, and from phone builds predating this field;
+    /// the consumer then falls back to deduping by URL.
+    #[serde(default)]
+    pub id: String,
 }
 
 impl HandoffEvent {

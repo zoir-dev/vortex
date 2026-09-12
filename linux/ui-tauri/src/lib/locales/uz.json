@@ -68,7 +68,12 @@
     "offline": "Oflayn",
     "forget_title": "Qurilmani unutish",
     "forget_body": "{name} bilan aloqa uziladi. Qayta ulanish uchun yana pairing qilinadi.",
-    "forget_confirm": "Unutish"
+    "forget_confirm": "Unutish",
+    "switch_tip": "Boshqa telefonga o'tish",
+    "switch_scanning": "Boshqa telefonlaringiz qidirilmoqda…",
+    "switch_pick": "Qaysi telefonga o'tamiz?",
+    "switch_none": "Yaqinda boshqa ulangan telefon yo'q.",
+    "switch_cancel": "Bekor qilish"
   },
   "discover": {
     "looking": "Yaqindagi qurilmalar qidirilmoqda…",

@@ -19,7 +19,7 @@ use crate::{app_state_to_dto, emit_peers};
 /// the gateway fallback when mDNS can't resolve the peer over its hotspot.
 pub(crate) const LAN_DEFAULT_PORT: u16 = 51820;
 
-use crate::lan_wifi_direct::{restore_wifi, wd_active, WIFI_DIRECT_GO_IP};
+use crate::lan_wifi_direct::{wd_active, WIFI_DIRECT_GO_IP};
 use crate::lan_state::{dispatch_appstate_call, dispatch_lock_command};
 
 /// Last peer IP that mDNS successfully resolved to. When mDNS later comes
@@ -79,9 +79,7 @@ async fn wait_for_settled(
 }
 
 fn last_peer_ip_path() -> Option<std::path::PathBuf> {
-    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/last_peer_ip");
-    Some(p)
+    crate::peer_cache::peer_file("last_peer_ip")
 }
 
 /// Is a phone→laptop file pull waiting on the next heartbeat round? The pull is
@@ -117,6 +115,23 @@ pub(crate) fn note_queue_progress() {
 /// [`files_queued`] — is what may drive the heartbeat harder: a queue that is
 /// permanently stuck must not spin a TCP+IK every 2 s for the rest of the
 /// session, which is exactly what the unconditional form would do.
+/// How long since a queued file last completed, if anything ever has.
+///
+/// Raw progress, deliberately NOT ANDed with [`files_queued`] the way
+/// [`file_pull_active`] is. A paced sender makes the pull queue oscillate
+/// empty→full, so "queue is empty right now" says nothing about health — using
+/// it as a stall signal force-restored Wi-Fi in the middle of a perfectly
+/// healthy 65-file batch.
+/// The peer IP that last worked, if any. Read by the Wi-Fi Direct gate to ask
+/// "is the phone already on our LAN?" before paying for a P2P group.
+pub(crate) fn last_good_peer_ip() -> Option<std::net::IpAddr> {
+    *LAST_GOOD_PEER_IP.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn queue_progress_age() -> Option<Duration> {
+    QUEUE_PROGRESS_AT.lock().ok().and_then(|g| *g).map(|t| t.elapsed())
+}
+
 pub(crate) fn file_pull_active() -> bool {
     if !files_queued() {
         return false;
@@ -767,6 +782,9 @@ pub(crate) async fn try_lan_reconnect(
                                 .get()
                                 .and_then(|m| m.lock().ok().and_then(|mut g| g.pop_front()));
                             if let Some((token, name, mime, id, kind)) = meta {
+                                // Before anything else: this token's bytes have
+                                // arrived, so a re-announce must not re-queue it.
+                                crate::clipboard_sync::note_pulled(&token);
                                 note_queue_progress();
                                 let offer = crate::clipboard_sync::Offer {
                                     kind,
@@ -882,11 +900,17 @@ pub(crate) async fn try_lan_reconnect(
                 // Wi-Fi Direct: once every queued file is pulled over the group
                 // link, hop back to the normal Wi-Fi; otherwise pull the next now.
                 if wd_active() {
-                    if !files_queued() {
-                        tracing::info!("Wi-Fi Direct: all files pulled → restoring Wi-Fi");
-                        restore_wifi(app).await;
-                    } else if let Some(n) = crate::SYNC_NUDGE.get() {
-                        n.notify_one();
+                    let queue_empty = !files_queued();
+                    // Hold the group link across brief gaps. A paced batch
+                    // empties the queue between windows, and restoring on each
+                    // gap cost a Wi-Fi disconnect/reconnect every few seconds.
+                    crate::lan_wifi_direct::restore_when_idle(app, queue_empty).await;
+                    if !queue_empty {
+                        // More to pull → fetch the next one now rather than
+                        // waiting out the heartbeat interval.
+                        if let Some(n) = crate::SYNC_NUDGE.get() {
+                            n.notify_one();
+                        }
                     }
                 }
                 // SecretService D-Bus can stall here for hundreds of

@@ -203,7 +203,17 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 }
             };
         emit_peers(&app, peer_store.clone()).await;
-        let _have_trust = !peer_store.list().unwrap_or_default().is_empty();
+        let trusted = peer_store.list().unwrap_or_default();
+        let _have_trust = !trusted.is_empty();
+        // Point the phone-specific caches at the trusted peer before any
+        // session exists, so the SMS/contacts/call-log pages render from cache
+        // at startup exactly as they did when those files were global. Only
+        // when there is exactly one peer: with several, "which phone's data"
+        // has no answer until a session picks one (BLE IK sets it), and
+        // guessing would show the wrong phone's messages.
+        if let [only] = trusted.as_slice() {
+            crate::arbiter::claim(&only.peer_static_pub);
+        }
 
         // BLE adapter.
         // BlueZ is very often not ready yet at this point. The autostart entry
@@ -422,7 +432,16 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
         // into. All merge/protocol logic lives in notes.rs.
         let ble_sealed_writer: Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        let _ = crate::BLE_SEALED_WRITER.set(ble_sealed_writer.clone());
         let ble_notes_tx = crate::notes::spawn_sync(app.clone(), ble_sealed_writer.clone());
+        // The generic additive-frame channel is single-consumer and notes used to
+        // own it. Put the peer-handoff dispatcher in front: it takes the frames it
+        // handles and forwards the rest to notes unchanged.
+        let ble_raw_tx = crate::peer_handoff::spawn_dispatcher(
+            app.clone(),
+            peer_store.clone(),
+            ble_notes_tx,
+        );
         crate::notes::spawn_reminders(); // desktop due-date reminders
 
         // BLE app-icon channel: the listener forwards ICON chunks here; a
@@ -527,7 +546,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
             let ble_clipboard_image_tx = ble_clipboard_image_tx.clone();
             let ble_clipboard_offer_tx = ble_clipboard_offer_tx.clone();
             let ble_handoff_tx = ble_handoff_tx.clone();
-            let ble_notes_tx = ble_notes_tx.clone();
+            let ble_raw_tx = ble_raw_tx.clone();
             let ble_notif_writer = ble_notif_writer.clone();
             let ble_clipboard_writer = ble_clipboard_writer.clone();
             let ble_clipboard_image_writer = ble_clipboard_image_writer.clone();
@@ -555,7 +574,7 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                     ble_clipboard_image_tx,
                     ble_clipboard_offer_tx,
                     ble_handoff_tx,
-                    ble_notes_tx,
+                    ble_raw_tx,
                     ble_notif_writer,
                     ble_clipboard_writer,
                     ble_clipboard_image_writer,
@@ -699,6 +718,11 @@ pub(crate) fn run_worker(app: AppHandle, cmd_rx: Receiver<UiCmd>) {
                 UiCmd::Pair(addr_str) => cmd_pairing::pair(&ctx, addr_str, &mut active_scan).await,
                 UiCmd::ForgetPeer(hex_str) => cmd_pairing::forget_peer(&ctx, hex_str).await,
                 UiCmd::ForgetAll => cmd_pairing::forget_all(&ctx).await,
+                UiCmd::SwitchPeer => cmd_pairing::switch_peer(&ctx),
+                UiCmd::CancelSwitch => cmd_pairing::cancel_switch(&ctx).await,
+                UiCmd::ActivatePeer(hex_str) => {
+                    cmd_pairing::activate_peer(&ctx, hex_str).await
+                }
                 UiCmd::RefreshState => cmd_earbuds::refresh_state(&ctx).await,
                 UiCmd::RefreshLocalEarbuds => cmd_earbuds::refresh_local_earbuds(&ctx).await,
                 UiCmd::RequestEarbudsSwitch { peer_static_pub, mac } => {

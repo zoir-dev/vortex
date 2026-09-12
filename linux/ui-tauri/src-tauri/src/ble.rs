@@ -118,6 +118,40 @@ pub(crate) fn shutdown_link_blocking() {
     note_session_addr(None);
 }
 
+/// Last BLE address we completed a Noise IK exchange with, per peer.
+///
+/// Recorded only *after* IK succeeds, so the address is positively tied to
+/// that `peer_static_pub` — before IK we merely believe an RPA belongs to the
+/// peer whose presence token matched, and acting on a belief would let us
+/// remove a stranger's BlueZ device object.
+///
+/// Used by `Forget` to clean up the peer's BlueZ device object (see
+/// [`forget_stale_device`]). Vortex deliberately creates no BT bond on Linux
+/// (see the 2026-06-02 note in `pairing.rs`), so there is usually no *bond*
+/// to drop here — but a cached device object with a stale RPA does linger, and
+/// leaving it behind is what feeds the RPA-churn connect wedge on the next
+/// pairing. Entries are dropped on forget; the map holds one small entry per
+/// trusted peer, so it needs no eviction.
+static PEER_BLE_ADDRS: std::sync::Mutex<
+    Option<std::collections::HashMap<[u8; 32], bluer::Address>>,
+> = std::sync::Mutex::new(None);
+
+/// Tie `addr` to `peer_pub` after a successful IK.
+pub(crate) fn remember_peer_addr(peer_pub: &[u8; 32], addr: bluer::Address) {
+    if let Ok(mut g) = PEER_BLE_ADDRS.lock() {
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(*peer_pub, addr);
+    }
+}
+
+/// Remove and return the address last tied to `peer_pub`, if any.
+pub(crate) fn take_peer_addr(peer_pub: &[u8; 32]) -> Option<bluer::Address> {
+    PEER_BLE_ADDRS
+        .lock()
+        .ok()
+        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(peer_pub)))
+}
+
 /// Ms since we last heard from the phone over any transport (huge if never).
 pub(crate) fn peer_contact_age_ms() -> u64 {
     let last = LAST_PEER_CONTACT_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -262,6 +296,121 @@ fn note_discovery_health(discovering: bool) {
              the controller is wedged; turning Bluetooth off and on clears it"
         );
     }
+}
+/// A trusted peer seen on air during a switch scan.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerCandidate {
+    pub peer_static_pub: [u8; 32],
+    pub name: Option<String>,
+    pub rssi: i16,
+}
+
+/// Scan for trusted-presence beacons from trusted peers OTHER than `exclude`.
+///
+/// [`expected_presence_tokens`] flattens every peer's tokens into one set,
+/// which answers "is any trusted peer nearby" — enough for reconnect, but not
+/// for a switch, which has to know *which* peer it found so it can leave the
+/// active one out. So this builds the token→peer map instead.
+///
+/// Excluding the active peer is what makes "Switch" coherent: the user pressed
+/// it precisely because they do not want the device they are already on
+/// (design doc §D3).
+pub(crate) async fn scan_other_trusted_peers(
+    adapter: &bluer::Adapter,
+    peer_store: &Arc<dyn PeerStore>,
+    exclude: Option<[u8; 32]>,
+    wait: Duration,
+) -> Vec<PeerCandidate> {
+    use std::collections::HashMap;
+    use vortex_l3_daemon::core::crypto::presence::{current_bucket, derive_presence_token};
+
+    let peers = {
+        let store = peer_store.clone();
+        tokio::task::spawn_blocking(move || store.list().unwrap_or_default())
+            .await
+            .unwrap_or_default()
+    };
+    let others: Vec<_> = peers
+        .into_iter()
+        .filter(|p| exclude.as_ref() != Some(&p.peer_static_pub))
+        .collect();
+    if others.is_empty() {
+        return Vec::new();
+    }
+
+    // token -> peer, over the same ±2 bucket window the reconnect path
+    // tolerates (clock skew / a Doze-deferred rotation).
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bucket_now = current_bucket(now_sec, PRESENCE_ROTATION_SEC);
+    let mut by_token: HashMap<[u8; 8], ([u8; 32], Option<String>)> = HashMap::new();
+    for p in &others {
+        for d in [-2i64, -1, 0, 1, 2] {
+            let tok = derive_presence_token(&p.prs, (bucket_now as i64 + d) as u64);
+            by_token.insert(tok, (p.peer_static_pub, p.peer_name.clone()));
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PeerCandidate>(16);
+    let scan = {
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            let _ = run_filtered_scan(adapter, move |c| {
+                if !c.payload.flags.is_trusted_presence() {
+                    return;
+                }
+                let Some((peer_pub, stored_name)) = by_token.get(&c.payload.payload_8) else {
+                    return;
+                };
+                let _ = tx.try_send(PeerCandidate {
+                    peer_static_pub: *peer_pub,
+                    // Prefer the live SCAN_RSP name, fall back to the name
+                    // recorded at pairing.
+                    name: c.local_name.clone().or_else(|| stored_name.clone()),
+                    rssi: c.rssi.unwrap_or(0),
+                });
+            })
+            .await;
+        })
+    };
+
+    // Collect for the whole window rather than stopping at the first hit: the
+    // point is to know whether there is ONE candidate (auto-connect) or
+    // several (ask the user), so an early return would make the picker
+    // depend on which phone happened to advertise first.
+    let mut found: HashMap<[u8; 32], PeerCandidate> = HashMap::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(cand)) => {
+                // Keep the strongest sighting per peer — RSSI wobbles a lot
+                // between advertising events.
+                found
+                    .entry(cand.peer_static_pub)
+                    .and_modify(|e| {
+                        if cand.rssi > e.rssi {
+                            *e = cand.clone();
+                        }
+                    })
+                    .or_insert(cand);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // Same abort+join discipline as find_trusted_presence_peer: bluer only
+    // issues StopDiscovery when the scan future is actually dropped, so
+    // without the join the next scan races a still-live discovery session.
+    scan.abort();
+    let _ = scan.await;
+    let mut out: Vec<_> = found.into_values().collect();
+    out.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+    out
 }
 
 pub(crate) async fn find_trusted_presence_peer(
@@ -719,7 +868,7 @@ pub(crate) async fn connect_bonded_or_scan(
 /// (live-observed: 67s walk-up reconnect, the user typed their password
 /// long before the eager unlock could fire). RPA entries are transient by
 /// nature — removing one can't lose anything durable.
-async fn forget_stale_device(adapter: &bluer::Adapter, addr: bluer::Address) {
+pub(crate) async fn forget_stale_device(adapter: &bluer::Adapter, addr: bluer::Address) {
     match tokio::time::timeout(Duration::from_secs(3), adapter.remove_device(addr)).await {
         Ok(Ok(())) => tracing::debug!(addr = %addr, "stale RPA entry removed from BlueZ"),
         Ok(Err(e)) => tracing::debug!(addr = %addr, "remove_device: {e} (ignored)"),
@@ -792,7 +941,7 @@ pub(crate) async fn run_ble_persistent_loop(
     >,
     // Generic additive-frame channel (e.g. NOTES_SYNC) — the listener forwards
     // (frame_ty, payload) here; the owning feature module filters + handles it.
-    raw_frame_tx: tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>,
+    raw_frame_tx: tokio::sync::mpsc::UnboundedSender<([u8; 32], u8, Vec<u8>)>,
     notif_writer: Arc<tokio::sync::Mutex<Option<NotifWriter>>>,
     clipboard_writer: Arc<tokio::sync::Mutex<Option<crate::ClipboardWriter>>>,
     clipboard_image_writer: Arc<tokio::sync::Mutex<Option<crate::ClipboardImageWriter>>>,
@@ -964,6 +1113,24 @@ pub(crate) async fn run_ble_persistent_loop(
         };
         consec_ik_fail = 0;
         tracing::info!("P2.13: BLE IK returned; peer_counter={}", outcome.peer_counter);
+        // IK proved this address really is this peer — safe to remember for
+        // Forget's BlueZ cleanup (see PEER_BLE_ADDRS), and to point the
+        // phone-specific caches at this peer.
+        remember_peer_addr(&peer.peer_static_pub, client.address);
+        crate::arbiter::note_connected(&peer.peer_static_pub);
+        // Ownership, separately from the link (design doc §D4). A refusal is
+        // logged rather than acted on for now: nothing sends `PeerHandoff.CLAIM`
+        // yet, so the only way to reach Busy is a second trusted phone
+        // connecting while one is active — worth seeing in the log.
+        if let crate::arbiter::Claim::Busy { current } =
+            crate::arbiter::claim(&peer.peer_static_pub)
+        {
+            tracing::warn!(
+                peer = %hex::encode(&peer.peer_static_pub[..4]),
+                active = %hex::encode(&current[..4]),
+                "second peer connected while another is active; link up but not active"
+            );
+        }
 
         let Some(transport) = outcome.transport else {
             tracing::error!("P2.13: IK outcome missing transport state — internal bug");

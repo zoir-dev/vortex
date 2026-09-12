@@ -198,7 +198,8 @@ pub(crate) fn spawn_state_consumer(
                         dispatch_appstate_call(&state.call);
                         // Browsing-handoff backstop: the page the phone is on,
                         // carried in this STATE frame (when the BLE HANDOFF frame
-                        // didn't get through). Consumer dedups by URL.
+                        // didn't get through). Re-delivered on every heartbeat, so
+                        // a Share carried here is opened once (deduped by id).
                         crate::handoff::dispatch_appstate_handoff(&state.handoff);
                         // Laptop→phone screen mirror over the BLE STATE path too.
                         crate::laptop_cast::dispatch_request(state.laptop_mirror_req, state.laptop_mirror_extend);

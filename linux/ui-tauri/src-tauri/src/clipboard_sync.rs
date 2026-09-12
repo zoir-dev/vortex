@@ -51,6 +51,48 @@ pub(crate) static CLIPBOARD_SYNC: AtomicBool = AtomicBool::new(true);
 /// Hash of the last text that crossed the link in EITHER direction — the
 /// loop guard. When the watcher re-captures this exact text (e.g. right
 /// after we set it from a received sync), it isn't bounced back.
+/// Content tokens whose bytes we already pulled, with when.
+///
+/// The queued-token dedupe below only covers offers still WAITING. There is a
+/// window between the laptop dequeuing an offer and the phone learning it was
+/// served, and a re-announce landing inside it passes the queued check, gets
+/// queued again, and is pulled a second time — which is how a 65-file share
+/// arrived as 75 files with duplicates.
+///
+/// Entries expire after [RECENT_PULL_TTL] so a *deliberate* re-share of the
+/// same content still works. That window only has to outlast the
+/// announce/serve race (seconds), not the user's patience.
+static RECENTLY_PULLED: Mutex<Vec<(String, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// How long a pulled token stays suppressed. Long enough to cover the
+/// re-announce race, short enough that re-sharing the same file on purpose is
+/// not mysteriously ignored.
+const RECENT_PULL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Record that `token`'s bytes arrived, so a re-announce cannot re-queue it.
+pub(crate) fn note_pulled(token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = RECENTLY_PULLED.lock() {
+        let now = std::time::Instant::now();
+        g.retain(|(_, at)| now.duration_since(*at) < RECENT_PULL_TTL);
+        g.push((token.to_string(), now));
+    }
+}
+
+/// True when `token` was pulled within [RECENT_PULL_TTL].
+fn pulled_recently(token: &str) -> bool {
+    RECENTLY_PULLED
+        .lock()
+        .map(|g| {
+            let now = std::time::Instant::now();
+            g.iter()
+                .any(|(t, at)| t == token && now.duration_since(*at) < RECENT_PULL_TTL)
+        })
+        .unwrap_or(false)
+}
+
 static LAST_SYNC_SIG: Mutex<String> = Mutex::new(String::new());
 
 /// Watcher (blocking thread) → async sender channel. Set once by
@@ -712,7 +754,14 @@ async fn flush_file_batch(batch: Vec<Offer>) {
             .into_iter()
             // `seen` also collapses duplicates WITHIN the batch: a re-announce
             // can land inside the same debounce window as the original.
-            .filter(|o| !queued.contains(&o.token) && seen.insert(o.token.clone()))
+            // `pulled_recently` closes the dequeued-but-not-yet-acked window;
+            // `queued` covers offers still waiting; `seen` collapses duplicates
+            // inside one debounce window.
+            .filter(|o| {
+                !queued.contains(&o.token)
+                    && !pulled_recently(&o.token)
+                    && seen.insert(o.token.clone())
+            })
             .collect()
     };
     if batch.is_empty() {

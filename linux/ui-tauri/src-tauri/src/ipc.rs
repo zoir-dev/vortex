@@ -41,6 +41,19 @@ pub(crate) enum UiCmd {
     StartMirror { width: u32, height: u32, fps: u32, bitrate: u32 },
     /// Stop the active screen-mirror session.
     StopMirror,
+    /// "Switch device" on the connected card: keep the current phone, and
+    /// start looking for another *already-trusted* one.
+    ///
+    /// Deliberately not a release — the link is held until a replacement is
+    /// confirmed, so the reconnect loop has nothing to race back into and the
+    /// laptop can never end up connected to nothing (design doc §D3).
+    SwitchPeer,
+    /// Close the switch window without changing anything (user cancelled, or
+    /// it expired).
+    CancelSwitch,
+    /// Adopt this trusted peer (hex `peer_static_pub`) as the active one —
+    /// either the single candidate found, or the user's pick from several.
+    ActivatePeer(String),
 }
 
 /// Identity surface visible to the Vue layer. We deliberately keep
@@ -67,6 +80,10 @@ pub(crate) struct TrustedPeerDto {
     peer_static_pub: String,
     paired_at: u64,
     peer_name: Option<String>,
+    /// True for the peer that currently owns the session. With several
+    /// trusted phones the UI has to distinguish "remembered" from "the one
+    /// whose SMS and notifications you are looking at" — see `arbiter`.
+    active: bool,
 }
 
 /// Per-peer AppState snapshot pushed to the UI so it can render
@@ -256,6 +273,7 @@ pub(crate) async fn emit_peers(app: &AppHandle, store: Arc<dyn PeerStore>) {
             let dtos: Vec<TrustedPeerDto> = list
                 .into_iter()
                 .map(|p| TrustedPeerDto {
+                    active: crate::arbiter::is_active(&p.peer_static_pub),
                     peer_static_pub: hex::encode(p.peer_static_pub),
                     paired_at: p.paired_at,
                     peer_name: p.peer_name,

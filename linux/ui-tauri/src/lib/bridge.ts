@@ -17,6 +17,17 @@ export interface TrustedPeer {
   peer_static_pub: string;
   paired_at: number;
   peer_name?: string | null;
+  /** True for the peer that currently owns the session (see `arbiter` on the
+   *  backend). With several trusted phones, "remembered" and "the one whose
+   *  data is on screen" are different things. */
+  active: boolean;
+}
+
+/** A trusted peer found on air during a switch scan. */
+export interface SwitchCandidate {
+  peer_static_pub: string;
+  name?: string | null;
+  rssi: number;
 }
 
 /**
@@ -65,6 +76,26 @@ export async function pairDecision(approve: boolean): Promise<void> {
 
 export async function forgetPeer(peerStaticPub: string): Promise<void> {
   await invoke("forget_peer", { peerStaticPub });
+}
+
+/**
+ * "Switch device": keep the current phone connected and look for another
+ * already-trusted one. Not a disconnect — the backend holds the active link
+ * for the whole scan, so a cancelled or fruitless switch leaves you exactly
+ * where you were.
+ */
+export async function switchPeer(): Promise<void> {
+  await invoke("switch_peer");
+}
+
+export async function cancelSwitch(): Promise<void> {
+  await invoke("cancel_switch");
+}
+
+/** Adopt this trusted peer as the active one (the user's pick, or the sole
+ *  candidate found). */
+export async function activatePeer(peerStaticPub: string): Promise<void> {
+  await invoke("activate_peer", { peerStaticPub });
 }
 
 export async function forgetAll(): Promise<void> {
@@ -206,6 +237,16 @@ export function onScanResult(cb: (hit: ScanHit) => void): Promise<UnlistenFn> {
 
 export function onScanDone(cb: () => void): Promise<UnlistenFn> {
   return listen<null>("vortex:scan_done", () => cb());
+}
+
+export function onSwitchScanning(cb: (scanning: boolean) => void): Promise<UnlistenFn> {
+  return listen<boolean>("vortex:switch_scanning", e => cb(e.payload));
+}
+
+export function onSwitchCandidates(
+  cb: (candidates: SwitchCandidate[]) => void,
+): Promise<UnlistenFn> {
+  return listen<SwitchCandidate[]>("vortex:switch_candidates", e => cb(e.payload));
 }
 
 export function onPairingStarted(cb: (e: PairingStartedEvent) => void): Promise<UnlistenFn> {

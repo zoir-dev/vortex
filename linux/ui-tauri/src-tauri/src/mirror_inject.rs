@@ -80,9 +80,7 @@ const WIRELESS_PORT: u16 = 5555;
 static LAST_ADB_PORT: Mutex<Option<u16>> = Mutex::new(None);
 
 fn adb_port_path() -> Option<std::path::PathBuf> {
-    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/last_adb_port");
-    Some(p)
+    crate::peer_cache::peer_file("last_adb_port")
 }
 
 /// Note the port a network transport is attached on, in memory and on disk.

@@ -5383,6 +5383,7 @@ dependencies = [
  "gstreamer-app",
  "gtk",
  "hex",
+ "if-addrs",
  "image",
  "ksni",
  "rand",

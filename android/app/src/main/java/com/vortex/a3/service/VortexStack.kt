@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.vortex.a3.core.ble.Advertiser
+import com.vortex.a3.core.ble.FrameSub
 import com.vortex.a3.core.ble.GattServer
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
@@ -67,6 +68,19 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     )
 
     private var advertiser: Advertiser? = null
+
+    /**
+     * static_pub of the laptop we are currently linked to, learned from the
+     * IK handshake (the only thing that proves *which* peer a link belongs
+     * to — a BLE address alone does not).
+     *
+     * Used by the presence loop to exclude the current laptop while seeking
+     * for a different one. Deliberately NOT cleared on disconnect: after a
+     * drop it is still the peer we were last with, which is what the seek
+     * filter wants, and a stale value is harmless because seeking only ever
+     * removes one candidate from the list.
+     */
+    @Volatile internal var activePeerPub: ByteArray? = null
     internal var gattServer: GattServer? = null
     /** Buffers phone→laptop notifications that fail to send while BLE is down;
      *  flushed when the peer re-subscribes to AUDIO_SIGNAL. */
@@ -77,6 +91,19 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     internal val sentIconPkgs = java.util.Collections.synchronizedSet(HashSet<String>())
     private var clipboardListener: com.vortex.a3.core.clipboard.ClipboardListener? = null
     internal var wifiDirectTeardownJob: kotlinx.coroutines.Job? = null
+    /** elapsedRealtime of the last WIFI_DIRECT_OFFER, for coalescing (see
+     *  [maybeStartWifiDirect]). 0 = none since the group last went down. */
+    @Volatile internal var lastWifiDirectOfferAtMs: Long = 0L
+
+    /**
+     * The one laptop a seek is aimed at, when the user picked it explicitly.
+     *
+     * A targeted seek advertises only THAT peer's token instead of cycling all
+     * of them, so it is both faster to be found (no dwell sharing) and cheaper
+     * on air. `null` = untargeted, i.e. "any remembered laptop but the current
+     * one" (design doc §D1).
+     */
+    @Volatile internal var seekTarget: ByteArray? = null
     /** Icon PNG bytes per ICON frame chunk (kept under the BLE notify MTU
      *  once the appId header + AEAD tag + frame header are added). */
     internal val ICON_CHUNK = 180
@@ -92,6 +119,22 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      *  cancelled on disconnect — so only a session stable for
      *  [MIRROR_REFRESH_SETTLE_MS] pays the ~37-chunk BLE storm. */
     private var mirrorRefreshJob: kotlinx.coroutines.Job? = null
+    /** Bounded "switch laptop" window (design doc §D9). Seeking while a
+     *  session is live is the most expensive radio state there is, so an
+     *  unattended press must not scan forever. */
+    private var seekJob: kotlinx.coroutines.Job? = null
+
+    /** Paces multi-file shares (see [ShareQueue]). Lazy because it needs
+     *  `ctx`, which resolves through the Service's base context. */
+    internal val shareQueue: ShareQueue by lazy {
+        ShareQueue(
+            context = ctx,
+            emit = { file -> VortexService.clipboardFileBus.tryEmit(file) },
+            // Offers awaiting collection == files in flight, so pacing follows
+            // real delivery instead of a timer.
+            inFlight = { pendingOffers.size },
+        )
+    }
 
     internal var contactsProvider: com.vortex.a3.core.contacts.ContactsProvider? = null
     /** Reads the phone's recent call log + observes changes; emits to callLogBus. */
@@ -730,6 +773,33 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 outcome.ciphers.receiver,
             )
             val peerPub = outcome.peerStaticPub.copyOf()
+            val previousPeer = activePeerPub
+            activePeerPub = peerPub
+            // A DIFFERENT laptop just completed IK while we were seeking —
+            // that is the switch succeeding, so close the window. Ownership
+            // has effectively moved; the old link drops on its own (the
+            // laptop side stops being active the moment it hands over).
+            if (advertiser?.seeking == true &&
+                (previousPeer == null || !previousPeer.contentEquals(peerPub))
+            ) {
+                Log.i(TAG, "seek satisfied — another laptop connected")
+                // Tell the laptop we just left, while its link is still up.
+                // Ordering matters: this runs BEFORE stopSeeking() teardown so
+                // the old session is still registered and can carry the frame.
+                // Best-effort — if it has already dropped, that laptop falls
+                // back to noticing on next contact, which is what happened
+                // before this frame existed.
+                previousPeer?.let { old ->
+                    val successor = try {
+                        peerStore.load(peerPub)?.peerName.orEmpty()
+                    } catch (_: Exception) { "" }
+                    val sent = server.sendPeerHandoffEncrypted(
+                        old, FrameSub.HANDOFF_RELEASE, successor,
+                    )
+                    Log.i(TAG, "RELEASE to previous laptop sent=$sent")
+                }
+                stopSeeking()
+            }
             val bleWriter: suspend (com.vortex.a3.core.earbuds.AudioOpFrame) -> Result<Unit> = { f ->
                 val ok = server.sendAudioOpEncrypted(peerPub, f.toJsonBytes())
                 if (ok) Result.success(Unit)
@@ -762,22 +832,135 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 android.os.SystemClock.elapsedRealtime() - srv.lastDisconnectAtMs <
                 FAST_ADV_WINDOW_MS
         }
-        val firstPeer = peerStore.list().firstOrNull()
-        if (firstPeer != null) {
-            adv.startTrustedPresence(
-                prs = firstPeer.prs,
+        // The laptop handed ownership to another phone (design doc §D4). Stop
+        // presenting ourselves as its active peer and go back on air so a
+        // laptop that DOES want us can find us — otherwise we would sit
+        // silently attached to a laptop that has moved on, invisible to
+        // everything else until the link happened to drop.
+        server.onPeerHandoffReceived = { peerPub, kind, successorName ->
+            if (kind == FrameSub.HANDOFF_RELEASE) {
+                val who = if (successorName.isBlank()) "another phone" else successorName
+                Log.i(TAG, "peer released us (now with $who) — resuming presence")
+                if (activePeerPub?.contentEquals(peerPub) == true) activePeerPub = null
+                // A seek in flight is moot: the laptop already chose someone.
+                stopSeeking()
+                // Presence resumes on the next phase evaluation; kick it so we
+                // are discoverable now rather than up to ACTIVE_RECHECK_MS later.
+                advertiser?.kickRotation()
+            } else {
+                // BUSY / CLAIM are defined in the contract but nothing sends
+                // them yet; log so an unexpected one is visible rather than
+                // silently dropped.
+                Log.i(TAG, "PEER_HANDOFF kind=0x${"%02x".format(kind)} — no handler")
+            }
+        }
+
+        // Advertising is suspended while a session is live — the session IS the
+        // presence proof, and beaconing on top of it is the single largest
+        // avoidable battery cost here (design doc §D5).
+        adv.linkedProvider = provider@{
+            val srv = gattServer ?: return@provider false
+            // SUBSCRIBED, not merely ACL-connected. BlueZ owns the ACL link, so
+            // it outlives the laptop app: after a restart the phone saw a
+            // "connection" with no session behind it, stayed silent, and became
+            // unreachable — the laptop had nothing to find and the phone had no
+            // reason to advertise. Observed live: file offers sat retrying with
+            // "BLE link down?" while the phone never advertised.
+            srv.hasAudioSignalSubscriber()
+        }
+        // Which peers' tokens we may advertise. Re-read every round rather
+        // than captured once, so pairing a new laptop or forgetting one takes
+        // effect without restarting the loop.
+        //
+        // While SEEKING we exclude the peer we are currently linked to: the
+        // user pressed Switch precisely because they want a different laptop,
+        // and spending dwell slots on the current one would only slow the
+        // others down.
+        adv.presencePeersProvider = provider@{
+            val all = try { peerStore.list() } catch (e: Exception) {
+                Log.w(TAG, "presence peers: peer store unavailable: ${e.message}")
+                return@provider emptyList()
+            }
+            if (!adv.seeking) return@provider all.map { it.prs }
+            // Targeted seek: advertise only the chosen laptop's token. One
+            // token means no dwell sharing, so it is seen as fast as the
+            // single-peer case.
+            seekTarget?.let { target ->
+                return@provider all.filter { it.peerStaticPub.contentEquals(target) }
+                    .map { it.prs }
+            }
+            val linkedPub = activePeerPub
+            all.filter { linkedPub == null || !it.peerStaticPub.contentEquals(linkedPub) }
+                .map { it.prs }
+        }
+        if (peerStore.list().isNotEmpty()) {
+            // No `isConnected` argument: `adv.linkedProvider` above answers the
+            // same question, and answers it better. Upstream passed
+            // `hasActiveConnection()`, which is merely ACL-connected — and
+            // BlueZ owns the ACL, so it outlives the laptop app. After a laptop
+            // restart the phone saw a "connection" with no session behind it,
+            // stayed silent, and became unreachable. `linkedProvider` keys on
+            // the audio-signal SUBSCRIPTION instead, which cannot outlive the
+            // session it belongs to.
+            adv.startPresenceLoop(
                 scope = scope,
                 rotationWindowSec = 60L,
-                isConnected = { gattServer?.hasActiveConnection() == true },
                 onError = { reason -> Log.w(TAG, "presence adv error: $reason") },
             )
-            Log.i(TAG, "trusted-presence advertising started (have ${peerStore.list().size} peer(s))")
+            Log.i(TAG, "presence loop started (have ${peerStore.list().size} peer(s))")
         } else {
             Log.i(TAG, "no trust — service idle, awaiting pairing")
         }
         advertiser = adv
         return true
     }
+
+    /**
+     * Open a seek window: advertise to the other remembered laptops while
+     * staying connected to the current one. See [VortexService.startSeeking].
+     */
+    fun startSeeking(target: ByteArray? = null): Boolean {
+        val adv = advertiser ?: return false
+        // Nothing to switch to — refuse rather than burn the radio on a window
+        // that cannot possibly succeed.
+        val peerCount = try { peerStore.list().size } catch (_: Exception) { 0 }
+        if (peerCount < 2) {
+            Log.i(TAG, "seek refused: only $peerCount remembered laptop(s)")
+            return false
+        }
+        seekJob?.cancel()
+        seekTarget = target?.copyOf()
+        adv.seeking = true
+        // Re-advertise immediately with the seek peer set instead of waiting
+        // out the current dwell / rotation sleep.
+        adv.kickRotation()
+        Log.i(TAG, "seek window opened ($peerCount peers, excluding the current one)")
+        seekJob = scope.launch {
+            kotlinx.coroutines.delay(SEEK_WINDOW_MS)
+            // Timed out with nobody else picking us up. Close quietly: the
+            // current laptop was never dropped, so there is nothing to undo.
+            if (adv.seeking) {
+                Log.i(TAG, "seek window expired")
+                stopSeeking()
+            }
+        }
+        return true
+    }
+
+    fun stopSeeking() {
+        seekJob?.cancel()
+        seekJob = null
+        val adv = advertiser ?: return
+        if (!adv.seeking) return
+        adv.seeking = false
+        seekTarget = null
+        // Back to the phase machine's verdict: silent if still linked,
+        // presence otherwise.
+        adv.kickRotation()
+        Log.i(TAG, "seek window closed")
+    }
+
+    fun isSeeking(): Boolean = advertiser?.seeking == true
 
     /**
      * Re-create the BLE stack after the BT adapter has come back ON. Tears
@@ -1075,6 +1258,18 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         /** How long after losing the laptop link the phone keeps
          *  advertising in LOW_LATENCY (reconnect-seeking) mode. */
         internal const val FAST_ADV_WINDOW_MS = 10 * 60_000L
+
+        /** How long a "switch laptop" seek window stays open. Matches the
+         *  laptop's SWITCH_WINDOW_SECS so both ends give up together —
+         *  long enough to walk to another machine and wake it, short
+         *  enough that an unattended press stops advertising-on-top-of-a-
+         *  live-link before it costs real battery. */
+        internal const val SEEK_WINDOW_MS = 45_000L
+
+        /** Minimum gap between WIFI_DIRECT_OFFERs. Each one costs the laptop a
+         *  Wi-Fi disconnect/reconnect (single adapter), so they must not track
+         *  the file count. Well inside the 60 s idle teardown. */
+        internal const val WIFI_DIRECT_OFFER_MIN_GAP_MS = 30_000L
 
         /** How long an AUDIO_SIGNAL subscription must stay up before the
          *  companion mirror burst (contacts/recents/SMS, ~37 chunks) fires.

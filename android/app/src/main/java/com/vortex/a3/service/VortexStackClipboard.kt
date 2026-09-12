@@ -130,14 +130,14 @@ internal fun VortexStack.startClipboardOutbound() {
  */
 internal fun VortexStack.offerCapturedMedia(media: com.vortex.a3.core.media.CapturedMedia) {
     scope.launch {
-        val file = com.vortex.a3.core.clipboard.ClipboardFileReader.read(ctx, media.uri)
+        val file = com.vortex.a3.core.clipboard.ClipboardFileReader.readOrNull(ctx, media.uri)
         if (file == null) {
             Log.w(VortexStack.TAG, "${media.kind.name.lowercase()} _id=${media.id} unreadable or over the cap; not sent")
             return@launch
         }
         val name = media.name.ifBlank { file.name }
         val token = com.vortex.a3.core.clipboard.ClipboardBlobStore.stashLazy(file.bytes) {
-            com.vortex.a3.core.clipboard.ClipboardFileReader.read(ctx, media.uri)?.bytes
+            com.vortex.a3.core.clipboard.ClipboardFileReader.readOrNull(ctx, media.uri)?.bytes
         }
         val o = org.json.JSONObject()
         o.put("token", token)

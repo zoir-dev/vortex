@@ -12,9 +12,7 @@ use vortex_l3_daemon::core::sms::{SmsAssembler, SmsMessage};
 /// `~/.cache/vortex/sms.json` — survives a daemon restart so the page shows the
 /// last-known messages instantly while a fresh sync arrives.
 fn cache_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/sms.json");
-    Some(p)
+    crate::peer_cache::peer_file("sms.json")
 }
 
 /// Spawn the SMS consumer; returns the sender the BLE listener feeds
@@ -191,15 +189,11 @@ pub(crate) fn get_sms() -> Vec<SmsMessage> {
 // what's missing — reading one tiny file instead of parsing the store.
 
 fn history_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/sms_history.json");
-    Some(p)
+    crate::peer_cache::peer_file("sms_history.json")
 }
 
 fn history_since_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/sms_history.since");
-    Some(p)
+    crate::peer_cache::peer_file("sms_history.since")
 }
 
 /// The history watermark: newest message date we've synced, 0 = nothing yet

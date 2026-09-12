@@ -16,6 +16,7 @@ import {
   Plus,
   BellRing,
   SwitchCamera,
+  TabletSmartphone,
 } from "lucide-vue-next";
 import {
   activeEarbuds,
@@ -33,7 +34,14 @@ import {
   primaryPeer,
   primaryPeerState,
   startMirror,
+  peerSwitchScanning,
+  peerSwitchCandidates,
+  peerSwitchNoneFound,
+  startPeerSwitch,
+  abortPeerSwitch,
+  choosePeer,
 } from "@/composables/useHome";
+import { peers } from "@/lib/connectionStore";
 
 const { t } = useI18n();
 
@@ -153,6 +161,19 @@ const earbudsStatus = computed(() => {
           >
             <BellRing class="h-[18px] w-[18px]" :stroke-width="1.9" />
           </button>
+          <!-- Switch to another already-paired phone. Keeps this one connected
+               while it looks, so a cancelled or fruitless switch leaves the
+               link exactly as it was. -->
+          <button
+            v-if="peers.length > 1 || peerSwitchScanning"
+            class="vx-ring"
+            :disabled="peerSwitchScanning"
+            :title="t('peers.switch_tip')"
+            @click="startPeerSwitch"
+          >
+            <Loader2 v-if="peerSwitchScanning" class="h-[18px] w-[18px] animate-spin" />
+            <TabletSmartphone v-else class="h-[18px] w-[18px]" :stroke-width="1.9" />
+          </button>
         </div>
         <div class="flex items-center gap-2">
           <span
@@ -176,6 +197,35 @@ const earbudsStatus = computed(() => {
             </span>
           </div>
           <span v-if="primaryPeerState?.charging" class="text-xs text-muted-foreground">Charging</span>
+        </div>
+        <!-- Switch results: several candidates → pick one; none → say so.
+             Rendered inside the card so it reads as being about this device. -->
+        <div v-if="peerSwitchCandidates.length > 0" class="flex flex-col gap-2">
+          <div class="h-px bg-white/[0.06]" />
+          <div class="text-xs text-muted-foreground">{{ t("peers.switch_pick") }}</div>
+          <button
+            v-for="c in peerSwitchCandidates"
+            :key="c.peer_static_pub"
+            class="vx-chip justify-between"
+            @click="choosePeer(c.peer_static_pub)"
+          >
+            <span class="truncate">{{ c.name || t("device.android") }}</span>
+            <span class="text-[11px] text-muted-foreground">{{ c.rssi }} dBm</span>
+          </button>
+          <button class="text-xs text-muted-foreground hover:underline" @click="abortPeerSwitch">
+            {{ t("peers.switch_cancel") }}
+          </button>
+        </div>
+        <div v-else-if="peerSwitchNoneFound" class="flex flex-col gap-2">
+          <div class="h-px bg-white/[0.06]" />
+          <div class="text-xs text-muted-foreground">{{ t("peers.switch_none") }}</div>
+        </div>
+        <div v-else-if="peerSwitchScanning" class="flex flex-col gap-2">
+          <div class="h-px bg-white/[0.06]" />
+          <div class="text-xs text-muted-foreground">{{ t("peers.switch_scanning") }}</div>
+          <button class="text-xs text-muted-foreground hover:underline" @click="abortPeerSwitch">
+            {{ t("peers.switch_cancel") }}
+          </button>
         </div>
         <!-- mt gives the absolute "Experimental" corner badges headroom above -->
         <div v-if="phoneOnline" class="mt-1.5 flex flex-wrap items-center gap-3">

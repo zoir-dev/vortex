@@ -197,9 +197,9 @@ internal fun VortexStack.noteFileServed(token: String) {
     val done = pendingOffers.remove(token) ?: return
     Log.i(VortexStack.TAG, "file '${done.name}' fetched by the laptop")
     // The one unambiguous "it worked" moment on this device: the laptop has the
-    // bytes. Per file rather than per batch, so a slow batch shows progress as
-    // it goes instead of one summary at the end.
-    if (!done.quiet) toastOffer("File sent: ${done.name}")
+    // bytes. Feeds the batch's progress notification and releases the next
+    // queued file — a toast per file meant 150 toasts for a 150-file share.
+    shareQueue.noteServed(done.name)
     // SLIDING deadline, like the daemon's bulk-sync idle budget: the laptop
     // pulls one file per heartbeat round, so a big batch's last offer can
     // legitimately wait many minutes for its turn. A fetch anywhere in the

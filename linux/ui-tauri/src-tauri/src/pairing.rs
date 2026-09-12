@@ -237,3 +237,21 @@ pub fn forget_peer(peer_static_pub: String, state: State<'_, CmdChannel>) -> Res
 pub fn forget_all(state: State<'_, CmdChannel>) -> Result<(), String> {
     state.0.send(UiCmd::ForgetAll).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub fn switch_peer(state: State<'_, CmdChannel>) -> Result<(), String> {
+    state.0.send(UiCmd::SwitchPeer).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_switch(state: State<'_, CmdChannel>) -> Result<(), String> {
+    state.0.send(UiCmd::CancelSwitch).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn activate_peer(peer_static_pub: String, state: State<'_, CmdChannel>) -> Result<(), String> {
+    state
+        .0
+        .send(UiCmd::ActivatePeer(peer_static_pub))
+        .map_err(|e| e.to_string())
+}

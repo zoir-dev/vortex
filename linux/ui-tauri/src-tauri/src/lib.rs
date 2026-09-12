@@ -54,7 +54,10 @@ mod lan_state;
 mod live_activity;
 mod media_remote;
 mod mirror;
+mod arbiter;
 mod mirror_inject;
+mod peer_cache;
+mod peer_handoff;
 mod mirror_window;
 mod notes;
 mod notifications;
@@ -116,6 +119,20 @@ pub(crate) static SYNC_NUDGE: std::sync::OnceLock<Arc<tokio::sync::Notify>> =
 /// passive monitor / its scan backoff.
 pub(crate) static BLE_RETRY_NUDGE: std::sync::OnceLock<Arc<tokio::sync::Notify>> =
     std::sync::OnceLock::new();
+
+/// The BLE session's generic sealed-frame writer, published so command
+/// handlers outside the BLE loop can send a frame to the CURRENTLY CONNECTED
+/// peer.
+///
+/// Deliberately "the connected peer", not an arbitrary one: it is a handle on
+/// the live session's cipher state. That is exactly what
+/// `PeerHandoff.RELEASE` needs — at the moment a switch is confirmed the live
+/// link is still the peer being displaced (we have not connected to the
+/// replacement yet), so this reaches the right device. If that ordering ever
+/// changes, the RELEASE send in cmd_pairing has to change with it.
+pub(crate) static BLE_SEALED_WRITER: std::sync::OnceLock<
+    Arc<tokio::sync::Mutex<Option<SealedWriter>>>,
+> = std::sync::OnceLock::new();
 
 /// Token of a phone-shared clipboard image waiting to be pulled over LAN.
 /// Set by the BLE image-offer consumer (which also nudges the heartbeat),
@@ -365,6 +382,9 @@ pub fn run() {
             pairing::pair_decision,
             pairing::forget_peer,
             pairing::forget_all,
+            pairing::switch_peer,
+            pairing::cancel_switch,
+            pairing::activate_peer,
             earbuds::refresh_local_earbuds,
             earbuds::open_bluetooth_settings,
             earbuds::scan_bluetooth_devices,

@@ -34,6 +34,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
+# Cross-platform interface addresses + netmasks (getifaddrs / GetAdaptersAddresses)
+# — the Wi-Fi Direct "are we already on the same LAN" test must work on the
+# Windows port too. Already in the lockfile transitively.
+if-addrs = "0.13"
 # Bulk-sync hash gate: sha256 of the cached mirror JSON (matches the
 # phone's hash of the same bytes).
 sha2 = "0.10"

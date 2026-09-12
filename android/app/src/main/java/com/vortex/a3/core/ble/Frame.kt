@@ -152,6 +152,13 @@ object FrameType {
     const val PHONE_FILES: Byte = 0x4F
 
     const val FRAG: Byte = 0x4E
+    /** Session-ownership handoff (design doc §D4). A device may TRUST many
+     *  peers but is ACTIVE with exactly one; this frame is how the two sides
+     *  agree which. `sub` carries the kind ([FrameSub.HANDOFF_RELEASE] etc.),
+     *  the AEAD payload an optional UTF-8 successor name for the UI.
+     *  Additive: both sides log-and-ignore unknown frame types, so a peer
+     *  without this build is unaffected. Mirrors Rust `ty::PEER_HANDOFF`. */
+    const val PEER_HANDOFF: Byte = 0x4F
     const val ERROR: Byte = 0x7F
 }
 
@@ -160,6 +167,16 @@ object FrameSub {
     const val PONG: Byte = 0x02
     const val ECHO_REQUEST: Byte = 0x01
     const val ECHO_RESPONSE: Byte = 0x02
+    /** [FrameType.PEER_HANDOFF] kinds. Mirror Rust `ty::sub::HANDOFF_*`. */
+    /** "You are no longer my active peer" — sent by the side handing ownership
+     *  over, so the receiver stops presenting itself as connected instead of
+     *  finding out on next contact. */
+    const val HANDOFF_RELEASE: Byte = 0x01
+    /** Refused: another peer is already active. Explicit because silence is
+     *  indistinguishable from packet loss and invites a retry loop. */
+    const val HANDOFF_BUSY: Byte = 0x02
+    /** Request to become the active peer. */
+    const val HANDOFF_CLAIM: Byte = 0x03
 }
 
 /** Header size in bytes. */
