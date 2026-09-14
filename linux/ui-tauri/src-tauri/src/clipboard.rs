@@ -80,9 +80,11 @@ pub(crate) struct ClipEntry {
     pub pinned: bool,
 }
 
+/// Through the seam rather than `$HOME`: the latter is unset on Windows, where
+/// this resolved to `None` and clipboard history was quietly never persisted.
+/// Same `~/.cache/vortex` on Linux as before.
 fn clip_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache/vortex/clipboard"))
+    Some(vortex_l3_daemon::core::platform::paths().cache()?.join("clipboard"))
 }
 
 fn index_path() -> Option<PathBuf> {
@@ -341,6 +343,13 @@ fn poll_once(cb: &mut arboard::Clipboard, last_sig: &mut String, last_state: &mu
 /// Plasma is frequently minutes stale. An X11-only probe would then report "not
 /// secret" for a password copy it simply cannot see, and the password would sync
 /// to the phone. So Wayland is asked first, on Wayland's own terms.
+///
+/// Elsewhere there is nothing to ask: this reads a selection TARGET, and a
+/// platform with neither an X server nor a Wayland compositor cannot offer one.
+#[cfg(not(target_os = "linux"))]
+fn clipboard_is_secret() -> bool {
+    false
+}
 
 /// The Wayland arm: list the MIME types the selection offers and look for the
 /// hint among them. Cheaper than the X11 round trip — no conversion request,
@@ -348,6 +357,7 @@ fn poll_once(cb: &mut arboard::Clipboard, last_sig: &mut String, last_state: &mu
 ///
 /// `None` means "could not ask" (no Wayland display, no data-control protocol),
 /// which hands the question to the X11 probe rather than answering it wrongly.
+#[cfg(target_os = "linux")]
 fn wayland_clipboard_is_secret() -> Option<bool> {
     use wl_clipboard_rs::paste::{get_mime_types, ClipboardType, Seat};
 
@@ -362,6 +372,7 @@ fn wayland_clipboard_is_secret() -> Option<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn clipboard_is_secret() -> bool {
     if let Some(secret) = wayland_clipboard_is_secret() {
         return secret;

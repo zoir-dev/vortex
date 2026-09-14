@@ -11,16 +11,24 @@ use std::sync::Arc;
 
 use tauri::AppHandle;
 
+#[cfg(target_os = "linux")]
 use vortex_l3_daemon::core::audio_lan_session::SessionWriterMap;
+#[cfg(target_os = "linux")]
 use vortex_l3_daemon::core::audio_orchestrator::SwitchOrchestrator;
 use vortex_l3_daemon::core::identity::IdentityRecord;
 use vortex_l3_daemon::core::storage::peers::PeerStore;
 
+/// What the UI-command handlers need to act. The BlueZ adapter and the audio
+/// hand-off handles are Linux-only, so the struct is narrower elsewhere and the
+/// handlers that reach for them are gated with it.
 pub(crate) struct WorkerCtx {
     pub app: AppHandle,
+    #[cfg(target_os = "linux")]
     pub adapter: bluer::Adapter,
     pub identity: IdentityRecord,
     pub peer_store: Arc<dyn PeerStore>,
+    #[cfg(target_os = "linux")]
     pub switch_orchestrator: Arc<SwitchOrchestrator>,
+    #[cfg(target_os = "linux")]
     pub session_writers: SessionWriterMap,
 }

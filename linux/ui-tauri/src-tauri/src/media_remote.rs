@@ -7,11 +7,19 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_os = "linux")]
 use vortex_l3_daemon::core::media_runtime::session_conn;
 
 /// Fill the laptop→phone now-playing fields on an outgoing AppState.
 /// Leaves them empty (phone clears its notification) when no MPRIS player
 /// has a readable title.
+/// No MPRIS, no now-playing: the fields stay empty and the phone clears its
+/// laptop-media notification, which is the same thing that happens on Linux
+/// when nothing is playing.
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn fill_now_playing(_state: &mut vortex_l3_daemon::core::appstate::AppState) {}
+
+#[cfg(target_os = "linux")]
 pub(crate) async fn fill_now_playing(state: &mut vortex_l3_daemon::core::appstate::AppState) {
     let Some(c) = session_conn().await else { return };
     if let Some(np) = vortex_l3_daemon::core::media_runtime::now_playing(c).await {
@@ -40,6 +48,11 @@ pub(crate) fn dispatch_media_command(state: &vortex_l3_daemon::core::appstate::A
         return;
     }
     LAST_MEDIA_SEQ.store(seq, Ordering::Relaxed);
+    // The transport buttons on the phone's laptop-media notification drive
+    // MPRIS. Nothing to drive elsewhere; the phone's optimistic flip simply
+    // never gets confirmed, which is what it already handles for a player that
+    // ignores the command.
+    #[cfg(target_os = "linux")]
     tokio::spawn(async move {
         if let Some(c) = session_conn().await {
             vortex_l3_daemon::core::media_runtime::media_control(c, &cmd).await;

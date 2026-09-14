@@ -85,7 +85,7 @@ pub fn send(text: &str) -> Result<(), String> {
     }
     // Both transports, and now rather than on the next beat: the user is
     // reaching for the phone as they click.
-    crate::ble::state_nudge().notify_one();
+    crate::presence::state_nudge().notify_one();
     if let Some(n) = crate::SYNC_NUDGE.get() {
         n.notify_one();
     }

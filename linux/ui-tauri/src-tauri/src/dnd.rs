@@ -128,7 +128,7 @@ fn note_local_change(on: bool) {
     // and the LAN heartbeat stretches to minutes while BLE looks healthy, so
     // nudging only one can leave a toggle waiting a long time on a wedged
     // link. The lock-screen hint nudges both for the same reason.
-    crate::ble::state_nudge().notify_one();
+    crate::presence::state_nudge().notify_one();
     if let Some(n) = crate::SYNC_NUDGE.get() {
         n.notify_one();
     }

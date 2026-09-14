@@ -4,11 +4,16 @@
 
 use snow::{params::NoiseParams, Builder};
 
+/// Re-exported so a consumer can NAME the state a completed handshake hands
+/// back without taking its own `snow` dependency. Two copies of snow in one
+/// build are two incompatible `TransportState`s, and the mismatch surfaces as a
+/// baffling type error at an API boundary rather than as a version conflict.
+pub use snow::TransportState;
+
 pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 /// The reconnect pattern — used by `run_ik_deterministic` for the test
 /// vector AND at runtime. Runtime additionally mixes the Pairwise Reconnect
-/// Secret into the prologue (see
-/// [`crate::core::pairing::reconnect::prologue_with_prs`]), which is what
+/// Secret into the prologue (see [`prologue_with_prs`]), which is what
 /// keeps a reconnect authenticated after a long-term static-key compromise.
 /// That is the goal `Noise_IKpsk2` would serve; the prologue route reaches it
 /// without a pattern the Android-side Noise library does not implement.
@@ -16,6 +21,26 @@ pub const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
 pub const PROLOGUE_XX: &[u8] = b"vortex/v1/pairing";
 pub const PROLOGUE_IK: &[u8] = b"vortex/v1/reconnect";
+
+/// Build the IK prologue with the Pairwise Reconnect Secret mixed in.
+///
+/// We extend the base prologue with the 32-byte PRS so that any wrong-PRS
+/// attempt by an attacker who has compromised only the long-term static
+/// private key fails AEAD verification on msg1's `s` decryption. This achieves
+/// the same security goal as Noise_IKpsk2_... — binding reconnect to BOTH
+/// static keys AND the prior pairing transcript — without requiring a Noise
+/// pattern that the Android-side library does not yet implement.
+///
+/// Lives HERE, with the prologue it extends, rather than in the BLE reconnect
+/// module it was first written in: both transports need it (`lan::tcp_client`
+/// runs the same IK over TCP) and it is normative wire material, so it must
+/// not sit behind a platform gate.
+pub(crate) fn prologue_with_prs(prs: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PROLOGUE_IK.len() + 32);
+    out.extend_from_slice(PROLOGUE_IK);
+    out.extend_from_slice(prs);
+    out
+}
 
 /// Result of a deterministic handshake run.
 #[derive(Debug, Clone)]
@@ -208,5 +233,26 @@ mod tests {
         let len = responder.write_message(&[], &mut buf).unwrap();
         let result = initiator.read_message(&buf[..len], &mut tmp);
         assert!(result.is_err(), "mismatched prologue must fail AEAD");
+    }
+
+    /// The reconnect prologue is normative wire material: the phone builds the
+    /// same bytes, and a mismatch fails AEAD on msg1 rather than producing a
+    /// readable error. Pin the layout — base prologue, then the raw 32-byte
+    /// PRS, nothing else — so a refactor can't silently reorder or pad it.
+    #[test]
+    fn ik_prologue_is_base_then_prs() {
+        let prs = [0xAB; 32];
+        let p = prologue_with_prs(&prs);
+        assert_eq!(p.len(), PROLOGUE_IK.len() + 32);
+        assert_eq!(&p[..PROLOGUE_IK.len()], PROLOGUE_IK);
+        assert_eq!(&p[PROLOGUE_IK.len()..], &prs[..]);
+        assert_eq!(&p[..PROLOGUE_IK.len()], b"vortex/v1/reconnect");
+    }
+
+    /// A different PRS must give a different prologue — that difference IS the
+    /// binding to the prior pairing transcript.
+    #[test]
+    fn a_different_prs_gives_a_different_prologue() {
+        assert_ne!(prologue_with_prs(&[1u8; 32]), prologue_with_prs(&[2u8; 32]));
     }
 }

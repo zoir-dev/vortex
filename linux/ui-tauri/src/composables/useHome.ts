@@ -4,12 +4,14 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { Battery, BatteryLow, BatteryMedium, BatteryFull, BatteryCharging } from "lucide-vue-next";
 import {
   startScan, startPair, forgetPeer, refreshState, refreshLocalEarbuds,
+  switchPeer, cancelSwitch, activatePeer,
   requestEarbudsSwitch, sendEarbudsClaim, getSavedEarbuds, onSwitchState,
   type SwitchState, scanBluetoothDevices, saveEarbuds, clearEarbuds,
   onScanResult, onScanDone, onPairingStarted, onPairingResult, onPairingSas,
+  onSwitchScanning, onSwitchCandidates,
   pairDecision, onLocalEarbuds, onBusy,
   type ScanHit, type TrustedPeer, type PairingResultEvent, type PeerState,
-  type EarbudsSnapshot, type BluetoothDeviceRow,
+  type EarbudsSnapshot, type BluetoothDeviceRow, type SwitchCandidate,
 } from "@/lib/bridge";
 import { initSmartSwitch } from "@/lib/smartSwitch";
 import { initNotifMirror } from "@/lib/notifMirror";
@@ -326,7 +328,11 @@ export const activeEarbuds = computed<
  * contact", and is comfortably above the 12 s heartbeat.
  */
 const PEER_ONLINE_SECS = 35;
-const nowTick = ref(Math.floor(Date.now() / 1000));
+
+/** Epoch seconds, re-read every 10 s. Exported so the "Also paired" rows can
+ *  age their "seen 5 min ago" labels off the same clock the online dot uses —
+ *  two tickers would drift and blink at different moments. */
+export const nowTick = ref(Math.floor(Date.now() / 1000));
 setInterval(() => (nowTick.value = Math.floor(Date.now() / 1000)), 10_000);
 
 /** True if we have a paired peer AND have seen its state within ~3 min. */
@@ -429,6 +435,39 @@ export function onCardPressEnd() {
     clearTimeout(pressTimer);
     pressTimer = null;
   }
+}
+
+// ---- Switch to another already-paired phone ----
+//
+// Distinct from `isSwitching` / `switchState` above, which are the EARBUDS
+// handoff. This is the device switch: keep the current phone connected while
+// looking for another trusted one, and only hand ownership over once a
+// replacement is in hand (design doc §D3).
+
+/** True while the backend is scanning for other trusted phones. */
+export const peerSwitchScanning = ref(false);
+/** Candidates from the last scan. Empty + not scanning = nothing found. */
+export const peerSwitchCandidates = ref<SwitchCandidate[]>([]);
+/** Set once a scan completes so the UI can say "none found" rather than
+ *  silently returning to the normal card. */
+export const peerSwitchNoneFound = ref(false);
+
+export async function startPeerSwitch() {
+  peerSwitchNoneFound.value = false;
+  peerSwitchCandidates.value = [];
+  await switchPeer();
+}
+
+export async function abortPeerSwitch() {
+  peerSwitchNoneFound.value = false;
+  peerSwitchCandidates.value = [];
+  await cancelSwitch();
+}
+
+export async function choosePeer(peerStaticPub: string) {
+  peerSwitchCandidates.value = [];
+  peerSwitchNoneFound.value = false;
+  await activatePeer(peerStaticPub);
 }
 
 // ---- Continuous BLE scan while no trust or pair-modal open ----
@@ -559,6 +598,17 @@ export async function initHome() {
     scanHits.value.push(hit);
   }));
   unlisten.push(await onScanDone(() => (scanning.value = false)));
+  unlisten.push(await onSwitchScanning(on => {
+    peerSwitchScanning.value = on;
+    if (on) peerSwitchNoneFound.value = false;
+  }));
+  unlisten.push(await onSwitchCandidates(list => {
+    peerSwitchCandidates.value = list;
+    // An empty list after a scan means "nothing else in range" — the
+    // backend also emits empty to CLEAR the picker once a peer is
+    // adopted, which is why this only latches while not scanning.
+    peerSwitchNoneFound.value = list.length === 0 && !peerSwitchScanning.value;
+  }));
   unlisten.push(await onPairingStarted(e => {
     pairingPeer.value = e.peer_addr;
     pairingResult.value = null;

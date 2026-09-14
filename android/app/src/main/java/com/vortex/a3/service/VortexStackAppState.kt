@@ -139,6 +139,26 @@ private fun currentWifiIp(): String? = try {
  *  notification, honour a bidirectional forget, run the initiator on a
  *  claim request, and release the buds when the laptop starts playing. */
 internal fun VortexStack.handlePeerAppState(peerPub: ByteArray, state: com.vortex.a3.core.appstate.AppState) {
+    // Being dropped is honoured from ANY laptop — revoking trust is not an
+    // ownership-gated act, and a laptop that has just forgotten us has nothing
+    // else worth saying.
+    if (state.revoked) {
+        Log.i(VortexStack.TAG, "peer revoked us; forgetting ${peerPub.toHexPrefix()}")
+        peerStore.forget(peerPub)
+        VortexService.revokedByPeerBus.tryEmit(peerPub.toHex())
+        return
+    }
+    // Everything below belongs to whichever laptop OWNS the session: the card
+    // the UI draws, the media hand-off, the camera, the cast, the ring.
+    //
+    // This is where the peer dance actually lived. `latestPeerState` is a
+    // single slot, and every laptop's heartbeat overwrote it — roughly one
+    // every twelve seconds, from each — so with two laptops up the phone's
+    // idea of "the laptop" alternated between them no matter what the BLE
+    // ownership rules said. The earlier fix guarded the BLE path alone; the
+    // observed flapping was pure LAN and never went near it.
+    if (!considerOwnership(peerPub)) return
+
     VortexService.peerStateBus.tryEmit(peerPub.toHex() to state)
     latestPeerState = state
     latestPeerStateAtMs = android.os.SystemClock.elapsedRealtime()
@@ -209,12 +229,6 @@ internal fun VortexStack.handlePeerAppState(peerPub: ByteArray, state: com.vorte
         state.dnd,
         state.dndChangedAt,
     )
-    // Bidirectional forget — peer asked us to drop their trust.
-    if (state.revoked) {
-        Log.i(VortexStack.TAG, "peer revoked us; forgetting ${peerPub.toHexPrefix()}")
-        peerStore.forget(peerPub)
-        VortexService.revokedByPeerBus.tryEmit(peerPub.toHex())
-    }
     // Peer holds the buds and is asking us to claim them. We become the
     // initiator. The orchestrator drops the request if a flow is already
     // in progress, so this is idempotent across repeated heartbeats —

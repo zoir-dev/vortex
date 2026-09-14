@@ -100,15 +100,32 @@
   }
 }
 
-/* Design-system motion: the connection dot breathes. */
+/* Design-system motion: the connection dot breathes. The halo itself is drawn
+   in pages/home/Devices.vue (`.vx-pulse::after`), a masked copy of the dot; this
+   is only the motion.
+
+   Two things here are load-bearing, both because the webview runs on the
+   software renderer on purpose (see the WEBKIT_DISABLE_DMABUF_RENDERER note in
+   src-tauri/src/main.rs): there is no compositor fast path, so every frame of
+   any animation repaints a good part of the window.
+
+   * `transform` and `opacity`, never an animated `box-shadow`. The box-shadow
+     version of this one 8px dot cost ~55% of a core, for ever, on a window
+     showing nothing but "everything in sync".
+   * `steps()` rather than a smooth ease, which caps the halo at 15 updates a
+     second instead of the display's 60. On a soft fade nobody can tell, and it
+     is another 2x off the only thing this screen animates.
+
+   The same reasoning applies to whatever else sits in the repainted area: see
+   the note on the logo import in components/Sidebar.vue, where a 512px PNG
+   rescaled to 30px on every frame was costing 60% of a core by itself. */
 @keyframes vx-pulse {
-  0% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0.5); }
-  70% { box-shadow: 0 0 0 7px hsl(var(--primary) / 0); }
-  100% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0); }
+  0% { transform: scale(1); opacity: 0.5; }
+  70%, 100% { transform: scale(2.75); opacity: 0; }
 }
 
 @layer utilities {
-  .vx-pulse { animation: vx-pulse 2.2s ease-out infinite; }
+  /* `.vx-pulse` only marks the dot; the halo it draws lives with `.vx-dot`. */
 
   /* Small lowercase tag for a feature that ships as Experimental. SOLID
      (opaque) dark-amber fill so it reads cleanly wherever it sits — including

@@ -411,6 +411,9 @@ pub(crate) fn spawn_subsystem(
                 tokio::spawn(async move {
                     // Take down anything a previous run left on screen before
                     // we post anything new — see `sweep_stale`.
+                    // Survivors of a previous run are a freedesktop notion —
+                    // a toast has no persistent server holding one.
+                    #[cfg(target_os = "linux")]
                     vortex_l3_daemon::core::notification_display::sweep_stale().await;
                     while let Some(notif) = ble_notif_rx.recv().await {
                         // Laptop-internal nudge (a BLE frame dropped, or we
@@ -502,7 +505,11 @@ pub(crate) fn spawn_subsystem(
                                 found
                             };
                             if let Some(id) = id {
-                                let _ = vortex_l3_daemon::core::notification_display::close(id).await;
+                                let _ = crate::notify::close(id).await;
+                                // The live-id map belongs to the freedesktop
+                                // implementation; there is nothing to forget
+                                // where the seam reaches a toast instead.
+                                #[cfg(target_os = "linux")]
                                 vortex_l3_daemon::core::notification_display::forget_live_id(id);
                             }
                             continue;
@@ -548,7 +555,7 @@ pub(crate) fn spawn_subsystem(
                                 .map(|(&id, _)| id)
                                 .unwrap_or(0)
                         };
-                        match vortex_l3_daemon::core::notification_display::show(&notif, replaces_id)
+                        match crate::notify::show_mirror(&notif, replaces_id)
                             .await
                         {
                             Ok(id) => {
@@ -557,7 +564,9 @@ pub(crate) fn spawn_subsystem(
                                 // detached so they outlive us, and only this
                                 // record lets a later run take down survivors
                                 // whose action mappings died with the process.
+                                #[cfg(target_os = "linux")]
                                 vortex_l3_daemon::core::notification_display::remember_live_id(id);
+                                #[cfg(target_os = "linux")]
                                 if replaces_id != 0 && replaces_id != id {
                                     vortex_l3_daemon::core::notification_display::forget_live_id(
                                         replaces_id,
@@ -612,7 +621,18 @@ pub(crate) fn spawn_subsystem(
                 let (cap_tx, mut cap_rx) = tokio::sync::mpsc::unbounded_channel::<
                     vortex_l3_daemon::core::notif_mirror::NotificationMirror,
                 >();
+                // Linux only: the capture is a `dbus-monitor` child parsing the
+                // session bus, and there is no such bus elsewhere. Left ungated
+                // it respawned every 5 s forever, logging a warn per attempt.
+                // Windows' equivalent is the UserNotificationListener, which
+                // needs a packaged-identity capability the app does not have
+                // yet, so laptop→phone mirroring is simply off there — the
+                // consumer below stays, harmlessly idle on a channel nothing
+                // feeds.
+                #[cfg(target_os = "linux")]
                 vortex_l3_daemon::core::notif_capturer::spawn(cap_tx);
+                #[cfg(not(target_os = "linux"))]
+                drop(cap_tx);
                 let writer_handle = ble_notif_writer.clone();
                 tokio::spawn(async move {
                     while let Some(notif) = cap_rx.recv().await {
@@ -640,7 +660,7 @@ pub(crate) fn spawn_subsystem(
             {
                 let (closed_tx, mut closed_rx) =
                     tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
-                tokio::spawn(vortex_l3_daemon::core::notification_display::watch_closed(closed_tx));
+                crate::notify::watch_closed(closed_tx);
                 let links = notif_links.clone();
                 let recent_actions = notif_recent_actions.clone();
                 let writer_handle = ble_notif_writer.clone();
@@ -707,7 +727,7 @@ pub(crate) fn spawn_subsystem(
             // (no portable inline-reply on freedesktop) — a plain fire.
             {
                 let (act_tx, mut act_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
-                tokio::spawn(vortex_l3_daemon::core::notification_display::watch_actions(act_tx));
+                crate::notify::watch_actions(act_tx);
                 let links = notif_links.clone();
                 let recent_actions = notif_recent_actions.clone();
                 let writer_handle = ble_notif_writer.clone();

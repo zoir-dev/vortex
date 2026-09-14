@@ -152,6 +152,36 @@ object FrameType {
     const val PHONE_FILES: Byte = 0x4F
 
     const val FRAG: Byte = 0x4E
+    /** Session-ownership handoff (design doc §D4). A device may TRUST many
+     *  peers but is ACTIVE with exactly one; this frame is how the two sides
+     *  agree which. `sub` carries the kind ([FrameSub.HANDOFF_RELEASE] etc.),
+     *  the AEAD payload an optional UTF-8 successor name for the UI.
+     *  Additive: both sides log-and-ignore unknown frame types, so a peer
+     *  without this build is unaffected. Mirrors Rust `ty::PEER_HANDOFF`. */
+    // 0x54, not 0x4F — see the note on the Rust side: upstream took 0x4F for
+    // PHONE_FILES, and PEER_HANDOFF is the one that has never shipped.
+    const val PEER_HANDOFF: Byte = 0x54
+    /** Ranged-filesystem request. `sub` carries the op
+     *  ([com.vortex.a3.core.fs.FsOp]), the payload a JSON request — plus a
+     *  binary byte tail for WRITE.
+     *
+     *  BIDIRECTIONAL and symmetric: this phone both serves these (so the
+     *  laptop can browse its storage) and sends them (so it can browse the
+     *  laptop's). Neither the frame nor its handler names a side. See
+     *  `docs/design/file-browsing.md`. Mirrors Rust `ty::FS_REQ`. */
+    const val FS_REQ: Byte = 0x50
+    /** Successful non-data reply — directory page, stat, open result, write
+     *  ack. Carries `FsReply` JSON. Mirrors Rust `ty::FS_META`. */
+    const val FS_META: Byte = 0x51
+    /** Read result: `[id u32 BE][offset u64 BE][flags u8][bytes]`. Binary, not
+     *  JSON: base64 would cost 33% on the protocol's hottest path. Mirrors
+     *  Rust `ty::FS_DATA`. */
+    const val FS_DATA: Byte = 0x52
+    /** A definite failure for one request id (`FsErr` JSON). Every failing op
+     *  answers with one — a file manager blocked on a read that will never be
+     *  answered is this feature's worst outcome, so silence is never valid.
+     *  Mirrors Rust `ty::FS_ERR`. */
+    const val FS_ERR: Byte = 0x53
     const val ERROR: Byte = 0x7F
 }
 
@@ -160,6 +190,16 @@ object FrameSub {
     const val PONG: Byte = 0x02
     const val ECHO_REQUEST: Byte = 0x01
     const val ECHO_RESPONSE: Byte = 0x02
+    /** [FrameType.PEER_HANDOFF] kinds. Mirror Rust `ty::sub::HANDOFF_*`. */
+    /** "You are no longer my active peer" — sent by the side handing ownership
+     *  over, so the receiver stops presenting itself as connected instead of
+     *  finding out on next contact. */
+    const val HANDOFF_RELEASE: Byte = 0x01
+    /** Refused: another peer is already active. Explicit because silence is
+     *  indistinguishable from packet loss and invites a retry loop. */
+    const val HANDOFF_BUSY: Byte = 0x02
+    /** Request to become the active peer. */
+    const val HANDOFF_CLAIM: Byte = 0x03
 }
 
 /** Header size in bytes. */

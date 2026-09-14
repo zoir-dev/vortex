@@ -1,7 +1,9 @@
 //! Browsing HANDOFF consumer (laptop): a phone `HandoffEvent` → continue the
 //! page here, continuity-style.
 //!
-//!  - `open_now = true`  (an explicit Share)         → open the URL right away.
+//!  - `open_now = true`  (an explicit Share)         → open the URL right away,
+//!    and exactly once per request — the event is re-delivered by every AppState
+//!    heartbeat, so the open path is idempotent on `id` (see [LAST_OPENED]).
 //!  - `open_now = false` (the live accessibility read) → show a top-bar PILL
 //!    badged with the SITE's domain + favicon; one click opens the page. An
 //!    empty `url` clears it.
@@ -27,6 +29,22 @@ const HANDOFF_PILL_KEY: &str = "vortex-handoff";
 /// (to swap in the site icon) if the user is STILL on that page (didn't navigate
 /// away while the favicon was downloading).
 static CURRENT_URL: Mutex<String> = Mutex::new(String::new());
+
+/// The `open_now` request we have already opened, so a heartbeat re-delivery
+/// does not open it a second time.
+///
+/// An explicit Share is a one-shot COMMAND, but it rides the phone's AppState
+/// snapshot as a backstop for a dead BLE link — and a snapshot is republished
+/// every ~12s. This branch used to call [open_url] unconditionally, so one
+/// shared link became a browser tab every 12s until the phone app was killed;
+/// 67 zombie `xdg-open` children had piled up under the app when it was caught.
+/// Nothing the user did on the phone could stop it: only the accessibility read
+/// ever clears the carried event, and copying other text does not touch it.
+///
+/// Keyed on the request `id`, NOT the URL, so deliberately re-sharing the same
+/// page still opens it. Falls back to the URL for phone builds that predate
+/// `id` — those cannot express "again", and stopping the loop matters more.
+static LAST_OPENED: Mutex<String> = Mutex::new(String::new());
 
 /// The handoff consumer's sender, so an AppState-carried handoff (the LAN
 /// backstop) can be fed in alongside the dedicated BLE HANDOFF frame. Set once
@@ -73,7 +91,7 @@ pub(crate) fn spawn_consumer(
         while let Some(ev) = rx.recv().await {
             // A handoff frame is proof of live phone contact (the 25s heartbeat
             // keeps this fresh while a page is up) → gates the disconnect-clear.
-            crate::ble::touch_peer_contact();
+            crate::presence::touch_peer_contact();
             if ev.url.is_empty() {
                 if let Ok(mut g) = CURRENT_URL.lock() {
                     g.clear();
@@ -86,7 +104,29 @@ pub(crate) fn spawn_consumer(
                 continue;
             }
             if ev.open_now {
-                open_url(&ev.url);
+                // Open EXACTLY once per request, however many times it is
+                // re-delivered (heartbeat backstop, or the BLE frame and the
+                // AppState carry both landing — which used to open two tabs).
+                let token = if ev.id.is_empty() {
+                    ev.url.clone()
+                } else {
+                    ev.id.clone()
+                };
+                let fresh = match LAST_OPENED.lock() {
+                    Ok(mut g) if *g != token => {
+                        *g = token;
+                        true
+                    }
+                    // Already opened, or the lock is poisoned. Either way the
+                    // safe answer is "don't open" — a missed share is a nuisance,
+                    // an unstoppable browser is what we are fixing.
+                    _ => false,
+                };
+                if fresh {
+                    open_url(&ev.url);
+                } else {
+                    tracing::debug!("handoff: share already opened; ignoring re-assert");
+                }
                 continue;
             }
             // Live read → a "continue" pill badged with the site domain + icon.
@@ -313,8 +353,13 @@ fn ensure_favicon(domain: &str) -> Option<String> {
 }
 
 /// Open `url` in the default browser. The URL is never logged.
+///
+/// `tokio::process`, not `std::process`: a `std` `Child` dropped without
+/// `wait()` stays a zombie for the parent's whole life, and this app runs for
+/// days. Tokio's orphan reaper collects the child on drop, so nothing
+/// accumulates. (The notification-action opener already does it this way.)
 fn open_url(url: &str) {
-    match std::process::Command::new("xdg-open").arg(url).spawn() {
+    match tokio::process::Command::new("xdg-open").arg(url).spawn() {
         Ok(_) => tracing::info!("handoff: opened a shared page in the browser"),
         Err(e) => tracing::warn!("handoff: xdg-open failed: {e}"),
     }

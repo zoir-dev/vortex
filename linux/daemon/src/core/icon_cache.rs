@@ -26,9 +26,9 @@ pub fn parse_chunk(plain: &[u8]) -> Option<(String, u16, u16, Vec<u8>)> {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/icons");
-    Some(p)
+    // Seam, not `$HOME` — unset on Windows, where no mirrored app icon could
+    // ever be cached. Same `~/.cache/vortex/icons` on Linux.
+    Some(crate::core::platform::paths().cache()?.join("icons"))
 }
 
 /// Keep only safe path chars so a malformed package can't escape the dir.

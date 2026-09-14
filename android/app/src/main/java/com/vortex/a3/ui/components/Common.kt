@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.shape.CircleShape
@@ -69,20 +70,32 @@ fun CardHeader(
     iconTint: Color,
     iconBg: Color,
     statusDot: Color,
+    /** Optional action rendered immediately right of the device icon. Card
+     *  actions that are not per-row belong here rather than in the bottom row,
+     *  which is already carrying battery + charging + per-feature glyphs. */
+    afterIcon: (@Composable () -> Unit)? = null,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.Top,
     ) {
-        Box(
-            modifier = Modifier
-                .size(42.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .background(iconBg),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(imageVector = icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(22.dp))
+        // Icon and its trailing action are grouped so SpaceBetween keeps them
+        // together on the left instead of spreading three items across the row.
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(iconBg),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(imageVector = icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(22.dp))
+            }
+            if (afterIcon != null) {
+                Spacer(modifier = Modifier.size(10.dp))
+                afterIcon()
+            }
         }
         StatusDot(color = statusDot)
     }

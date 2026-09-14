@@ -8,9 +8,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+#[cfg(target_os = "linux")]
 use vortex_l3_daemon::core::ble::client::VortexClient;
 use vortex_l3_daemon::core::identity::IdentityRecord;
 use vortex_l3_daemon::core::pairing::handshake::{run_pairing_initiator, LocalDecision};
+#[cfg(target_os = "linux")]
+use vortex_l3_daemon::core::platform::linux::LinuxGattLink;
 use vortex_l3_daemon::core::storage::peers::{PeerStore, TrustedPeer};
 
 use crate::{emit_peers, CmdChannel, PairDecisionState, UiCmd};
@@ -28,6 +31,19 @@ pub(crate) fn redact_sas(sas: &str) -> String {
     format!("{head}…{tail}")
 }
 
+/// This machine's friendly name, sent in the APPROVE frame so the phone shows
+/// "MyLaptop" rather than a platform label. `/proc` on Linux, `COMPUTERNAME`
+/// elsewhere; sanitised on the way out by the handshake either way.
+pub(crate) fn local_device_name() -> Option<String> {
+    // One source, shared with the AppState heartbeat: the pairing frame and the
+    // heartbeat both carry this name, and if they disagree the heartbeat wins by
+    // arriving second.
+    vortex_l3_daemon::core::platform::host_name()
+}
+
+/// Pair over BlueZ: connect to a scanned BD_ADDR, then hand the link to
+/// [`do_pair_over`].
+#[cfg(target_os = "linux")]
 pub(crate) async fn do_pair(
     app: &AppHandle,
     adapter: &bluer::Adapter,
@@ -56,13 +72,28 @@ pub(crate) async fn do_pair(
     info!(hygiene_ms, connect_total_ms = t_pair.elapsed().as_millis(),
         "pair: connected to {addr_str}; running Noise XX");
 
-    let local_name = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let local_name = crate::pairing::local_device_name();
+    let link = LinuxGattLink::from_client(adapter.clone(), &client);
+    do_pair_over(app, &link, identity, peer_store, local_name.as_deref()).await
+}
+
+/// The pairing handshake and everything after it: run Noise XX over `link`, show
+/// the SAS, wait for the user on BOTH devices, and store the trust record.
+///
+/// Platform-neutral — this is the part that decides whether two devices trust
+/// each other forever, and it should not exist twice. The transports differ
+/// only in how the link was obtained.
+pub(crate) async fn do_pair_over(
+    app: &AppHandle,
+    link: &dyn vortex_l3_daemon::core::platform::GattLink,
+    identity: &IdentityRecord,
+    peer_store: Arc<dyn PeerStore>,
+    local_name: Option<&str>,
+) -> Result<(), String> {
+    let t_pair = std::time::Instant::now();
     let app_for_sas = app.clone();
     let outcome = run_pairing_initiator(
-        &client,
+        link,
         &identity.static_priv.0,
         Duration::from_secs(60),
         move |sas: &str| {
@@ -118,7 +149,7 @@ pub(crate) async fn do_pair(
                 }
             }
         },
-        local_name.as_deref(),
+        local_name,
     )
     .await
     .map_err(|e| format!("handshake: {e}"))?;
@@ -236,4 +267,22 @@ pub fn forget_peer(peer_static_pub: String, state: State<'_, CmdChannel>) -> Res
 #[tauri::command]
 pub fn forget_all(state: State<'_, CmdChannel>) -> Result<(), String> {
     state.0.send(UiCmd::ForgetAll).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn switch_peer(state: State<'_, CmdChannel>) -> Result<(), String> {
+    state.0.send(UiCmd::SwitchPeer).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_switch(state: State<'_, CmdChannel>) -> Result<(), String> {
+    state.0.send(UiCmd::CancelSwitch).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn activate_peer(peer_static_pub: String, state: State<'_, CmdChannel>) -> Result<(), String> {
+    state
+        .0
+        .send(UiCmd::ActivatePeer(peer_static_pub))
+        .map_err(|e| e.to_string())
 }

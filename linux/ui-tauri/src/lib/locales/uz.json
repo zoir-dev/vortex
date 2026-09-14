@@ -12,6 +12,7 @@
   "device": {
     "this": "Bu qurilma",
     "linux": "Linux noutbuk",
+    "windows": "Windows noutbuki",
     "android": "Android telefon",
     "earbuds": "Quloqchin",
     "paired_badge": "{count} ta ulangan",
@@ -68,7 +69,24 @@
     "offline": "Oflayn",
     "forget_title": "Qurilmani unutish",
     "forget_body": "{name} bilan aloqa uziladi. Qayta ulanish uchun yana pairing qilinadi.",
-    "forget_confirm": "Unutish"
+    "forget_confirm": "Unutish",
+    "switch_tip": "Boshqa telefonga o'tish",
+    "browse_tip": "Telefon fayllarini ko'rish",
+    "switch_scanning": "Boshqa telefonlaringiz qidirilmoqda…",
+    "switch_pick": "Qaysi telefonga o'tamiz?",
+    "switch_none": "Yaqinda boshqa ulangan telefon yo'q.",
+    "switch_cancel": "Bekor qilish",
+    "other_title": "Yana ulangan",
+    "other_hint": "O'tish uchun bosing",
+    "add_pair": "Yana bir telefon ulash",
+    "add_pair_hint": "Boshqa telefonni ulanish rejimiga o'tkazing, so'ng bu yerda qidiruvni boshlang.",
+    "seen": "{ago} ko'rilgan",
+    "paired_ago": "{ago} ulangan",
+    "never": "ulanmagan",
+    "just_now": "hozirgina",
+    "mins": "{n} daq oldin",
+    "hours": "{n} soat oldin",
+    "days": "{n} kun oldin"
   },
   "discover": {
     "looking": "Yaqindagi qurilmalar qidirilmoqda…",

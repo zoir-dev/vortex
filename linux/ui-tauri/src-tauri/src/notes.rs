@@ -51,9 +51,10 @@ pub(crate) fn now_ms() -> i64 {
 /// `~/.cache/vortex/notes.json` — the full item array incl. tombstones (so a
 /// delete still propagates after a restart).
 fn cache_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/notes.json");
-    Some(p)
+    // Seam, not `$HOME` — unset on Windows, where notes were therefore never
+    // written to disk and came back empty after every restart. Resolves to the
+    // same `~/.cache/vortex` on Linux.
+    Some(vortex_l3_daemon::core::platform::paths().cache()?.join("notes.json"))
 }
 
 /// How long a tombstone is kept before it is dropped.
@@ -411,7 +412,7 @@ async fn send_full(writer: &Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>
     let w = { writer.lock().await.clone() };
     let Some(w) = w else { return };
     for chunk in build_chunks(items) {
-        if w(NOTES_FRAME, chunk).await.is_err() {
+        if w(NOTES_FRAME, 0, chunk).await.is_err() {
             break;
         }
     }
@@ -424,7 +425,7 @@ async fn send_full(writer: &Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>
 pub(crate) fn spawn_sync(
     app: AppHandle,
     writer: Arc<tokio::sync::Mutex<Option<crate::SealedWriter>>>,
-) -> tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)> {
+) -> tokio::sync::mpsc::UnboundedSender<vortex_l3_daemon::core::ble::frame::RawFrame> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let _ = NOTES_DIRTY.set(notify.clone());
 
@@ -440,13 +441,16 @@ pub(crate) fn spawn_sync(
         });
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<vortex_l3_daemon::core::ble::frame::RawFrame>();
     tokio::spawn(async move {
         let mut asm = Assembler::default();
-        while let Some((ty, payload)) = rx.recv().await {
-            if ty != NOTES_FRAME {
+        // Notes are one shared list across devices, so WHICH peer sent a
+        // chunk does not change the merge — ignore the identity here.
+        while let Some(f) = rx.recv().await {
+            if f.ty != NOTES_FRAME {
                 continue; // the raw channel is generic — ignore other features
             }
+            let payload = f.payload;
             let Some((total, idx, data)) = parse_chunk(&payload) else {
                 continue;
             };
@@ -525,6 +529,6 @@ async fn fire_reminder(it: &Item) {
         text: "Reminder".to_string(),
         ..Default::default()
     };
-    let _ = vortex_l3_daemon::core::notification_display::show(&notif, 0).await;
+    let _ = crate::notify::show_mirror(&notif, 0).await;
     tracing::info!("notes: fired todo reminder");
 }

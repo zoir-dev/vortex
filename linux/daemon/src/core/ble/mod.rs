@@ -1,9 +1,26 @@
 //! BLE constants, advertisement payload codec, and platform-side BLE
 //! integration per spec §5 and §10.
 
-pub mod audio_signal;
-pub mod client;
+// `frame` is the WIRE PROTOCOL: frame types, subtypes and chunk headers, shared
+// byte-for-byte with the phone and used by the LAN transport too (see
+// `lan::tcp_client`, which reassembles bulk-sync datasets by BLE frame type).
+// It is pure Rust and must build everywhere — the phone cannot tell the two
+// laptops apart, and `shared/vectors/` exists to keep it that way.
 pub mod frame;
+
+// The post-handshake event stream: AEAD-sealed frames in both directions over
+// the AUDIO_SIGNAL characteristic, with nonce resync when the link drops one.
+// Platform-neutral — it speaks `core::platform::GattLink`, so the same dispatch
+// and the same resync run over BlueZ, over WinRT, or over a test fake.
+pub mod audio_signal;
+
+// Everything below is BlueZ over D-Bus: the central-role transport that
+// carries those frames on Linux. A second OS brings its own transport (WinRT
+// `BluetoothLEDevice`) behind `core::platform::BleCentral` and reuses both
+// `frame` and `audio_signal` unchanged.
+#[cfg(target_os = "linux")]
+pub mod client;
+#[cfg(target_os = "linux")]
 pub mod scanner;
 
 /// V1 protocol version byte. Receivers MUST reject other versions (§5.2).
@@ -142,6 +159,39 @@ impl AdvPayload {
     }
 }
 
+/// Decode a **Service Data — 128-bit UUID** AD section (type `0x21`): sixteen
+/// bytes of service UUID followed by the service data itself.
+///
+/// Returns the payload only when the UUID is ours AND the payload passes the
+/// §5.2 filter. `None` covers a foreign advert, a truncated section, and a
+/// malformed payload alike, because a scanner's only useful question is "is
+/// this a Vortex peer worth looking at".
+///
+/// The UUID in an AD structure is **little-endian** — reversed from the printed
+/// form. That reversal is the whole reason this is a function with a test
+/// rather than a comparison written inline at a call site.
+///
+/// Platforms that hand back parsed service data (BlueZ gives a UUID→bytes map)
+/// go straight to [`AdvPayload::decode`]; this is for the ones that hand over
+/// raw AD sections, as WinRT does.
+pub fn decode_service_data_128(section: &[u8]) -> Option<AdvPayload> {
+    if section.len() < 16 {
+        return None;
+    }
+    let (uuid_le, payload) = section.split_at(16);
+    let mut be = [0u8; 16];
+    for (i, b) in uuid_le.iter().rev().enumerate() {
+        be[i] = *b;
+    }
+    if uuid::Uuid::from_bytes(be) != VORTEX_SERVICE_UUID {
+        return None;
+    }
+    AdvPayload::decode(payload).ok()
+}
+
+/// AD type for Service Data with a 128-bit UUID (Core Spec Supplement §1.11).
+pub const AD_TYPE_SERVICE_DATA_128: u8 = 0x21;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvDecodeError {
     WrongLength(usize),
@@ -251,6 +301,54 @@ mod tests {
             AdvPayload::decode(&bytes),
             Err(AdvDecodeError::BadFlags(0x03))
         ));
+    }
+
+    /// Build the AD section a phone actually emits: little-endian UUID, then
+    /// the 10-byte payload.
+    fn service_data_section(payload: [u8; ADV_PAYLOAD_LEN]) -> Vec<u8> {
+        let mut v: Vec<u8> = VORTEX_SERVICE_UUID.as_bytes().iter().rev().copied().collect();
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    #[test]
+    fn decodes_a_service_data_section_from_raw_ad_bytes() {
+        let token = [0x11u8; 8];
+        let section = service_data_section(AdvPayload::trusted_presence(token).encode());
+        let decoded = decode_service_data_128(&section).expect("ours");
+        assert!(decoded.flags.is_trusted_presence());
+        assert_eq!(decoded.payload_8, token);
+    }
+
+    /// The UUID is little-endian on air. Feeding it big-endian must NOT match,
+    /// or a scanner would silently depend on which way round the platform
+    /// happened to hand the bytes over.
+    #[test]
+    fn a_big_endian_uuid_does_not_match() {
+        let mut section: Vec<u8> = VORTEX_SERVICE_UUID.as_bytes().to_vec();
+        section.extend_from_slice(&AdvPayload::pairable([0; 8]).encode());
+        assert!(decode_service_data_128(&section).is_none());
+    }
+
+    #[test]
+    fn rejects_foreign_short_and_malformed_sections() {
+        // Someone else's service data.
+        let mut foreign: Vec<u8> = uuid::uuid!("00001234-0000-1000-8000-00805f9b34fb")
+            .as_bytes()
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        foreign.extend_from_slice(&AdvPayload::pairable([0; 8]).encode());
+        assert!(decode_service_data_128(&foreign).is_none());
+
+        // Truncated before the UUID even ends.
+        assert!(decode_service_data_128(&[0u8; 8]).is_none());
+
+        // Ours, but the payload fails the §5.2 filter (both mode bits set).
+        let mut bad = AdvPayload::pairable([0; 8]).encode();
+        bad[1] = 0x03;
+        assert!(decode_service_data_128(&service_data_section(bad)).is_none());
     }
 
     #[test]

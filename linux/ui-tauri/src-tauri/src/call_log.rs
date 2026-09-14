@@ -11,9 +11,7 @@ use vortex_l3_daemon::core::call_log::{CallLogAssembler, CallLogEntry};
 /// `~/.cache/vortex/call_log.json` — survives a daemon restart so the page
 /// shows the last-known list instantly while a fresh sync arrives.
 fn cache_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/call_log.json");
-    Some(p)
+    crate::peer_cache::peer_file("call_log.json")
 }
 
 /// Validate a complete call-log JSON blob, persist it to the disk cache and
@@ -60,15 +58,11 @@ pub(crate) fn cache_hash() -> String {
 // The twin of sms.rs's history store; see there for the model.
 
 fn history_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/call_log_history.json");
-    Some(p)
+    crate::peer_cache::peer_file("call_log_history.json")
 }
 
 fn history_since_path() -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/call_log_history.since");
-    Some(p)
+    crate::peer_cache::peer_file("call_log_history.since")
 }
 
 /// The history watermark: newest call date we've synced, 0 = nothing yet.

@@ -37,6 +37,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- File browsing: serve the whole of shared storage to a paired laptop.
+         Declared but NOT requested at launch — it is reached only through the
+         "Allow access to any files" setting, because it is a special access
+         the user grants on a system screen, and the default remains the SAF
+         folder picker (design doc §5). Play Store restricts this permission;
+         Vortex ships via GitHub releases, so that is a labelling concern
+         rather than a blocker. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <!-- Continuity Camera: use the phone camera as a laptop webcam. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />

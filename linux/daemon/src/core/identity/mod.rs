@@ -17,11 +17,20 @@ use super::crypto::x25519::{public_from_private, X25519Pub, X25519Sec, X25519Sec
 pub const IDENTITY_VERSION: u8 = 0x01;
 
 /// `platform` byte (§3.1).
+///
+/// LOCAL, despite living in a record with a spec section: the identity record
+/// is written to this device's own secure storage and never leaves it. What the
+/// peer sees is the `class` STRING in `AppState` ("laptop", "phone"), decoded by
+/// its own `DeviceClass` — the phone's `Platform.fromByte` only ever parses the
+/// record IT stored. So adding a variant here is not a wire change and cannot
+/// make an existing phone reject us; the only reader of a `0x03` byte is a
+/// Windows build reading back its own record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
     Android = 0x01,
     Linux = 0x02,
+    Windows = 0x03,
 }
 
 impl Platform {
@@ -32,6 +41,7 @@ impl Platform {
         match b {
             0x01 => Some(Self::Android),
             0x02 => Some(Self::Linux),
+            0x03 => Some(Self::Windows),
             _ => None,
         }
     }
@@ -96,6 +106,47 @@ impl IdentityRecord {
         out.push(self.platform.as_byte()); //       89..90 platform
         debug_assert_eq!(out.len(), 90);
         out
+    }
+
+    /// Decode a 90-byte record written by [`Self::encode`].
+    ///
+    /// Lives here, beside `encode`, rather than inside a storage backend: this
+    /// is the on-disk identity format, every backend reads the same bytes, and
+    /// a second copy of the offsets is a second place to get them wrong.
+    ///
+    /// Strict on length and version — a record that is not exactly what we
+    /// wrote is a corrupt keypair, and guessing at it would mean running with
+    /// a private key we cannot vouch for.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 90 {
+            return Err(format!(
+                "stored identity has wrong length: {} (expected 90)",
+                bytes.len()
+            ));
+        }
+        let version = bytes[0];
+        if version != IDENTITY_VERSION {
+            return Err(format!(
+                "stored identity has unknown version: {version:#04x}"
+            ));
+        }
+        let mut device_id = [0u8; 16];
+        device_id.copy_from_slice(&bytes[1..17]);
+        let mut static_priv = [0u8; 32];
+        static_priv.copy_from_slice(&bytes[17..49]);
+        let mut static_pub = [0u8; 32];
+        static_pub.copy_from_slice(&bytes[49..81]);
+        let created_at = u64::from_be_bytes(bytes[81..89].try_into().unwrap());
+        let platform = Platform::from_byte(bytes[89])
+            .ok_or_else(|| format!("unknown platform byte: {}", bytes[89]))?;
+        Ok(Self {
+            version,
+            device_id,
+            static_priv: crate::core::crypto::x25519::X25519Sec(static_priv),
+            static_pub: crate::core::crypto::x25519::X25519Pub(static_pub),
+            created_at,
+            platform,
+        })
     }
 }
 

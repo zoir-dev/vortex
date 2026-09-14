@@ -104,7 +104,13 @@ pub(crate) fn diagnostics() -> Diagnostics {
     // rounds this happens on; say so here, with the fix, because the fix
     // (power the adapter off and on) drops the user's audio and so has to be
     // their decision rather than something the app does behind them.
+    // BlueZ-specific: the counter is kept by the BlueZ discovery loop, and
+    // WinRT's scanner reports nothing equivalent. No counter means no wedge to
+    // report, which is the honest answer rather than a fabricated zero.
+    #[cfg(target_os = "linux")]
     let wedged = crate::ble::not_discovering_rounds();
+    #[cfg(not(target_os = "linux"))]
+    let wedged = 0u32;
     if wedged > 0 {
         checks.push(check(
             "bluetooth_discovery",

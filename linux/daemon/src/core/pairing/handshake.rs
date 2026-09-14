@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use futures::{pin_mut, StreamExt};
 use snow::{params::NoiseParams, Builder, HandshakeState};
 use tokio::time::timeout;
 use tracing::{debug, info};
 
-use crate::core::ble::client::{ClientError, VortexClient};
+use crate::core::ble::PAIRING_CONTROL_UUID;
+use crate::core::platform::GattLink;
 use crate::core::ble::frame::{ty, Frame, FrameDecodeError};
 use crate::core::crypto::derive::derive_prs;
 use crate::core::crypto::noise::{NOISE_XX, PROLOGUE_XX};
@@ -51,7 +51,10 @@ pub struct PairingOutcome {
 #[derive(Debug)]
 pub enum HandshakeError {
     Snow(snow::Error),
-    Client(ClientError),
+    /// The GATT link failed the write or subscribe. A `String` because
+    /// [`GattLink`] is the seam — BlueZ and WinRT share no error type, and
+    /// callers only log it.
+    Link(String),
     UnexpectedFrame { ty: u8, sub: u8 },
     FrameDecode(FrameDecodeError),
     Timeout(&'static str),
@@ -64,7 +67,7 @@ impl std::fmt::Display for HandshakeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Snow(e) => write!(f, "noise: {e}"),
-            Self::Client(e) => write!(f, "ble client: {e}"),
+            Self::Link(e) => write!(f, "gatt link: {e}"),
             Self::UnexpectedFrame { ty, sub } => {
                 write!(f, "unexpected frame type=0x{ty:02x} sub=0x{sub:02x}")
             }
@@ -85,9 +88,9 @@ impl From<snow::Error> for HandshakeError {
     }
 }
 
-impl From<ClientError> for HandshakeError {
-    fn from(e: ClientError) -> Self {
-        Self::Client(e)
+impl From<String> for HandshakeError {
+    fn from(e: String) -> Self {
+        Self::Link(e)
     }
 }
 
@@ -99,12 +102,22 @@ fn build_initiator(static_priv: &X25519SecBytes) -> Result<HandshakeState, snow:
         .build_initiator()
 }
 
-/// Run Noise XX against `client`'s peer using the supplied static private
+/// One frame to Pairing Control, unacknowledged (§9.1): the flow is driven by
+/// the notification each write provokes, so an ATT ack would add a round trip
+/// and no reliability. `VortexClient::write_pairing_control` used to encode that
+/// choice; now the `false` does.
+async fn write_pairing(link: &dyn GattLink, frame: &Frame) -> Result<(), HandshakeError> {
+    link.write(PAIRING_CONTROL_UUID.as_u128(), &frame.encode(), false)
+        .await
+        .map_err(HandshakeError::Link)
+}
+
+/// Run Noise XX against the peer on `link`, using the supplied static private
 /// key. Production callers pass the long-lived identity scalar.
 ///
 /// Bounded by `wait_per_step` for each notify step.
 pub async fn run_xx_initiator(
-    client: &VortexClient,
+    link: &dyn GattLink,
     static_priv: &X25519SecBytes,
     wait_per_step: Duration,
 ) -> Result<XxOutcome, HandshakeError> {
@@ -113,22 +126,18 @@ pub async fn run_xx_initiator(
     let mut payload_scratch = vec![0u8; 1024];
 
     // Subscribe BEFORE writing msg1 so we don't miss the msg2 notification.
-    let notifies = client
-        .pairing_control
-        .notify()
-        .await
-        .map_err(ClientError::from)?;
-    pin_mut!(notifies);
+    let (tx, mut notifies) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    link.subscribe(PAIRING_CONTROL_UUID.as_u128(), tx).await?;
 
     // ---- msg1 (initiator → responder) ----
     let n = handshake.write_message(&[], &mut buffer)?;
     debug!(bytes = n, "noise xx msg1");
     let frame = Frame::new(ty::PAIRING_HANDSHAKE, 0x01, buffer[..n].to_vec());
-    client.write_pairing_control(&frame).await?;
+    write_pairing(link, &frame).await?;
     info!("→ msg1 sent ({} bytes)", n);
 
     // ---- msg2 (responder → initiator) ----
-    let raw = timeout(wait_per_step, notifies.next())
+    let raw = timeout(wait_per_step, notifies.recv())
         .await
         .map_err(|_| HandshakeError::Timeout("msg2 notify"))?
         .ok_or(HandshakeError::Timeout("notify stream closed"))?;
@@ -146,7 +155,7 @@ pub async fn run_xx_initiator(
     let n = handshake.write_message(&[], &mut buffer)?;
     debug!(bytes = n, "noise xx msg3");
     let frame = Frame::new(ty::PAIRING_HANDSHAKE, 0x03, buffer[..n].to_vec());
-    client.write_pairing_control(&frame).await?;
+    write_pairing(link, &frame).await?;
     info!("→ msg3 sent ({} bytes)", n);
 
     // Snow advances to transport mode after the third XX message; harvest
@@ -176,7 +185,7 @@ pub async fn run_xx_initiator(
 /// derived PRS. Otherwise returns [`HandshakeError::LocalRejected`] or
 /// [`HandshakeError::PeerRejected`].
 pub async fn run_pairing_initiator<F, Fut>(
-    client: &VortexClient,
+    link: &dyn GattLink,
     static_priv: &X25519SecBytes,
     wait_per_step: Duration,
     decide: F,
@@ -186,14 +195,11 @@ where
     F: FnOnce(&str) -> Fut,
     Fut: std::future::Future<Output = LocalDecision>,
 {
-    // Subscribe to PairingControl notifications BEFORE writing msg1 and
-    // keep the stream alive across XX + approval.
-    let notifies = client
-        .pairing_control
-        .notify()
-        .await
-        .map_err(ClientError::from)?;
-    pin_mut!(notifies);
+    // Subscribe to PairingControl notifications BEFORE writing msg1 and keep
+    // the channel alive across XX + approval — the subscription outlives every
+    // step, so a notification can never land between two of them unheard.
+    let (tx, mut notifies) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    link.subscribe(PAIRING_CONTROL_UUID.as_u128(), tx).await?;
 
     let mut handshake = build_initiator(static_priv)?;
     let mut buffer = vec![0u8; 1024];
@@ -202,11 +208,11 @@ where
     // ---- XX msg1 ----
     let n = handshake.write_message(&[], &mut buffer)?;
     let frame = Frame::new(ty::PAIRING_HANDSHAKE, 0x01, buffer[..n].to_vec());
-    client.write_pairing_control(&frame).await?;
+    write_pairing(link, &frame).await?;
     info!("→ msg1 sent ({} bytes)", n);
 
     // ---- XX msg2 ----
-    let raw = timeout(wait_per_step, notifies.next())
+    let raw = timeout(wait_per_step, notifies.recv())
         .await
         .map_err(|_| HandshakeError::Timeout("msg2 notify"))?
         .ok_or(HandshakeError::Timeout("notify stream closed"))?;
@@ -223,7 +229,7 @@ where
     // ---- XX msg3 ----
     let n = handshake.write_message(&[], &mut buffer)?;
     let frame = Frame::new(ty::PAIRING_HANDSHAKE, 0x03, buffer[..n].to_vec());
-    client.write_pairing_control(&frame).await?;
+    write_pairing(link, &frame).await?;
     info!("→ msg3 sent ({} bytes)", n);
 
     // Harvest XX outputs.
@@ -270,9 +276,11 @@ where
     let mut approval_ct = vec![0u8; approval_plain.len() + 16];
     let approval_ct_len = transport.write_message(&approval_plain, &mut approval_ct)?;
     approval_ct.truncate(approval_ct_len);
-    client
-        .write_pairing_control(&Frame::new(ty::PAIRING_APPROVAL, approval_sub, approval_ct))
-        .await?;
+    write_pairing(
+        link,
+        &Frame::new(ty::PAIRING_APPROVAL, approval_sub, approval_ct),
+    )
+    .await?;
     info!(
         "→ approval sent ({} ct bytes): {}",
         approval_ct_len,
@@ -284,7 +292,7 @@ where
     }
 
     // Wait for peer's approval frame.
-    let raw = timeout(wait_per_step, notifies.next())
+    let raw = timeout(wait_per_step, notifies.recv())
         .await
         .map_err(|_| HandshakeError::Timeout("peer approval"))?
         .ok_or(HandshakeError::Timeout("notify stream closed"))?;
@@ -334,7 +342,7 @@ const PEER_NAME_MAX_CHARS: usize = 64;
 ///   * trim surrounding whitespace.
 ///
 /// Returns an empty string if everything was filtered out.
-pub(crate) fn sanitize_peer_name(input: &str) -> String {
+pub fn sanitize_peer_name(input: &str) -> String {
     let cleaned: String = input
         .chars()
         .filter(|c| {
@@ -394,5 +402,163 @@ mod sanitize_tests {
     #[test]
     fn returns_empty_when_fully_filtered() {
         assert_eq!(sanitize_peer_name("\x00\x01\x02"), "");
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::core::crypto::noise::{NOISE_XX, PROLOGUE_XX};
+    use crate::core::platform::FakeGattLink;
+    use snow::Builder;
+
+    fn uuid() -> crate::core::platform::Uuid128 {
+        PAIRING_CONTROL_UUID.as_u128()
+    }
+
+    fn fake() -> FakeGattLink {
+        FakeGattLink::new(vec![uuid()])
+    }
+
+    /// Wait until the initiator has written `n` frames, then return the last.
+    ///
+    /// Polling rather than a callback because `FakeGattLink` deliberately has
+    /// no notion of "react to a write" — it is a recorder, and the test drives
+    /// the peer side itself.
+    async fn nth_write(fake: &FakeGattLink, n: usize) -> Frame {
+        for _ in 0..200 {
+            {
+                let w = fake.writes.lock().unwrap();
+                if w.len() >= n {
+                    return Frame::decode(&w[n - 1].1).expect("well-formed frame");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("initiator never wrote frame {n}");
+    }
+
+    /// A full XX pairing with dual approval, both sides in one test and no
+    /// radio anywhere: the test plays the phone.
+    ///
+    /// This is the flow that decides whether two devices trust each other
+    /// forever, and until the seam existed it could only be exercised with a
+    /// real phone, a real adapter and a human reading a code off a screen. The
+    /// property that matters most is the one asserted last: BOTH sides derive
+    /// the same SAS, because that is the only thing standing between the user
+    /// and a man in the middle.
+    #[tokio::test]
+    async fn a_full_pairing_completes_and_both_sides_agree_on_the_sas() {
+        let fake = fake();
+        let responder_priv = [0x42u8; 32];
+
+        let phone = async {
+            let mut resp = Builder::new(NOISE_XX.parse().unwrap())
+                .local_private_key(&responder_priv)
+                .unwrap()
+                .prologue(PROLOGUE_XX)
+                .unwrap()
+                .build_responder()
+                .unwrap();
+            let mut scratch = vec![0u8; 1024];
+            let mut out = vec![0u8; 1024];
+
+            // msg1 → msg2
+            let msg1 = nth_write(&fake, 1).await;
+            assert_eq!((msg1.ty, msg1.sub), (ty::PAIRING_HANDSHAKE, 0x01));
+            resp.read_message(&msg1.payload, &mut scratch).unwrap();
+            let n = resp.write_message(&[], &mut out).unwrap();
+            fake.push_notification(
+                uuid(),
+                Frame::new(ty::PAIRING_HANDSHAKE, 0x02, out[..n].to_vec()).encode(),
+            );
+
+            // msg3 completes XX
+            let msg3 = nth_write(&fake, 2).await;
+            assert_eq!((msg3.ty, msg3.sub), (ty::PAIRING_HANDSHAKE, 0x03));
+            resp.read_message(&msg3.payload, &mut scratch).unwrap();
+            let responder_hash = resp.get_handshake_hash().to_vec();
+            let mut transport = resp.into_transport_mode().unwrap();
+
+            // The laptop's APPROVE arrives AEAD-wrapped; a tampered frame
+            // would fail right here, which is the point of wrapping it.
+            let approval = nth_write(&fake, 3).await;
+            assert_eq!(approval.ty, ty::PAIRING_APPROVAL);
+            assert_eq!(approval.sub, 0x01, "approve");
+            let mut pt = vec![0u8; approval.payload.len()];
+            let len = transport.read_message(&approval.payload, &mut pt).unwrap();
+            assert_eq!(&pt[..len], b"test-laptop", "our name, decrypted");
+
+            // Answer with our own approval.
+            let mut ct = vec![0u8; 64];
+            let n = transport.write_message(b"test-phone", &mut ct).unwrap();
+            fake.push_notification(
+                uuid(),
+                Frame::new(ty::PAIRING_APPROVAL, 0x01, ct[..n].to_vec()).encode(),
+            );
+            responder_hash
+        };
+
+        let laptop = run_pairing_initiator(
+            &fake,
+            &[0x11u8; 32],
+            Duration::from_secs(5),
+            |_sas| async { LocalDecision::Approve },
+            Some("test-laptop"),
+        );
+
+        let (outcome, responder_hash) = tokio::join!(laptop, phone);
+        let outcome = outcome.expect("pairing should complete");
+
+        assert_eq!(outcome.peer_name.as_deref(), Some("test-phone"));
+        // The SAS the user compares is derived from the transcript, so both
+        // sides MUST agree — a mismatch is exactly what a MITM produces.
+        assert_eq!(outcome.xx.transcript_hash, responder_hash);
+        let (_, phone_sas) = crate::core::crypto::sas::derive_sas(&responder_hash);
+        assert_eq!(outcome.xx.sas_string, phone_sas);
+        assert_eq!(outcome.xx.sas_string.len(), 6);
+        // PRS comes from the transcript too, and only after both approved.
+        assert_eq!(outcome.prs, crate::core::crypto::derive::derive_prs(&responder_hash));
+    }
+
+    /// A local reject must still TELL the peer, then fail — otherwise the phone
+    /// sits waiting on a pairing the user already refused.
+    #[tokio::test]
+    async fn a_local_reject_sends_a_reject_frame_and_then_fails() {
+        let fake = fake();
+        let phone = async {
+            let mut resp = Builder::new(NOISE_XX.parse().unwrap())
+                .local_private_key(&[0x42u8; 32])
+                .unwrap()
+                .prologue(PROLOGUE_XX)
+                .unwrap()
+                .build_responder()
+                .unwrap();
+            let mut scratch = vec![0u8; 1024];
+            let mut out = vec![0u8; 1024];
+            let msg1 = nth_write(&fake, 1).await;
+            resp.read_message(&msg1.payload, &mut scratch).unwrap();
+            let n = resp.write_message(&[], &mut out).unwrap();
+            fake.push_notification(
+                uuid(),
+                Frame::new(ty::PAIRING_HANDSHAKE, 0x02, out[..n].to_vec()).encode(),
+            );
+            nth_write(&fake, 3).await
+        };
+
+        let laptop = run_pairing_initiator(
+            &fake,
+            &[0x11u8; 32],
+            Duration::from_secs(5),
+            |_sas| async { LocalDecision::Reject },
+            Some("test-laptop"),
+        );
+
+        let (outcome, reject_frame) = tokio::join!(laptop, phone);
+        assert!(matches!(outcome, Err(HandshakeError::LocalRejected)));
+        assert_eq!(reject_frame.ty, ty::PAIRING_APPROVAL);
+        assert_eq!(reject_frame.sub, 0x02, "reject");
+        // No name leaks to a peer we just refused.
+        assert!(reject_frame.payload.len() <= 16, "empty plaintext + AEAD tag");
     }
 }

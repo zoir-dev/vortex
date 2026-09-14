@@ -80,9 +80,7 @@ const WIRELESS_PORT: u16 = 5555;
 static LAST_ADB_PORT: Mutex<Option<u16>> = Mutex::new(None);
 
 fn adb_port_path() -> Option<std::path::PathBuf> {
-    let mut p = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    p.push(".cache/vortex/last_adb_port");
-    Some(p)
+    crate::peer_cache::peer_file("last_adb_port")
 }
 
 /// Note the port a network transport is attached on, in memory and on disk.
@@ -1011,6 +1009,12 @@ pub fn spawn_health_check(armed: impl Fn() -> bool + Send + 'static) {
     });
 }
 
+/// The Bluetooth HID server, when one is registered.
+///
+/// Linux-only: registering a HID profile means owning a BlueZ profile object
+/// over D-Bus. The adb transport above is what carries Universal Control
+/// everywhere else.
+#[cfg(target_os = "linux")]
 static BT_HID: Mutex<Option<vortex_l3_daemon::core::bt_hid::BtHidServer>> = Mutex::new(None);
 
 /// BLE HID (HOGP) — the adb-free transport, and the only one that survives a
@@ -1022,14 +1026,17 @@ static BT_HID: Mutex<Option<vortex_l3_daemon::core::bt_hid::BtHidServer>> = Mute
 /// no developer mode, no `adb tcpip`, and no re-bootstrap after the phone
 /// restarts, which is the single biggest thing standing between a new user and
 /// this feature working.
+#[cfg(target_os = "linux")]
 static HOGP: Mutex<Option<vortex_l3_daemon::core::hogp::HogpServer>> = Mutex::new(None);
 
+#[cfg(target_os = "linux")]
 pub fn set_hogp(server: vortex_l3_daemon::core::hogp::HogpServer) {
     if let Ok(mut g) = HOGP.lock() {
         *g = Some(server);
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn get_hogp() -> Option<vortex_l3_daemon::core::hogp::HogpServer> {
     HOGP.lock().ok().and_then(|g| g.clone())
 }
@@ -1053,6 +1060,11 @@ pub fn hogp_ready() -> bool {
 
 /// Re-read whether a HOGP host is subscribed. Subscription — not the bond and
 /// not the connection — is what means a report will actually be delivered.
+/// No HID-over-GATT server off Linux, so readiness never changes from false.
+#[cfg(not(target_os = "linux"))]
+pub fn refresh_hogp_ready() {}
+
+#[cfg(target_os = "linux")]
 pub fn refresh_hogp_ready() {
     let Some(server) = get_hogp() else {
         HOGP_READY.store(false, Ordering::Relaxed);
@@ -1064,6 +1076,7 @@ pub fn refresh_hogp_ready() {
 }
 
 /// Register the Bluetooth HID server for ADB-free Universal Control fallback.
+#[cfg(target_os = "linux")]
 pub fn set_bt_hid(server: vortex_l3_daemon::core::bt_hid::BtHidServer) {
     if let Ok(mut g) = BT_HID.lock() {
         *g = Some(server);
@@ -1105,6 +1118,8 @@ pub fn active() -> bool {
     if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
         return true;
     }
+    // Classic Bluetooth HID: a BlueZ profile, so Linux only.
+    #[cfg(target_os = "linux")]
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
             if hid.is_connected() {
@@ -1129,6 +1144,11 @@ static LAST_BT_CONNECT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 /// transport that is already unnecessary is how the phone ended up being asked
 /// to connect over and over while the cursor was crossing perfectly well over
 /// Wi-Fi.
+/// Nothing to reach out to: the Bluetooth HID profile is a BlueZ object.
+#[cfg(not(target_os = "linux"))]
+pub fn trigger_bt_connect() {}
+
+#[cfg(target_os = "linux")]
 pub fn trigger_bt_connect() {
     if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
         return; // adb injector is up — the fallback is not needed
@@ -1140,6 +1160,8 @@ pub fn trigger_bt_connect() {
         }
         *last = Some(std::time::Instant::now());
     }
+    // Classic Bluetooth HID: a BlueZ profile, so Linux only.
+    #[cfg(target_os = "linux")]
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
             if !hid.is_connected() {
@@ -1172,6 +1194,8 @@ pub fn has_transport() -> bool {
     if INJECT.lock().map(|g| g.is_some()).unwrap_or(false) {
         return true;
     }
+    // Classic Bluetooth HID: a BlueZ profile, so Linux only.
+    #[cfg(target_os = "linux")]
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
             if hid.is_connected() {
@@ -1201,6 +1225,7 @@ pub fn send(line: &str) {
     // whole state on every report: a move sent while the left button is down
     // must repeat that bit or the phone sees the button release mid-drag.
     if hogp_ready() {
+        #[cfg(target_os = "linux")]
         if let Some(server) = get_hogp() {
             let mut parts = line.trim().split_whitespace();
             let cmd = parts.next().unwrap_or("");
@@ -1245,6 +1270,8 @@ pub fn send(line: &str) {
     }
 
     // Fallback 2: Classic Bluetooth HID report dispatch
+    // Classic Bluetooth HID: a BlueZ profile, so Linux only.
+    #[cfg(target_os = "linux")]
     if let Ok(g) = BT_HID.lock() {
         if let Some(hid) = g.as_ref() {
             let line_str = line.trim();

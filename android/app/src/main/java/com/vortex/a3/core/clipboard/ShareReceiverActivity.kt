@@ -38,7 +38,16 @@ class ShareReceiverActivity : Activity() {
                 val title = intent.getStringExtra(Intent.EXTRA_SUBJECT)
                     ?.takeIf { it.isNotBlank() } ?: ""
                 VortexService.handoffBus.tryEmit(
-                    com.vortex.a3.core.handoff.HandoffEvent(url = url, title = title, openNow = true),
+                    com.vortex.a3.core.handoff.HandoffEvent(
+                        url = url,
+                        title = title,
+                        openNow = true,
+                        // Identifies THIS share so the laptop opens it once, no
+                        // matter how many transports and heartbeats deliver it.
+                        // A fresh id per share is what keeps re-sharing the same
+                        // page working (the laptop dedups on the id, not the URL).
+                        id = java.util.UUID.randomUUID().toString(),
+                    ),
                 )
                 Log.i(TAG, "share: forwarded a page to the laptop")
                 Toast.makeText(this, "Opening on laptop…", Toast.LENGTH_SHORT).show()
@@ -76,28 +85,52 @@ class ShareReceiverActivity : Activity() {
             }
         }
 
-        var sent = 0
-        for (uri in uris) {
-            val file = ClipboardFileReader.read(this, uri)
-            if (file != null) {
-                // `tryEmit` returning false means the buffer was full and this
-                // file went nowhere — which used to happen silently, and then be
-                // counted as sent. Count only what the bus actually took, so the
-                // toast tells the truth.
-                if (VortexService.clipboardFileBus.tryEmit(file)) {
-                    Log.i(TAG, "share: forwarded file '${file.name}' (${file.bytes.size} bytes)")
-                    sent++
-                } else {
-                    Log.w(TAG, "share: bus full, dropped '${file.name}'")
-                }
-            } else {
-                Log.w(TAG, "share: couldn't read $uri")
-            }
+        // Hand the whole list to the service and let it pace itself.
+        //
+        // Deliberately NOT read here: reading every file up front is what made
+        // an 835 MB share an OutOfMemoryError, and what made a 150-file share
+        // lose most of its files to buffer overflow. The service reads each
+        // file on its turn (see ShareQueue), so memory is flat and the batch is
+        // bounded by real delivery instead of a cap that refuses work.
+        //
+        // ClipData + FLAG_GRANT_READ_URI_PERMISSION is what carries the share
+        // sheet's read grant across to the service; plain extras would not.
+        if (uris.isEmpty()) {
+            // Nothing readable in the share and the text path above did not
+            // claim it. `uris.first()` below would throw.
+            Log.w(TAG, "share: no URIs and no text — nothing to do")
+            Toast.makeText(this, "Nothing to send", Toast.LENGTH_SHORT).show()
+            finish()
+            overridePendingTransition(0, 0)
+            return
         }
-        val msg = when {
-            sent == 0 -> "Couldn't read the shared file(s)"
-            sent == 1 -> "Sending file to laptop…"
-            else -> "Sending $sent files to laptop…"
+        val clip = android.content.ClipData.newUri(contentResolver, "vortex-share", uris.first())
+        for (u in uris.drop(1)) clip.addItem(android.content.ClipData.Item(u))
+        val svc = android.content.Intent(this, VortexService::class.java).apply {
+            action = VortexService.ACTION_ENQUEUE_SHARE
+            clipData = clip
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                startForegroundService(svc)
+            } else {
+                startService(svc)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "couldn't hand the share to the service: ${e.message}")
+            Toast.makeText(this, "Couldn't start the transfer", Toast.LENGTH_SHORT).show()
+            finish()
+            overridePendingTransition(0, 0)
+            return
+        }
+        Log.i(TAG, "share: handed ${uris.size} file(s) to the queue")
+        // One toast. Per-file progress is the notification the queue maintains —
+        // a toast per file meant 150 toasts for a 150-file share.
+        val msg = if (uris.size == 1) {
+            "Sending file to laptop…"
+        } else {
+            "Queued ${uris.size} files for the laptop"
         }
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 

@@ -9,8 +9,7 @@ use std::collections::HashMap;
 use secret_service::{EncryptionType, SecretService};
 
 use super::{unlocked_default_collection, IdentityStore, StorageError, StorageResult};
-use crate::core::crypto::x25519::{X25519Pub, X25519Sec, X25519SecBytes};
-use crate::core::identity::{IdentityRecord, Platform, IDENTITY_VERSION};
+use crate::core::identity::IdentityRecord;
 
 const SCHEMA: &str = "com.vortex.identity.v1";
 const LABEL: &str = "Vortex V1 identity";
@@ -59,35 +58,7 @@ fn encode_for_storage(record: &IdentityRecord) -> Vec<u8> {
 }
 
 fn decode_from_storage(bytes: &[u8]) -> StorageResult<IdentityRecord> {
-    if bytes.len() != 90 {
-        return Err(StorageError::Backend(format!(
-            "stored identity has wrong length: {} (expected 90)",
-            bytes.len()
-        )));
-    }
-    let version = bytes[0];
-    if version != IDENTITY_VERSION {
-        return Err(StorageError::Backend(format!(
-            "stored identity has unknown version: {version:#04x}"
-        )));
-    }
-    let mut device_id = [0u8; 16];
-    device_id.copy_from_slice(&bytes[1..17]);
-    let mut static_priv: X25519SecBytes = [0u8; 32];
-    static_priv.copy_from_slice(&bytes[17..49]);
-    let mut static_pub = [0u8; 32];
-    static_pub.copy_from_slice(&bytes[49..81]);
-    let created_at = u64::from_be_bytes(bytes[81..89].try_into().unwrap());
-    let platform = Platform::from_byte(bytes[89])
-        .ok_or_else(|| StorageError::Backend(format!("unknown platform byte: {}", bytes[89])))?;
-    Ok(IdentityRecord {
-        version,
-        device_id,
-        static_priv: X25519Sec(static_priv),
-        static_pub: X25519Pub(static_pub),
-        created_at,
-        platform,
-    })
+    IdentityRecord::decode(bytes).map_err(StorageError::Backend)
 }
 
 impl IdentityStore for SecretServiceIdentityStore {

@@ -101,6 +101,63 @@ class LanServer(
      *  the stack can gate the redundant BLE burst. */
     var onBulkDelivered: (key: String, hash: String) -> Unit = { _, _ -> }
 
+    /**
+     * Serve one filesystem op (FS_REQ 0x50) and return the reply as
+     * `(frame type, payload)`, or null when there is no server wired.
+     *
+     * Wired by VortexStack to the SAME [com.vortex.a3.core.fs.FsServer] the BLE
+     * path uses, deliberately: handles are minted by OPEN and used by later
+     * READs, and the laptop may switch transports between the two — it prefers
+     * Wi-Fi and falls back to Bluetooth on failure. A per-transport handle
+     * table would turn that fallback into a BADF in the middle of a file.
+     */
+    var fsServe: ((op: Byte, payload: ByteArray) -> Pair<Byte, ByteArray>)? = null
+
+    /**
+     * A reply to a filesystem request WE sent, arriving over this socket.
+     *
+     * Needed because a reply does not necessarily come back on the transport
+     * that carried the request: the laptop's client prefers Wi-Fi for FS
+     * traffic, so a request sent over BLE is answered over TCP. Without this
+     * the phone dropped every such reply and its browser sat until the 20 s
+     * timeout, reporting "the laptop did not answer" while the laptop had in
+     * fact answered immediately.
+     */
+    var onFsReply: ((frameType: Byte, payload: ByteArray) -> Unit)? = null
+
+    /**
+     * Writer for the LAN session the laptop is using for filesystem traffic,
+     * or null when there is none open.
+     *
+     * Bound to the connection that has actually carried an FS frame, not to
+     * whichever connection is newest: the laptop also opens short-lived
+     * heartbeat sessions, and publishing one of those would send a request down
+     * a socket about to close.
+     */
+    @Volatile
+    private var fsWriter: ((op: Byte, payload: ByteArray) -> Unit)? = null
+
+    /**
+     * Send one FS_REQ over the live LAN session. False when there is none, so
+     * the caller can fall back to BLE.
+     *
+     * This works because the session is a plain bidirectional socket: the
+     * laptop dials it and serves whatever arrives on it, whichever side asked.
+     * The phone cannot open one itself — the laptop has no listener — so the
+     * first request of a browse still goes over BLE, and the laptop's own reply
+     * is what brings the LAN session up for everything after it.
+     */
+    fun fsSend(op: Byte, payload: ByteArray): Boolean {
+        val w = fsWriter ?: return false
+        return try {
+            w(op, payload)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "fs: LAN send failed (${e.message}); caller falls back")
+            false
+        }
+    }
+
     /** Fired after an instant-share FILE blob has been written to the peer,
      *  with the content token it pulled by. Closes the loop the outgoing-offer
      *  watchdog waits on: an offer is only really done once the laptop has the
@@ -694,6 +751,13 @@ class LanServer(
                     } finally { outLock.unlock() }
                 }
 
+                // Writes an FS_REQ on THIS connection. Published only once an
+                // FS frame has arrived here (below), so it can never be a
+                // heartbeat socket.
+                val fsOut: (Byte, ByteArray) -> Unit = { op, payloadBytes ->
+                    lockedSealAndWrite(FrameType.FS_REQ, op, payloadBytes)
+                }
+
                 val writer: suspend (com.vortex.a3.core.earbuds.AudioOpFrame) -> Result<Unit> =
                     { outFrame ->
                         try {
@@ -837,50 +901,6 @@ class LanServer(
                                     }
                                     continue
                                 }
-                                // Instant-share file pull: serve the stashed blob
-                                // reliably over TCP as CLIPBOARD_FILE chunks.
-                                if (key == "clipboard_file") {
-                                    val token = req.optString(key, "")
-                                    // A stashed blob, or — when the token is a
-                                    // document URI — a file the laptop picked
-                                    // out of a browsed folder. One pull path
-                                    // for both: the transfer, the chunking and
-                                    // the laptop's save are already proven, and
-                                    // a browsed file is not a different kind of
-                                    // file just because it was asked for.
-                                    val blob = com.vortex.a3.core.clipboard.ClipboardBlobStore
-                                        .getByToken(token)
-                                        ?: com.vortex.a3.core.files.PhoneFiles
-                                            .read(context, token)?.bytes
-                                    if (blob == null) {
-                                        Log.i(TAG, "bulk-sync: clipboard_file token=$token not found")
-                                        status.put(key, "nomatch")
-                                    } else {
-                                        // Extends the hot window: the laptop
-                                        // comes back for the NEXT queued file
-                                        // in a fresh round moments from now.
-                                        keepLanHot()
-                                        sendChunked(FrameType.CLIPBOARD_FILE, blob)
-                                        Log.i(TAG, "bulk-sync: clipboard_file sent (${blob.size} bytes)")
-                                        status.put(key, "sent")
-                                        try { onFileServed(token) } catch (e: Exception) {
-                                            Log.w(TAG, "onFileServed listener threw: ${e.message}")
-                                        }
-                                    }
-                                    continue
-                                }
-                                // Folder listing: the value is the document
-                                // URI to look inside, or "" for the roots the
-                                // user has granted.
-                                if (key == "browse") {
-                                    val at = req.optString(key, "")
-                                    val json = com.vortex.a3.core.files.PhoneFiles.list(context, at)
-                                    keepLanHot()
-                                    sendChunked(FrameType.PHONE_FILES, json)
-                                    Log.i(TAG, "bulk-sync: listing sent (${json.size} bytes)")
-                                    status.put(key, "sent")
-                                    continue
-                                }
                                 // Watermark datasets: the value is "everything
                                 // up to <ms>" rather than a content hash.
                                 val historyFrameType = when (key) {
@@ -890,16 +910,23 @@ class LanServer(
                                 }
                                 if (historyFrameType != null) {
                                     val since = req.optString(key, "").toLongOrNull() ?: 0L
-                                    // A denied READ_SMS / READ_CALL_LOG throws here
-                                    // (ContentResolver read). Catch it so ONE missing
-                                    // permission can't kill the whole bulk-sync
-                                    // connection (which left the laptop on stale data
-                                    // with a repeating "early eof"): mark this dataset
-                                    // errored and move on, still reaching the done frame.
+                                    // Any ContentResolver read can throw here — a denied
+                                    // READ_SMS / READ_CALL_LOG, but also a query the
+                                    // provider itself refuses. Catch it so ONE failing
+                                    // dataset can't kill the whole bulk-sync connection
+                                    // (which left the laptop on stale data with a
+                                    // repeating "early eof"): mark this dataset errored
+                                    // and move on, still reaching the done frame.
                                     val json = try {
                                         historyProvider(key, since)
                                     } catch (e: Exception) {
-                                        Log.w(TAG, "bulk-sync: $key history provider threw (permission denied?): ${e.message}")
+                                        // Name the exception class instead of guessing a
+                                        // cause: a denied permission is a
+                                        // SecurityException, a rejected query an
+                                        // IllegalArgumentException. Logging both as
+                                        // "permission denied?" sent us hunting the wrong
+                                        // bug for a sortOrder the provider wouldn't take.
+                                        Log.w(TAG, "bulk-sync: $key history provider threw ${e.javaClass.simpleName}: ${e.message}")
                                         status.put(key, "error")
                                         continue
                                     }
@@ -985,6 +1012,51 @@ class LanServer(
                                 FrameType.BULK_SYNC, 0x02,
                                 status.toString().toByteArray(Charsets.UTF_8),
                             )
+                        }
+                        frame.type == FrameType.FS_META ||
+                            frame.type == FrameType.FS_DATA ||
+                            frame.type == FrameType.FS_ERR -> {
+                            val plain = runCatching {
+                                aeadOpen(pair.receiver, frame.payload)
+                            }.getOrNull()
+                            if (plain == null) {
+                                Log.w(TAG, "fs: reply AEAD decrypt failed")
+                                continue
+                            }
+                            // This socket is demonstrably the laptop's FS
+                            // session, so it is the one to send our own
+                            // requests on — Wi-Fi instead of BLE for everything
+                            // after the first.
+                            fsWriter = fsOut
+                            try {
+                                onFsReply?.invoke(frame.type, plain)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "onFsReply threw: ${e.message}")
+                            }
+                        }
+                        frame.type == FrameType.FS_REQ -> {
+                            // Ranged filesystem op over Wi-Fi. The laptop
+                            // prefers this transport because BLE caps a notify
+                            // at 512 bytes: a 48 KiB read is ~96 paced
+                            // fragments there and a single frame here.
+                            val plain = runCatching {
+                                aeadOpen(pair.receiver, frame.payload)
+                            }.getOrNull()
+                            if (plain == null) {
+                                Log.w(TAG, "fs: AEAD decrypt failed")
+                                continue
+                            }
+                            val serve = fsServe
+                            if (serve == null) {
+                                Log.w(TAG, "fs: no server wired; ignoring op 0x${"%02x".format(frame.sub)}")
+                                continue
+                            }
+                            // Serving touches the disk and runs on this
+                            // connection's thread, which is what we want: it
+                            // serialises the ops on this socket and cannot
+                            // stall any other peer's connection.
+                            val (type, bytes) = serve(frame.sub, plain)
+                            lockedSealAndWrite(type, 0x00, bytes)
                         }
                         frame.type == FrameType.AUDIO_OP -> {
                             // Earbuds-switch frame (Phase 1). AEAD-decrypt
@@ -1133,6 +1205,10 @@ class LanServer(
                     // its writer.
                     com.vortex.a3.core.earbuds.EarbudsSwitchHolder
                         .clearSessionWriter(peerPubFinal, writer)
+                    // Same CAS discipline: only clear the FS slot if this
+                    // connection still owns it, or we would strip a newer
+                    // session of its writer on our way out.
+                    if (fsWriter === fsOut) fsWriter = null
                 }
             }
         } catch (e: Exception) {

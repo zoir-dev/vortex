@@ -2,15 +2,15 @@
 
 use std::time::Duration;
 
-use futures::{pin_mut, StreamExt};
 use rand::RngCore;
 use snow::{params::NoiseParams, Builder, HandshakeState, TransportState};
 use tokio::time::timeout;
 use tracing::info;
 
-use crate::core::ble::client::{ClientError, VortexClient};
 use crate::core::ble::frame::{ty, Frame, FrameDecodeError};
-use crate::core::crypto::noise::{NOISE_IK, PROLOGUE_IK};
+use crate::core::ble::RECONNECT_CONTROL_UUID;
+use crate::core::platform::GattLink;
+use crate::core::crypto::noise::NOISE_IK;
 use crate::core::crypto::x25519::X25519SecBytes;
 
 #[derive(Debug)]
@@ -34,7 +34,10 @@ pub struct ReconnectOutcome {
 #[derive(Debug)]
 pub enum ReconnectError {
     Snow(snow::Error),
-    Client(ClientError),
+    /// The GATT link failed the read, write or subscribe. A `String` because
+    /// [`GattLink`] is the seam: BlueZ and WinRT have nothing in common to
+    /// name here, and every caller only logs it.
+    Link(String),
     Timeout(&'static str),
     UnexpectedFrame { ty: u8, sub: u8 },
     FrameDecode(FrameDecodeError),
@@ -47,7 +50,7 @@ impl std::fmt::Display for ReconnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Snow(e) => write!(f, "noise: {e}"),
-            Self::Client(e) => write!(f, "ble client: {e}"),
+            Self::Link(e) => write!(f, "gatt link: {e}"),
             Self::Timeout(what) => write!(f, "timeout: {what}"),
             Self::UnexpectedFrame { ty, sub } => {
                 write!(f, "unexpected frame type=0x{ty:02x} sub=0x{sub:02x}")
@@ -68,10 +71,17 @@ impl From<snow::Error> for ReconnectError {
     }
 }
 
-impl From<ClientError> for ReconnectError {
-    fn from(e: ClientError) -> Self {
-        Self::Client(e)
+impl From<String> for ReconnectError {
+    fn from(e: String) -> Self {
+        Self::Link(e)
     }
+}
+
+/// One frame to Reconnect Control, unacknowledged (§9.1).
+async fn write_reconnect(link: &dyn GattLink, frame: &Frame) -> Result<(), ReconnectError> {
+    link.write(RECONNECT_CONTROL_UUID.as_u128(), &frame.encode(), false)
+        .await
+        .map_err(ReconnectError::Link)
 }
 
 fn build_ik_initiator(
@@ -83,27 +93,12 @@ fn build_ik_initiator(
     Builder::new(params)
         .local_private_key(static_priv)?
         .remote_public_key(peer_static_pub)?
-        .prologue(&prologue_with_prs(prs))?
+        .prologue(&crate::core::crypto::noise::prologue_with_prs(prs))?
         .build_initiator()
 }
 
-/// Build the IK prologue with the Pairwise Reconnect Secret mixed in.
-///
-/// We extend the base prologue with the 32-byte PRS so that any wrong-
-/// PRS attempt by an attacker who has compromised only the long-term
-/// static private key fails AEAD verification on msg1's `s` decryption.
-/// This achieves the same security goal as Noise_IKpsk2_... — binding
-/// reconnect to BOTH static keys AND the prior pairing transcript —
-/// without requiring a Noise pattern that the Android-side library
-/// does not yet implement.
-pub(crate) fn prologue_with_prs(prs: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PROLOGUE_IK.len() + 32);
-    out.extend_from_slice(PROLOGUE_IK);
-    out.extend_from_slice(prs);
-    out
-}
 
-/// Run Noise IK against `client`'s peer using the local static identity,
+/// Run Noise IK against the peer on `link`, using the local static identity,
 /// the trusted peer's static public key, and the Pairwise Reconnect
 /// Secret (mixed into the handshake prologue).
 ///
@@ -115,20 +110,18 @@ pub(crate) fn prologue_with_prs(prs: &[u8; 32]) -> Vec<u8> {
 /// On success, the initiator follows up with a ping/pong liveness probe
 /// (frame `0x30/0x01` → `0x30/0x02`) before returning.
 pub async fn run_ik_initiator(
-    client: &VortexClient,
+    link: &dyn GattLink,
     static_priv: &X25519SecBytes,
     peer_static_pub: &[u8; 32],
     prs: &[u8; 32],
     local_counter: u64,
     wait_per_step: Duration,
 ) -> Result<ReconnectOutcome, ReconnectError> {
-    // Subscribe to Reconnect Control notifications BEFORE sending msg1.
-    let notifies = client
-        .reconnect_control
-        .notify()
-        .await
-        .map_err(ClientError::from)?;
-    pin_mut!(notifies);
+    // Subscribe to Reconnect Control notifications BEFORE sending msg1: the
+    // phone answers the moment it sees the write, and a notification that
+    // arrives before we are listening is simply gone.
+    let (tx, mut notifies) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    link.subscribe(RECONNECT_CONTROL_UUID.as_u128(), tx).await?;
 
     let mut handshake = build_ik_initiator(static_priv, peer_static_pub, prs)?;
     let mut buffer = vec![0u8; 1024];
@@ -140,11 +133,15 @@ pub async fn run_ik_initiator(
     let counter_bytes = local_counter.to_be_bytes();
     let n = handshake.write_message(&counter_bytes, &mut buffer)?;
     let frame = Frame::new(ty::RECONNECT_HANDSHAKE, 0x01, buffer[..n].to_vec());
-    client.write_reconnect_control(&frame).await?;
+    // Write WITHOUT response throughout, per §9.1: the flow is driven by the
+    // notification each write provokes, so an ATT ack adds a round trip and no
+    // reliability. `write_reconnect_control` used to encode that choice; now
+    // the `false` does.
+    write_reconnect(link, &frame).await?;
     info!("→ IK msg1 sent ({} bytes, counter={local_counter})", n);
 
     // ---- IK msg2 ----
-    let raw = timeout(wait_per_step, notifies.next())
+    let raw = timeout(wait_per_step, notifies.recv())
         .await
         .map_err(|_| ReconnectError::Timeout("msg2 notify"))?
         .ok_or(ReconnectError::Timeout("notify stream closed"))?;
@@ -185,10 +182,10 @@ pub async fn run_ik_initiator(
     let mut nonce = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let ping = Frame::new(ty::TRANSPORT_KEEPALIVE, 0x01, nonce.to_vec());
-    client.write_reconnect_control(&ping).await?;
+    write_reconnect(link, &ping).await?;
     info!("→ ping ({})", hex::encode(nonce));
 
-    let raw = timeout(wait_per_step, notifies.next())
+    let raw = timeout(wait_per_step, notifies.recv())
         .await
         .map_err(|_| ReconnectError::Timeout("pong"))?
         .ok_or(ReconnectError::Timeout("notify stream closed"))?;
@@ -211,4 +208,98 @@ pub async fn run_ik_initiator(
         peer_counter,
         transport: Some(transport),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::platform::FakeGattLink;
+
+    fn link() -> FakeGattLink {
+        FakeGattLink::new(vec![RECONNECT_CONTROL_UUID.as_u128()])
+    }
+
+    /// What IK msg1 must look like on the wire, without a phone in the room.
+    ///
+    /// This is the first test of this flow that has ever been possible: before
+    /// the seam it needed a BlueZ adapter and a real peer, so the frame type,
+    /// the characteristic and the write mode were only ever verified by the
+    /// handshake working end to end.
+    #[tokio::test]
+    async fn msg1_goes_out_unacknowledged_on_reconnect_control() {
+        let fake = link();
+        let err = run_ik_initiator(
+            &fake,
+            &[7u8; 32],
+            &[9u8; 32],
+            &[3u8; 32],
+            42,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("no peer answers, so this must time out");
+        assert!(matches!(err, ReconnectError::Timeout("msg2 notify")), "{err}");
+
+        let writes = fake.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "exactly msg1, nothing speculative");
+        let (uuid, bytes, with_response) = &writes[0];
+        assert_eq!(*uuid, RECONNECT_CONTROL_UUID.as_u128());
+        assert!(!with_response, "§9.1: unacknowledged writes");
+
+        let frame = Frame::decode(bytes).expect("a well-formed frame");
+        assert_eq!(frame.ty, ty::RECONNECT_HANDSHAKE);
+        assert_eq!(frame.sub, 0x01);
+        // Noise IK msg1 is e (32) + encrypted s (32+16) + encrypted payload
+        // (8-byte counter + 16 tag): a fixed 104 bytes for our pattern. A
+        // change here means the wire format moved.
+        assert_eq!(frame.payload.len(), 104);
+    }
+
+    /// A frame that isn't msg2 must be rejected by type, not misparsed. The
+    /// peer is unauthenticated at this point, so this is the boundary where a
+    /// stray or hostile notification gets turned away.
+    #[tokio::test]
+    async fn a_wrong_frame_type_is_rejected_rather_than_decrypted() {
+        let fake = link();
+        let uuid = RECONNECT_CONTROL_UUID.as_u128();
+        let driver = async {
+            // Give the initiator a moment to subscribe and send msg1.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            fake.push_notification(uuid, Frame::new(ty::PAIRING_HANDSHAKE, 0x02, vec![0; 48]).encode());
+        };
+        let run = run_ik_initiator(
+            &fake,
+            &[7u8; 32],
+            &[9u8; 32],
+            &[3u8; 32],
+            0,
+            Duration::from_millis(200),
+        );
+        let (outcome, ()) = tokio::join!(run, driver);
+        match outcome.expect_err("must not accept a foreign frame") {
+            ReconnectError::UnexpectedFrame { ty, sub } => {
+                assert_eq!((ty, sub), (crate::core::ble::frame::ty::PAIRING_HANDSHAKE, 0x02));
+            }
+            other => panic!("expected UnexpectedFrame, got {other}"),
+        }
+    }
+
+    /// A link that can't carry the write fails the handshake with the reason,
+    /// rather than hanging until the step timeout.
+    #[tokio::test]
+    async fn a_dead_link_fails_fast_with_its_own_error() {
+        // Nothing present → subscribe itself fails.
+        let fake = FakeGattLink::new(vec![]);
+        let err = run_ik_initiator(
+            &fake,
+            &[7u8; 32],
+            &[9u8; 32],
+            &[3u8; 32],
+            0,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a link with no characteristic cannot handshake");
+        assert!(matches!(err, ReconnectError::Link(_)), "{err}");
+    }
 }

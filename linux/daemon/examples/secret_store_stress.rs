@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vortex_l3_daemon::core::storage::peers::{PeerStore, SecretServicePeerStore};
+use vortex_l3_daemon::core::storage::peers::PeerStore;
+use vortex_l3_daemon::core::storage::peers_secret_service::SecretServicePeerStore;
 
 const FAKE_PEER: [u8; 32] = [0xEE; 32];
 const BURST_TASKS: u64 = 32;

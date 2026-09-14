@@ -8,8 +8,26 @@ use std::io::Write;
 use std::path::PathBuf;
 
 fn bridge_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/share/vortex/voice/lang"))
+    // Linux keeps its exact path: this file is a BRIDGE, read by the voice
+    // assistant scripts outside this process, so moving it would break a
+    // consumer that knows nothing about the seam. Same reasoning as
+    // `file_consent::flag_path`.
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".local/share/vortex/voice/lang"))
+    }
+    // Everywhere else, through the seam. `$HOME` is unset on Windows, so this
+    // resolved to `None` and the language could be neither read nor written.
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(
+            vortex_l3_daemon::core::platform::paths()
+                .config()?
+                .join("voice")
+                .join("lang"),
+        )
+    }
 }
 
 /// Persist the active language (en/ru/uz) for the voice assistant. Written

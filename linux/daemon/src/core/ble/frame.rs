@@ -14,6 +14,25 @@
 /// Header size in bytes.
 pub const FRAME_HEADER_LEN: usize = 4;
 
+/// An additive feature frame, opened and forwarded to whichever module owns it.
+///
+/// A named struct rather than a tuple because `sub` had to be threaded through
+/// for the filesystem ops (`FS_REQ` carries its op there), and a signature with
+/// two adjacent `u8`s is a transposition waiting to happen — `(ty, sub)` and
+/// `(sub, ty)` both compile and only one is right.
+///
+/// `peer_pub` is part of it because a frame's meaning can depend on WHO sent
+/// it: `PEER_HANDOFF` says "you are no longer my active peer", which is
+/// unactionable without knowing whose statement it is, and an `FS_REQ` handle
+/// belongs to one peer's table and not another's.
+#[derive(Debug, Clone)]
+pub struct RawFrame {
+    pub peer_pub: [u8; 32],
+    pub ty: u8,
+    pub sub: u8,
+    pub payload: Vec<u8>,
+}
+
 /// Per spec §11. Larger frames are a `bad-frame` error. Sized to admit a
 /// 48 KiB LAN file-transfer chunk + AEAD tag (BLE notifies stay MTU-small
 /// regardless; the `length` field is u16 so the hard ceiling is 65535).
@@ -184,6 +203,46 @@ pub mod ty {
     pub const PHONE_FILES: u8 = 0x4F;
 
     pub const FRAG: u8 = 0x4E;
+    /// Session-ownership handoff (design doc §D4). A device may TRUST many
+    /// peers but is ACTIVE with exactly one; this frame is how the two sides
+    /// agree which. `sub` carries the kind ([`sub::HANDOFF_RELEASE`] etc.) and
+    /// the AEAD payload an optional UTF-8 successor name for the UI (peer-
+    /// supplied, so sanitise before display).
+    ///
+    /// Additive by design: both sides log-and-ignore an unknown frame type, so
+    /// a peer without this build is unaffected. Mirrors Kotlin
+    /// `FrameType.PEER_HANDOFF`.
+    // 0x54, not 0x4F: upstream took 0x4F for PHONE_FILES while this was on a
+    // branch, and two meanings for one type byte is a protocol that cannot be
+    // read. This one moved because it is the one that has never shipped —
+    // nothing but these two repositories has ever sent it. Sits just past the
+    // FS block below, keeping this branch's additions contiguous.
+    pub const PEER_HANDOFF: u8 = 0x54;
+    /// Ranged-filesystem request. `sub` carries the op (`core::fs_proto::op`),
+    /// the payload a JSON request — plus a binary byte tail for `WRITE`.
+    ///
+    /// **Bidirectional and symmetric**: both peers serve these and both send
+    /// them. The laptop browses the phone's storage with the same frames the
+    /// phone browses the laptop's, so neither the frame nor its handler names a
+    /// side. See `docs/design/file-browsing.md`.
+    ///
+    /// Additive: an unknown frame type is logged and ignored on both sides, so
+    /// a peer without this build simply never answers and the requester times
+    /// out. Mirrors Kotlin `FrameType.FS_REQ`.
+    pub const FS_REQ: u8 = 0x50;
+    /// Successful non-data reply to an `FS_REQ` — directory page, stat, open
+    /// result or write ack. Carries `core::fs_proto::FsReply` JSON. Mirrors
+    /// Kotlin `FrameType.FS_META`.
+    pub const FS_META: u8 = 0x51;
+    /// Read result: `[id u32 BE][offset u64 BE][flags u8][bytes]`. Binary
+    /// rather than JSON because base64 would cost 33% on the hottest path in
+    /// the protocol. Mirrors Kotlin `FrameType.FS_DATA`.
+    pub const FS_DATA: u8 = 0x52;
+    /// A definite failure for one request id (`core::fs_proto::FsErr` JSON).
+    /// Every failing op answers with one: a file manager blocked on a read
+    /// that will never be answered is the worst outcome in this feature, so
+    /// silence is never a valid response. Mirrors Kotlin `FrameType.FS_ERR`.
+    pub const FS_ERR: u8 = 0x53;
     pub const ERROR: u8 = 0x7F;
 }
 
@@ -193,6 +252,18 @@ pub mod sub {
     pub const PONG: u8 = 0x02;
     pub const ECHO_REQUEST: u8 = 0x01;
     pub const ECHO_RESPONSE: u8 = 0x02;
+    /// `PEER_HANDOFF` kinds. Mirror Kotlin `FrameSub.HANDOFF_*`.
+    ///
+    /// RELEASE: "you are no longer my active peer" — sent by the side handing
+    /// ownership over, so the receiver stops presenting itself as connected
+    /// instead of discovering it on the next contact.
+    pub const HANDOFF_RELEASE: u8 = 0x01;
+    /// BUSY: refused, another peer is already active. Explicit so a rejected
+    /// peer can back off; silence is indistinguishable from packet loss and
+    /// invites a retry loop against the phone's single GATT link.
+    pub const HANDOFF_BUSY: u8 = 0x02;
+    /// CLAIM: request to become the active peer.
+    pub const HANDOFF_CLAIM: u8 = 0x03;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -663,7 +663,7 @@ async fn start_extend(phone_ip: std::net::IpAddr, key: [u8; 32]) -> Result<(), S
             // generous because the cast itself is the traffic keeping contact
             // fresh; going this long without a single frame from the phone means
             // it is gone, not slow.
-            if crate::ble::peer_contact_age_ms() > PEER_LOST_MS {
+            if crate::presence::peer_contact_age_ms() > PEER_LOST_MS {
                 tracing::info!(
                     "laptop-cast: no contact with the phone for over {}s — tearing down \
                      (a virtual monitor must never outlive the device it exists for)",

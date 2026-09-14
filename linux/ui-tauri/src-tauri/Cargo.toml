@@ -23,21 +23,52 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# DO NOT REMOVE. `tauri`'s own build script derives `dev = !custom-protocol`,
+# so a build without this feature loads the UI from `devUrl` — a dev server
+# that is not running in a shipped binary — and the window shows
+# ERR_CONNECTION_REFUSED instead of the app.
+#
+# `npm run tauri build` (what install_linux.sh uses) enables it for you, which
+# is why the Linux flow never hit this. A bare `cargo build --release` does not,
+# and note that `--features tauri/custom-protocol` on the command line is a
+# SILENT NO-OP: that syntax only addresses workspace members, so the feature has
+# to be forwarded here. Build a standalone binary with:
+#
+#   cargo build --release --features custom-protocol
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Name every feature we use. `net` (the LAN fast-path probe in lan.rs) and
+# `process` (pactl / loginctl / xdg-open helpers) were arriving via bluer and
+# zbus through Cargo's feature unification — which stops the moment those move
+# behind a target gate below, exactly as it did in the daemon crate.
+#
 # `signal` is for the shutdown hook: Tauri's RunEvent::Exit covers a tray quit,
 # but a session logout or a `systemctl` stop sends SIGTERM, which kills the
 # process without it — and that is the path that leaves the BLE link dangling.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "process",
+    "signal",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
+# Cross-platform interface addresses + netmasks (getifaddrs / GetAdaptersAddresses)
+# — the Wi-Fi Direct "are we already on the same LAN" test must work on the
+# Windows port too. Already in the lockfile transitively.
+if-addrs = "0.13"
 # Bulk-sync hash gate: sha256 of the cached mirror JSON (matches the
 # phone's hash of the same bytes).
 sha2 = "0.10"
-bluer = { version = "0.17", features = ["bluetoothd"] }
 futures = "0.3"
 # In-process folder zipping for "Share via Vortex" (no system `zip` binary).
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -55,8 +86,30 @@ tauri-plugin-single-instance = "2"
 # value while `wl-paste` reported the truth, so laptop→phone clipboard sync only
 # fired on the rare copy the bridge happened to carry across. With the feature,
 # arboard talks wlr-data-control directly and tracks every change; X11 stays the
-# fallback when there is no Wayland display.
+# fallback when there is no Wayland display. Stays in the shared section — the
+# clipboard is a feature on every platform; the feature is safe on Windows
+# because arboard gates `wl-clipboard-rs` to unix itself.
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+image = { version = "0.25.6", default-features = false, features = ["png", "ico", "jpeg", "gif"] }
+# Fresh random per-cast media key for the laptop→phone screen stream.
+rand = "0.8"
+
+# ── Linux-bound dependencies ──────────────────────────────────────────────
+# Each of these is one OS's API surface: BlueZ, X11, D-Bus, the XDG portals,
+# libei, and the GTK3 window that hosts the mirror's gtksink. Target-gating
+# them is what lets a Windows build resolve at all — several have no Windows
+# build and one (glib-sys, via gtk) fails in its build script looking for
+# pkg-config, before any Vortex code is compiled.
+#
+# The code that uses them still needs `cfg(target_os = "linux")` on the way to
+# a Windows build; this manifest change is what turns the build-script failure
+# into a list of those places.
+#
+# GStreamer is the arguable one: it does build on Windows, but the mirror
+# pipeline here is Wayland/PipeWire-shaped and ends in a GTK widget, so it is
+# gated with the rest rather than half-ported.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
 # Already in the tree via arboard — used here to probe the CLIPBOARD selection's
 # `x-kde-passwordManagerHint` target so password-manager copies aren't synced.
 x11rb = "0.13"
@@ -65,7 +118,6 @@ x11rb = "0.13"
 # reads: once that is the Wayland one, an X11-only probe reads a stale selection
 # and would report "not secret" for a password copy it simply cannot see.
 wl-clipboard-rs = "0.9"
-image = { version = "0.25.6", default-features = false, features = ["png", "ico", "jpeg", "gif"] }
 # Screen mirroring (laptop receiver): decode the phone's sealed H.264 stream
 # into a native window. Links against the system GStreamer (1.20+).
 gstreamer = "0.23"
@@ -84,6 +136,32 @@ reis = { version = "0.3", features = ["tokio"] }
 # Universal Control cursor-hide: own org.vortex.UniversalControl (CursorHidden)
 # so the GNOME extension can inhibit the laptop pointer while captured.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-# Fresh random per-cast media key for the laptop→phone screen stream.
-rand = "0.8"
+# The tray, spoken as StatusNotifierItem. Linux-only by nature, which is why
+# it lives here and not above.
 ksni = "0.3"
+# The phone's storage as a real mount (`fs_mount`). Default features are empty
+# on purpose: with `libfuse` this would need libfuse3 headers and pkg-config at
+# BUILD time, which every packaging target would then have to carry. Without
+# it, fuser mounts through the kernel directly and falls back to the setuid
+# `fusermount3` binary — a runtime dependency already present anywhere FUSE
+# works at all.
+fuser = { version = "0.18", default-features = false }
+
+
+# ── Windows-bound dependencies ────────────────────────────────────────────
+# The mount adapter there is ProjFS (design doc §8 step 6) — a Win32 API with
+# no Linux counterpart, the way FUSE has no Windows one. Feature-gated per
+# namespace so we pull metadata for what we actually call: the ProjFS entry
+# points themselves, the FILE_ATTRIBUTE_* bits a placeholder carries, and the
+# ERROR_* codes the callbacks answer with.
+#
+# Same major version the daemon crate already pins, so the two do not resolve
+# two copies of the metadata into one build.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_ProjectedFileSystem",
+    # The Explorer context-menu verb ("Share via Vortex"), written under HKCU.
+    "Win32_System_Registry",
+] }

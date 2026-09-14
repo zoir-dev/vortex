@@ -10,6 +10,14 @@
 //! this file is just the composition root: module declarations, the
 //! cross-cutting statics, the re-export block, and `run()`.
 
+// A port in progress: on Windows the Linux-only paths are gated out, which
+// leaves ~110 helpers, constants and statics unreachable there. They are all
+// still live on Linux, so deleting or per-item-gating them would be churn that
+// has to be undone as the Windows side fills in. Silence them as a group
+// instead, and REMOVE this once the port stops moving — otherwise it hides
+// genuinely dead Windows code.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_variables, unused_imports))]
+
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,11 +28,41 @@ use tokio::sync::oneshot;
 use vortex_l3_daemon::core::pairing::handshake::LocalDecision;
 
 mod applog;
+// The BLE transport and everything that drives it. Gated together with the
+// persistent loop in `worker`: `BleCentral`/`GattLink` make the protocol side
+// portable, but this orchestration is still BlueZ-shaped. See the TODO at the
+// loop's spawn site.
+#[cfg(target_os = "linux")]
 mod ble;
+// The same link, over the seam. Used where there is no BlueZ loop.
+#[cfg(not(target_os = "linux"))]
+mod ble_portable;
 mod call;
 mod call_log;
+// ── Linux-only subsystems ─────────────────────────────────────────────────
+// Screen mirror / cast / camera (GStreamer + GTK3 + the ScreenCast portal) and
+// the earbuds audio hand-off (PulseAudio + BlueZ) have no Windows
+// implementation. Gated as whole modules rather than cfg'd internally: there is
+// no partial version of "decode H.264 into a GTK widget", and pretending
+// otherwise would leave a Windows build full of functions that always error.
+//
+// The features simply do not exist on Windows for now. Everything else — pair,
+// reconnect, notifications, clipboard, file transfer, Universal Control — does.
+#[cfg(target_os = "linux")]
 mod camera;
 mod capture_ledger;
+// Elsewhere, the same command names resolve to the "unsupported" module, so the
+// `generate_handler!` list below stays single-sourced.
+#[cfg(not(target_os = "linux"))]
+mod platform_unsupported;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as camera;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as proximity;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as earbuds;
+#[cfg(not(target_os = "linux"))]
+use platform_unsupported as laptop_cast;
 mod clipboard;
 mod clipboard_hotkey;
 mod clipboard_window;
@@ -34,39 +72,81 @@ mod transfers;
 mod transfers_out;
 mod worker_transfers;
 mod worker_ctx;
+// Available everywhere: ForgetPeer / ForgetAll need no radio — they are a trust
+// store delete, a cache purge and a LAN revoke, all of which work on any
+// platform. Only Scan and Pair inside it are Linux-gated, since those two are
+// the ones that hold a BlueZ adapter.
 mod cmd_pairing;
+#[cfg(target_os = "linux")]
 mod cmd_earbuds;
 mod send_to_phone;
 mod share;
 mod file_consent;
+mod fs_cli;
+mod fs_lan;
+// The phone's storage as a real filesystem. `fs_mount` is the facade and
+// `fs_vfs` the OS-independent half; the adapter under them is per-OS — FUSE on
+// Linux, ProjFS on Windows (design doc §8 step 6).
+mod fs_mount;
+mod fs_vfs;
+#[cfg(target_os = "linux")]
+mod fs_fuse;
+#[cfg(target_os = "windows")]
+mod fs_projfs;
+mod fs_pull;
 mod contacts;
 mod desktop_apps;
 mod diagnostics;
 mod dnd;
 mod first_run;
+#[cfg(target_os = "linux")]
 mod earbuds;
 mod handoff;
 mod ipc;
 mod lan;
+#[cfg(target_os = "linux")]
 mod laptop_cast;
 mod lan_wifi_direct;
 mod lan_state;
 mod live_activity;
 mod media_remote;
+#[cfg(target_os = "linux")]
 mod mirror;
+mod arbiter;
+// NOT gated with the rest of the mirror: this is the laptop→phone injection
+// path — an adb-forwarded socket to a uinput helper ON THE PHONE. Pure std plus
+// `adb`, no GStreamer and no GTK, and Universal Control sends through it too.
 mod mirror_inject;
+mod peer_cache;
+mod peer_handoff;
+/// The laptop's end of the ranged-filesystem protocol (serves and consumes).
+mod fs_link;
+#[cfg(target_os = "linux")]
 mod mirror_window;
 mod notes;
 mod notifications;
+mod notify;
+mod presence;
 mod pairing;
+#[cfg(target_os = "linux")]
 mod proximity;
 mod ring;
 mod sms;
 mod tray;
+// The two tray implementations behind it — see `tray.rs` for why there are two.
+#[cfg(target_os = "linux")]
+mod tray_ksni;
+#[cfg(not(target_os = "linux"))]
+mod tray_tauri;
 mod universal_control;
+#[cfg(target_os = "linux")]
 mod virtual_display;
 mod voice_settings;
 mod window;
+// Explorer's "Share via Vortex", the counterpart of the Nautilus extension and
+// Dolphin ServiceMenu that install_linux.sh writes.
+#[cfg(target_os = "windows")]
+mod win_shell;
 mod worker;
 mod x11_focus;
 
@@ -80,11 +160,16 @@ pub(crate) use clipboard_sync::{ClipboardImageWriter, ClipboardWriter};
 pub(crate) use ipc::{app_state_to_dto, emit_peers, CmdChannel, UiCmd};
 pub(crate) use notifications::{NotifWriter, ACTIVE_CHAT};
 
-/// Generic laptop→phone sealed-frame writer: `(frame_ty, payload)` → an AEAD-
-/// sealed BLE frame. The BLE persistent loop fills the holder on connect; any
-/// feature (e.g. notes) sends through it without its own transport plumbing.
+/// Generic laptop→phone sealed-frame writer: `(frame_ty, sub, payload)` → an
+/// AEAD-sealed BLE frame. The BLE persistent loop fills the holder on connect;
+/// any feature (e.g. notes) sends through it without its own transport plumbing.
+///
+/// `sub` is exposed because the filesystem ops carry their op there — it has
+/// always been in the wire format, this writer just used to hardcode it to 0.
+/// Pass 0 for frame types that do not use it.
 pub(crate) type SealedWriter = Arc<
     dyn Fn(
+            u8,
             u8,
             Vec<u8>,
         )
@@ -99,6 +184,11 @@ pub(crate) type SealedWriter = Arc<
 /// itself lives inside the worker task; this is just a handle to its
 /// AtomicBool. `OnceLock` because it's set exactly once and read-only
 /// thereafter (the AtomicBool inside is what mutates).
+/// Linux-only: the watcher is MPRIS, so there is nothing to hold a handle to
+/// elsewhere. Its readers are the earbuds module (gated with it) and the
+/// smart-switch setting adopted from the phone's heartbeat, which skips the
+/// adoption rather than inventing a local value.
+#[cfg(target_os = "linux")]
 pub(crate) static MEDIA_WATCH: std::sync::OnceLock<
     Arc<vortex_l3_daemon::core::media_watch::MediaWatch>,
 > = std::sync::OnceLock::new();
@@ -116,6 +206,20 @@ pub(crate) static SYNC_NUDGE: std::sync::OnceLock<Arc<tokio::sync::Notify>> =
 /// passive monitor / its scan backoff.
 pub(crate) static BLE_RETRY_NUDGE: std::sync::OnceLock<Arc<tokio::sync::Notify>> =
     std::sync::OnceLock::new();
+
+/// The BLE session's generic sealed-frame writer, published so command
+/// handlers outside the BLE loop can send a frame to the CURRENTLY CONNECTED
+/// peer.
+///
+/// Deliberately "the connected peer", not an arbitrary one: it is a handle on
+/// the live session's cipher state. That is exactly what
+/// `PeerHandoff.RELEASE` needs — at the moment a switch is confirmed the live
+/// link is still the peer being displaced (we have not connected to the
+/// replacement yet), so this reaches the right device. If that ordering ever
+/// changes, the RELEASE send in cmd_pairing has to change with it.
+pub(crate) static BLE_SEALED_WRITER: std::sync::OnceLock<
+    Arc<tokio::sync::Mutex<Option<SealedWriter>>>,
+> = std::sync::OnceLock::new();
 
 /// Token of a phone-shared clipboard image waiting to be pulled over LAN.
 /// Set by the BLE image-offer consumer (which also nudges the heartbeat),
@@ -154,6 +258,141 @@ pub(crate) struct PairDecisionState(pub(crate) Mutex<Option<oneshot::Sender<Loca
 // Tauri entrypoint
 // --------------------------------------------------------------------------
 
+/// `RUST_LOG` if set, else `info`.
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// Tee log lines to stderr AND the log file.
+///
+/// stderr is best-effort on purpose: a Windows GUI binary has none, and a
+/// desktop-launched Linux app has it pointed at `/dev/null`. A failed write
+/// there must never cost us the line in the file.
+struct Tee(std::fs::File);
+
+impl std::io::Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), buf);
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        self.0.flush()
+    }
+}
+
+/// Start logging to a FILE — on every platform — while still writing stderr for
+/// whoever is watching a terminal.
+///
+/// A file is not a Windows nicety. Neither platform reliably has a console:
+/// a Windows GUI binary has none at all, and on Linux the app is started from a
+/// `.desktop` autostart entry, which sends stdout and stderr to `/dev/null`. So
+/// the installed Linux app kept no record of anything, and every diagnosis
+/// began by asking someone to kill it and relaunch it by hand with `RUST_LOG`
+/// set — which loses exactly the run that misbehaved. (The doc comment this
+/// replaces claimed the journal picked it up; that is only true under a systemd
+/// user unit, which is not how this is installed.)
+///
+/// `~/.cache/vortex/vortex.log`, or `%LOCALAPPDATA%\Vortex\vortex.log`, with
+/// the previous run kept as `vortex.log.1` — one restart of history, because
+/// the interesting run is often the one before the one you thought to look at.
+/// Falls back to stderr alone if the file cannot be opened, which is no worse
+/// than before.
+fn init_logging() {
+    use std::io::Write;
+
+    // A launch WITH arguments is a forwarder: single-instance hands the argv to
+    // the already-running app and this process exits seconds later. It must not
+    // touch the log file, because rolling it aside pulls the running app's file
+    // out from under its open handle — after two such invocations the real
+    // app's output is going to an unlinked inode nobody can read. Found the
+    // hard way: two `--fs-ls` runs in a row destroyed the very log they were
+    // supposed to be inspected in.
+    //
+    // The cost is that a FIRST launch carrying arguments keeps no file log for
+    // that session. That is the rare case (autostart and the desktop entry both
+    // launch bare) and it is recoverable by restarting, whereas losing the
+    // running app's log is not.
+    let forwarding = std::env::args().len() > 1;
+    let path = vortex_l3_daemon::core::platform::paths()
+        .logs()
+        .filter(|_| !forwarding)
+        .map(|dir| {
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("vortex.log")
+        });
+
+    let file = path.as_ref().and_then(|p| {
+        // Roll the previous run aside rather than appending: a fresh file per
+        // launch is what makes "what did THIS run do" answerable at a glance.
+        if p.exists() {
+            let _ = std::fs::rename(p, p.with_extension("log.1"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(p)
+            .ok()
+    });
+
+    match file {
+        Some(f) => {
+            // A closure is the `MakeWriter` that needs no extra dependency;
+            // cloned handles share the file offset, so lines from different
+            // threads append rather than overwrite. ANSI off — colour escapes
+            // in a file make it unreadable in Notepad.
+            let writer = move || Tee(f.try_clone().expect("clone log handle"));
+            tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_writer(writer)
+                .with_ansi(false)
+                .init();
+            if let Some(p) = path.as_ref() {
+                tracing::info!("logging to {}", p.display());
+                // Named on stderr too, so someone watching a terminal knows
+                // where the file is without reading this function.
+                let _ = writeln!(std::io::stderr(), "vortex: logging to {}", p.display());
+            }
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_ansi(false)
+                .init();
+            tracing::warn!("could not open a log file; logging to stderr only");
+        }
+    }
+}
+
+/// Route panics into the log.
+///
+/// The default hook prints to stderr, which on a Windows GUI binary goes
+/// nowhere at all — a thread that panics simply stops, leaving a log that ends
+/// mid-startup with no reason given. That is the single most confusing failure
+/// a first run can produce, so panics go where the rest of the diagnosis is.
+///
+/// Keeps the default hook too: on Linux stderr IS the journal.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // `info.location()` is where it happened; the payload is the message.
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        tracing::error!(location = %where_, "PANIC: {what}");
+        default(info);
+    }));
+}
+
 pub fn run() {
     // Logs go to stderr AND to a file — the packaged launch paths discard
     // stderr, so without the file a normal user's run leaves no trace at all.
@@ -161,6 +400,18 @@ pub fn run() {
         Some(p) => tracing::info!("logging to {}", p.display()),
         None => tracing::warn!("could not open the log file; stderr only"),
     }
+    // Panics too. The default hook prints to stderr, which on a Windows GUI
+    // binary goes nowhere at all — a thread that panics simply stops, leaving a
+    // log that ends mid-startup with no reason given.
+    log_panics();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "vortex starting");
+    // Explorer's "Share via Vortex". Re-registered every start rather than
+    // once, because the command has this exe's full path in it and Explorer
+    // will not go looking for a binary that moved. Cheap, and it means an
+    // unzipped standalone .exe gets the menu entry without an installer —
+    // which is the same reason the toast AUMID shortcut registers itself.
+    #[cfg(target_os = "windows")]
+    win_shell::register_share_verb();
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCmd>();
     // Tray heartbeat: the 5-second local-earbuds rescan used to live in the
@@ -168,6 +419,10 @@ pub fn run() {
     // so with the window closed the tray battery/owner rows froze until the
     // phone's next heartbeat. Driven from here instead: same worker path,
     // independent of window visibility.
+    // Linux only: what it drives is a BlueZ earbuds rescan, so off Linux it is
+    // a command with no handler arriving every 5 s forever — 28 warn lines in
+    // the first Windows log, and the noise that hid the real fault.
+    #[cfg(target_os = "linux")]
     {
         let hb_tx = cmd_tx.clone();
         thread::spawn(move || loop {
@@ -224,6 +479,11 @@ pub fn run() {
                         window::present(&w);
                     }
                 }
+            } else if fs_cli::dispatch(&argv) {
+                // `--fs-ls` / `--fs-stat` / `--fs-get`: drive the filesystem
+                // client over whatever session is already up. Same rationale as
+                // `--mirror` below — without a mount adapter or any browsing UI
+                // yet, this is the only way to exercise the path at all.
             } else if argv.iter().any(|a| a == "--clipboard") {
                 clipboard_window::show_clipboard_window(app);
             } else if argv.iter().any(|a| a == "--mirror") {
@@ -308,6 +568,7 @@ pub fn run() {
             // Universal Control is the one switch that used to forget itself: it
             // lives entirely in this process, so a reboot or a quit left the edge
             // unarmed with the switch showing off. Put it back the way it was.
+            #[cfg(target_os = "linux")]
             universal_control::ensure_bt_hid();
             // Per-user setup a package cannot do for us (autostart entry,
             // enabling the GNOME extension). Idempotent, so it also repairs an
@@ -359,12 +620,16 @@ pub fn run() {
             worker::start_scan,
             worker::refresh_state,
             ipc::get_peer_states,
+            ipc::host_platform,
             worker::start_screen_mirror,
             worker::stop_screen_mirror,
             pairing::start_pair,
             pairing::pair_decision,
             pairing::forget_peer,
             pairing::forget_all,
+            pairing::switch_peer,
+            pairing::cancel_switch,
+            pairing::activate_peer,
             earbuds::refresh_local_earbuds,
             earbuds::open_bluetooth_settings,
             earbuds::scan_bluetooth_devices,
@@ -416,6 +681,7 @@ pub fn run() {
             universal_control::uc_running,
             universal_control::uc_set_placement,
             universal_control::uc_get_placement,
+            fs_mount::open_phone_files,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Vortex Tauri")
@@ -437,6 +703,7 @@ pub fn run() {
                 // — leaving the phone believing a peer is still attached, and
                 // the next run scanning for an advertisement it will therefore
                 // never send.
+                #[cfg(target_os = "linux")]
                 crate::ble::shutdown_link_blocking();
             }
         });

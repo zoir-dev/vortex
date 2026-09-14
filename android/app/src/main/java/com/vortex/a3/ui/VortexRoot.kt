@@ -1,6 +1,7 @@
 package com.vortex.a3.ui
 
 import androidx.activity.ComponentActivity
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -10,6 +11,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -63,6 +65,8 @@ class MainUiState(
     val showAutostartDialog: MutableStateFlow<Boolean>,
     /** Bluetooth adapter is off/absent → drives the home "turn on BT" banner. */
     val bluetoothOff: StateFlow<Boolean>,
+    /** A "switch laptop" seek window is open. */
+    val seekingLaptop: StateFlow<Boolean>,
 )
 
 /**
@@ -75,6 +79,14 @@ class MainUiState(
  */
 class VortexActions(
     val onForgetPeer: (TrustedPeer) -> Unit,
+    /** Open a pairing window while trust already exists, so this phone
+     *  can be offered to a second laptop without forgetting the first. */
+    val onAddPair: () -> Unit,
+    val onCancelAddPair: () -> Unit,
+    /** Look for another remembered laptop while staying on this one. */
+    val onSwitchLaptop: () -> Unit,
+    /** Switch to one NAMED laptop; lets the seek advertise a single token. */
+    val onSwitchToPeer: (TrustedPeer) -> Unit,
     val onOpenAutostart: () -> Unit,
     val onDismissAutostartHint: () -> Unit,
     val onRequestBatteryWhitelist: () -> Unit,
@@ -94,6 +106,7 @@ class VortexActions(
     /** Ask for the storage grant the media-share toggles need (no-op if held). */
     val onRequestMediaPermission: () -> Unit,
     val onPickSharedFolder: () -> Unit,
+    val onOpenAllFilesAccess: () -> Unit,
     /** Ask the system to turn Bluetooth on (one-tap dialog). */
     val onEnableBluetooth: () -> Unit,
     val isAggressiveOem: Boolean,
@@ -126,6 +139,26 @@ fun VortexRoot(
         @Suppress("DEPRECATION")
         window.statusBarColor = colorScheme.background.toArgb()
     }
+    // Hold the screen on, but only while the phone is waiting on another device
+    // to find it: the pairing window, the SAS comparison, and the switch-laptop
+    // seek. Those are the bounded stretches where the user is reading the screen
+    // without touching it, and a display timeout in the middle of a handshake
+    // takes the radio work down with it. Everywhere else the phone is free to
+    // sleep — MainActivity.onCreate deliberately sets no window-level
+    // KEEP_SCREEN_ON, which used to keep the display up for as long as Vortex
+    // was in front.
+    val advertising by ui.advertise.collectAsState()
+    val awaitingSas by ui.pendingApproval.collectAsState()
+    val seekingLaptop by ui.seekingLaptop.collectAsState()
+    val holdScreenOn = advertising is AdvertiseState.Starting ||
+        advertising is AdvertiseState.Active ||
+        awaitingSas != null ||
+        seekingLaptop
+    DisposableEffect(holdScreenOn) {
+        val w = activity.window
+        if (holdScreenOn) w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose { w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
     CompositionLocalProvider(LocalVortexLocale provides activeLocale) {
         MaterialTheme(colorScheme = colorScheme) {
             Surface(
@@ -134,6 +167,7 @@ fun VortexRoot(
             ) {
                 var showSettings by remember { mutableStateOf(false) }
                 var showNotes by remember { mutableStateOf(false) }
+                var showLaptopFiles by remember { mutableStateOf(false) }
                 remember { com.vortex.a3.core.notes.NoteStore.init(activity); 0 }
                 // Shared smart-switch setting (persisted + cross-device LWW).
                 remember { SmartSwitchSetting.init(activity); 0 }
@@ -159,9 +193,7 @@ fun VortexRoot(
                 // Re-read whenever the settings screen is shown: the picker is
                 // a separate activity, so a grant taken there lands while this
                 // composition is away.
-                val sharedFolderCount = remember(showSettings) {
-                    com.vortex.a3.core.files.PhoneFiles.grantedTrees(activity).size
-                }
+
                 // Re-checked each time Settings opens AND after either toggle
                 // moves: the flip that turns a row on is what asks for the
                 // grant, and the hint should follow the answer.
@@ -178,7 +210,21 @@ fun VortexRoot(
                 val screenControlOn = remember(showSettings) {
                     com.vortex.a3.service.VortexInputService.isEnabled(activity)
                 }
-                if (showNotes) {
+                // Re-read when Settings opens: the user may have added or
+                // revoked a grant since, including from system settings.
+                val sharedFolderCount = remember(showSettings) {
+                    com.vortex.a3.core.fs.FsRoots(activity).roots().size
+                }
+                val allFilesOn = remember(showSettings) {
+                    com.vortex.a3.core.fs.FsRoots(activity).allFilesGranted()
+                }
+                if (showLaptopFiles) {
+                    // Its own BackHandler walks up the folder stack first, so
+                    // Back only leaves the screen from the top level.
+                    com.vortex.a3.ui.screens.LaptopFilesScreen(
+                        onBack = { showLaptopFiles = false },
+                    )
+                } else if (showNotes) {
                     // System back pops to Home instead of leaving the app.
                     // NotesScreen's own handlers (close the editor) compose
                     // later, so they still win while the editor is open.
@@ -240,6 +286,8 @@ fun VortexRoot(
                         onPickSharedFolder = actions.onPickSharedFolder,
                         screenControlOn = screenControlOn,
                         onScreenControlClick = actions.onOpenScreenControl,
+                        allFilesOn = allFilesOn,
+                        onAllFilesClick = actions.onOpenAllFilesAccess,
                         onBack = { showSettings = false },
                     )
                 } else {
@@ -257,11 +305,17 @@ fun VortexRoot(
                         pickerState = ui.picker.collectAsState().value,
                         switchState = EarbudsSwitchHolder.state.collectAsState().value,
                         onForgetPeer = actions.onForgetPeer,
+                        onAddPair = actions.onAddPair,
+                        onCancelAddPair = actions.onCancelAddPair,
+                        onSwitchLaptop = actions.onSwitchLaptop,
+                        onSwitchToPeer = actions.onSwitchToPeer,
+                        seekingLaptop = ui.seekingLaptop.collectAsState().value,
                         onOpenAutostart = actions.onOpenAutostart,
                         onDismissAutostartHint = actions.onDismissAutostartHint,
                         onRequestBatteryWhitelist = actions.onRequestBatteryWhitelist,
                         onOpenSettings = { showSettings = true },
                         onOpenNotes = { showNotes = true },
+                        onOpenLaptopFiles = { showLaptopFiles = true },
                         onOpenEarbudsPicker = actions.onOpenEarbudsPicker,
                         onPickEarbud = actions.onPickEarbud,
                         onRescanEarbuds = actions.onRescanEarbuds,

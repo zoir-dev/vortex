@@ -364,14 +364,12 @@ data class CapturedMedia(
                         continue
                     }
                     val size = if (sizeIdx >= 0) c.getLong(sizeIdx) else 0L
-                    // Reject on the row's own SIZE, before anything opens the
-                    // file. A recording is orders of magnitude bigger than a
-                    // screenshot, and the reader would otherwise pull it into
-                    // the service's heap to find out it was too big.
-                    if (size > com.vortex.a3.core.clipboard.ClipboardFileReader.MAX_FILE_BYTES) {
-                        Log.i(tag, "${kind.name.lowercase()} _id=$id is $size bytes — over the cap, not sent")
-                        continue
-                    }
+                    // No size cap any more. There used to be one because the
+                    // reader pulled the whole file into the service's heap to
+                    // send it — which is exactly what the ranged-read protocol
+                    // removed: an offer now carries a grant, and the laptop
+                    // streams the bytes on demand. A screen recording is
+                    // offered like anything else, and nothing here holds it.
                     val name = (if (nameIdx >= 0) c.getString(nameIdx) else null)
                         ?.takeIf { it.isNotBlank() } ?: "capture-$id"
                     val mime = (if (mimeIdx >= 0) c.getString(mimeIdx) else null)

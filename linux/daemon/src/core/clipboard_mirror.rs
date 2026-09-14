@@ -17,11 +17,6 @@ pub const MAX_CLIPBOARD_TEXT_CHARS: usize = 65_536;
 /// frame stays under the BLE notify MTU (same reason images are chunked).
 pub const MAX_SINGLE_FRAME_TEXT_BYTES: usize = 400;
 
-/// Max bytes for a phone→laptop FILE pulled over LAN (reliable TCP). Files
-/// ride the same offer+pull path as images but can be much larger; this bounds
-/// memory and transfer time. ~64 MiB covers documents, photos, short clips.
-pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-
 /// "Blob available, pull it over LAN" signal (phone→laptop). The laptop fetches
 /// the bytes by `token` via the next bulk-sync (served as CLIPBOARD_IMAGE
 /// chunks). When `name`/`mime` are EMPTY it's a clipboard IMAGE (PNG); when set
@@ -75,13 +70,23 @@ impl ClipboardImageOffer {
     /// share, or a kind this build does not know — lands in the root as
     /// shares always have.
     pub fn subdir(&self) -> Option<&'static str> {
-        match self.kind.as_str() {
-            "screenshot" => Some("Phone/Screenshots"),
-            "photo" => Some("Phone/Photos"),
-            "screen_recording" => Some("Phone/Screen recordings"),
-            "video" => Some("Phone/Videos"),
-            _ => None,
-        }
+        subdir_for_kind(&self.kind)
+    }
+}
+
+/// The same table, reachable without an [`Offer`].
+///
+/// The ranged-read puller receives a kind string off the queue rather than the
+/// whole offer, and must file a capture in the same place the bulk path did —
+/// two copies of this table would be two chances to disagree about where a
+/// screenshot lives.
+pub fn subdir_for_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "screenshot" => Some("Phone/Screenshots"),
+        "photo" => Some("Phone/Photos"),
+        "screen_recording" => Some("Phone/Screen recordings"),
+        "video" => Some("Phone/Videos"),
+        _ => None,
     }
 }
 

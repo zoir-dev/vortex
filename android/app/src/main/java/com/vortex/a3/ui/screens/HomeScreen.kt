@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -20,6 +21,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Laptop
+import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Smartphone
 import androidx.compose.material.icons.outlined.StickyNote2
@@ -59,6 +61,7 @@ import com.vortex.a3.ui.components.CardCorner
 import com.vortex.a3.ui.components.EarbudsCard
 import com.vortex.a3.ui.components.EarbudsPickerDialog
 import com.vortex.a3.ui.components.HintCard
+import com.vortex.a3.ui.components.OtherPeersCard
 import com.vortex.a3.ui.components.PeerDeviceCard
 import com.vortex.a3.ui.components.SurfaceCard
 import com.vortex.a3.ui.components.VortexDivider
@@ -87,11 +90,17 @@ fun HomeScreen(
     pickerState: PickerState,
     switchState: SwitchState,
     onForgetPeer: (TrustedPeer) -> Unit,
+    onAddPair: () -> Unit,
+    onCancelAddPair: () -> Unit,
+    onSwitchLaptop: () -> Unit,
+    onSwitchToPeer: (TrustedPeer) -> Unit,
+    seekingLaptop: Boolean,
     onOpenAutostart: () -> Unit,
     onDismissAutostartHint: () -> Unit,
     onRequestBatteryWhitelist: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenNotes: () -> Unit,
+    onOpenLaptopFiles: () -> Unit,
     onOpenEarbudsPicker: () -> Unit,
     onPickEarbud: (BluetoothDeviceRow) -> Unit,
     onRescanEarbuds: () -> Unit,
@@ -104,7 +113,18 @@ fun HomeScreen(
     onEnableBluetooth: () -> Unit,
 ) {
     val peerCount = peers.size
-    val primaryPeer = peers.firstOrNull()
+    // Show the laptop we are actually talking to.
+    //
+    // This used to be `peers.firstOrNull()`, which with two trusted laptops
+    // meant "an arbitrary one" — observed showing a laptop 40 km away as
+    // "Disconnected" while the phone was happily syncing with the one on the
+    // desk. Freshest traffic wins; `pairedAt` breaks ties so the choice is
+    // still deterministic when nothing has been heard from yet (and then it is
+    // most-recently-paired, which is the best available guess at "yours").
+    val primaryPeer = peers.maxWithOrNull(
+        compareBy<TrustedPeer> { peerLastSeen[it.peerStaticPub.toHex()] ?: 0L }
+            .thenBy { it.pairedAt },
+    )
     val primaryState = primaryPeer?.let { peerStates[it.peerStaticPub.toHex()] }
     val primaryHex = primaryPeer?.peerStaticPub?.toHex()
     val lastSeen = primaryHex?.let { peerLastSeen[it] } ?: 0L
@@ -145,7 +165,15 @@ fun HomeScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .background(MaterialTheme.colorScheme.background)
+            // targetSdk 36 makes edge-to-edge mandatory and nothing here opted
+            // in, so this header drew UNDER the status bar: the Notes / Laptop
+            // files / Settings icons sat in the same band as the clock, where
+            // the system consumes the touch. They rendered fine and simply did
+            // not respond, which reads as a broken button rather than a
+            // mispositioned one. Background before padding, so the status bar
+            // still sits on our colour instead of a bare strip.
+            .systemBarsPadding(),
     ) {
         Row(
             modifier = Modifier
@@ -184,6 +212,13 @@ fun HomeScreen(
                     Icon(
                         imageVector = Icons.Outlined.StickyNote2,
                         contentDescription = str("notes.title"),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = onOpenLaptopFiles) {
+                    Icon(
+                        imageVector = Icons.Outlined.FolderOpen,
+                        contentDescription = "Laptop files",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -263,6 +298,10 @@ fun HomeScreen(
                         } else {
                             null
                         },
+                        // Only offered with a second laptop to switch TO —
+                        // otherwise the seek can only ever time out.
+                        onSwitch = if (peerCount > 1) onSwitchLaptop else null,
+                        seeking = seekingLaptop,
                     )
 
                     EarbudsCard(
@@ -276,6 +315,50 @@ fun HomeScreen(
                         onOpenPicker = onOpenEarbudsPicker,
                         onRemoveSaved = onRemoveSavedEarbuds,
                     )
+                }
+
+                // Every other paired laptop, tappable to switch to it.
+                // Compact rows: a 180 dp card each would push the rest of the
+                // screen away for what is mostly "this one exists".
+                OtherPeersCard(
+                    peers = peers.filter { it !== primaryPeer },
+                    lastSeen = peerLastSeen,
+                    now = now,
+                    seeking = seekingLaptop,
+                    onSwitchTo = onSwitchToPeer,
+                )
+
+                // "Pair another laptop". A pairable window preempts the
+                // trusted-presence beacon (one advertising set), so it is
+                // explicit and bounded rather than always-on: while it is
+                // open the already-paired laptop cannot see this phone.
+                val windowOpen =
+                    state is AdvertiseState.Active || state is AdvertiseState.Starting
+                SurfaceCard {
+                    if (windowOpen) {
+                        Text(
+                            str("discover.title"),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontWeight = FW.SemiBold,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        WaitingForLinuxRow(state = state)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        TextButton(onClick = onCancelAddPair) {
+                            Text(str("peers.add_pair_cancel"))
+                        }
+                    } else {
+                        Text(
+                            str("peers.add_pair_hint"),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(onClick = onAddPair) {
+                            Text(str("peers.add_pair"))
+                        }
+                    }
                 }
             }
 

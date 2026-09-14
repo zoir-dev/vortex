@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.vortex.a3.core.ble.Advertiser
+import com.vortex.a3.core.ble.FrameSub
 import com.vortex.a3.core.ble.GattServer
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
@@ -67,7 +68,48 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     )
 
     private var advertiser: Advertiser? = null
+
+    /**
+     * static_pub of the laptop we are currently linked to, learned from the
+     * IK handshake (the only thing that proves *which* peer a link belongs
+     * to — a BLE address alone does not).
+     *
+     * Used by the presence loop to exclude the current laptop while seeking
+     * for a different one. Deliberately NOT cleared on disconnect: after a
+     * drop it is still the peer we were last with, which is what the seek
+     * filter wants, and a stale value is harmless because seeking only ever
+     * removes one candidate from the list.
+     */
+    @Volatile internal var activePeerPub: ByteArray? = null
+
+    /**
+     * When the owner was last heard from, on ANY transport.
+     *
+     * Liveness is a timestamp rather than a disconnect event because the two
+     * transports fail differently: a BLE link raises a disconnect, while a LAN
+     * session is torn down and rebuilt every heartbeat by design, so "the
+     * socket closed" says nothing at all there. Last contact is the one signal
+     * that means the same thing on both.
+     *
+     * Ownership then outlives a blip: it becomes available to another laptop
+     * only after [OWNERSHIP_GRACE_MS] of silence, which is the walk-away case
+     * rather than the flap.
+     */
+    @Volatile internal var activeSeenAtMs: Long = 0L
     internal var gattServer: GattServer? = null
+    /** Open read handles held for the current peer's filesystem session, so
+     *  they can be dropped when the link goes. Null until [startFsServer]. */
+    internal var fsHandles: com.vortex.a3.core.fs.FsHandles? = null
+
+    /** The filesystem serve function, kept here because the two transports are
+     *  started at different times: BLE comes up before the LAN server exists,
+     *  and `restartBleComponents` replaces the server (and its handle table)
+     *  without touching the LAN side. Whoever starts second installs it. */
+    internal var fsServeFn: ((Byte, ByteArray) -> Pair<Byte, ByteArray>)? = null
+
+    /** Route for FS replies arriving over LAN. Same late-binding problem as
+     *  [fsServeFn]: the LAN server does not exist yet when BLE starts. */
+    internal var fsReplyFn: ((Byte, ByteArray) -> Unit)? = null
     /** Buffers phone→laptop notifications that fail to send while BLE is down;
      *  flushed when the peer re-subscribes to AUDIO_SIGNAL. */
     internal val notificationOutbox = com.vortex.a3.core.notif.NotificationOutbox()
@@ -77,6 +119,66 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
     internal val sentIconPkgs = java.util.Collections.synchronizedSet(HashSet<String>())
     private var clipboardListener: com.vortex.a3.core.clipboard.ClipboardListener? = null
     internal var wifiDirectTeardownJob: kotlinx.coroutines.Job? = null
+    /** elapsedRealtime of the last WIFI_DIRECT_OFFER, for coalescing (see
+     *  [maybeStartWifiDirect]). 0 = none since the group last went down. */
+    @Volatile internal var lastWifiDirectOfferAtMs: Long = 0L
+
+    /**
+     * The one laptop a seek is aimed at, when the user picked it explicitly.
+     *
+     * A targeted seek advertises only THAT peer's token instead of cycling all
+     * of them, so it is both faster to be found (no dwell sharing) and cheaper
+     * on air. `null` = untargeted, i.e. "any remembered laptop but the current
+     * one" (design doc §D1).
+     */
+    @Volatile internal var seekTarget: ByteArray? = null
+
+    /**
+     * Does [peerPub] own this phone's session — and take it if it may?
+     *
+     * CONNECTED IS NOT ACTIVE (design doc §D4). The laptop side has always kept
+     * those apart; this side did not, and every path that heard from a laptop
+     * simply treated it as the current one. With two laptops up, that made the
+     * phone flip between them: the BLE loop promoted whoever completed IK last,
+     * and [handlePeerAppState] overwrote the UI's single peer slot from
+     * whichever LAN heartbeat landed most recently — about one every twelve
+     * seconds, from each.
+     *
+     * Ownership moves only when:
+     *  - nothing holds it;
+     *  - the holder is the one calling (it refreshes its own claim);
+     *  - the user picked this laptop in the UI (a targeted seek), or an
+     *    untargeted seek is running and this is the first to answer;
+     *  - the holder has been silent for [OWNERSHIP_GRACE_MS].
+     *
+     * Everything else may hold a link, sync files, and get no ownership with
+     * it. Returns true when the caller owns the session after this call.
+     */
+    internal fun considerOwnership(peerPub: ByteArray): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val current = activePeerPub
+        if (current == null || current.contentEquals(peerPub)) {
+            activePeerPub = peerPub.copyOf()
+            activeSeenAtMs = now
+            return true
+        }
+        val chosen = seekTarget?.contentEquals(peerPub) == true
+        // An untargeted seek ("switch to any other laptop") names no
+        // destination, so the first to answer IS the choice.
+        val anySeek = advertiser?.seeking == true && seekTarget == null
+        val ownerGone = activeSeenAtMs != 0L && now - activeSeenAtMs > OWNERSHIP_GRACE_MS
+        if (chosen || anySeek || ownerGone) {
+            Log.i(
+                TAG,
+                "session ownership → ${peerPub.toHexPrefix()} " +
+                    "(chosen=$chosen seek=$anySeek ownerSilent=$ownerGone)",
+            )
+            activePeerPub = peerPub.copyOf()
+            activeSeenAtMs = now
+            return true
+        }
+        return false
+    }
     /** Icon PNG bytes per ICON frame chunk (kept under the BLE notify MTU
      *  once the appId header + AEAD tag + frame header are added). */
     internal val ICON_CHUNK = 180
@@ -92,6 +194,22 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
      *  cancelled on disconnect — so only a session stable for
      *  [MIRROR_REFRESH_SETTLE_MS] pays the ~37-chunk BLE storm. */
     private var mirrorRefreshJob: kotlinx.coroutines.Job? = null
+    /** Bounded "switch laptop" window (design doc §D9). Seeking while a
+     *  session is live is the most expensive radio state there is, so an
+     *  unattended press must not scan forever. */
+    private var seekJob: kotlinx.coroutines.Job? = null
+
+    /** Paces multi-file shares (see [ShareQueue]). Lazy because it needs
+     *  `ctx`, which resolves through the Service's base context. */
+    internal val shareQueue: ShareQueue by lazy {
+        ShareQueue(
+            context = ctx,
+            emit = { file -> VortexService.clipboardFileBus.tryEmit(file) },
+            // Offers awaiting collection == files in flight, so pacing follows
+            // real delivery instead of a timer.
+            inFlight = { pendingOffers.size },
+        )
+    }
 
     internal var contactsProvider: com.vortex.a3.core.contacts.ContactsProvider? = null
     /** Reads the phone's recent call log + observes changes; emits to callLogBus. */
@@ -473,6 +591,7 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         }
         gattServer = server
         startNotesSync() // notes/todos bidirectional sync (NOTES_SYNC)
+        startFsServer() // serve shared folders to the laptop (FS_REQ)
 
         // BLE-WRITE reverse channel: when the laptop AEAD-seals an
         // AudioOpFrame and WRITEs it to AUDIO_SIGNAL, the GattServer decrypts
@@ -647,9 +766,17 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // BLE session gone → mDNS discovery matters again; re-hold the
         // multicast lock so the laptop can find us over LAN. Also drop any
         // pending mirror burst — a flapping session must not queue storms.
-        server.onPeerDisconnected = { _ ->
+        server.onPeerDisconnected = { device ->
+            // Deliberately does NOT touch ownership. A dropped BLE link is not
+            // evidence the laptop has gone — it may still be right there on
+            // Wi-Fi — so the owner is timed out on silence instead
+            // ([activeSeenAtMs]), which is the one signal both transports share.
             mirrorRefreshJob?.cancel()
             lanServer?.setBleLinked(false)
+            // Handles belong to the session that opened them: the ids mean
+            // nothing to a new one, and waiting for the 5-minute idle sweep
+            // would hold a descriptor per file the laptop was mid-copy on.
+            stopFsServer()
             // Engage the reconnect-seeking LOW_LATENCY advertising NOW —
             // waiting for the next 60s rotation cost the whole first
             // reconnect window after a walk-away.
@@ -730,6 +857,36 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 outcome.ciphers.receiver,
             )
             val peerPub = outcome.peerStaticPub.copyOf()
+            val previousPeer = activePeerPub
+            val seeking = advertiser?.seeking == true
+            val sameAsActive = previousPeer?.contentEquals(peerPub) == true
+            val takeOver = considerOwnership(peerPub)
+            if (!takeOver) {
+                Log.i(TAG, "${peerPub.toHexPrefix()} linked but NOT active — another laptop owns the session")
+            }
+            // A DIFFERENT laptop just completed IK while we were seeking —
+            // that is the switch succeeding, so close the window. Ownership
+            // has effectively moved; the old link drops on its own (the
+            // laptop side stops being active the moment it hands over).
+            if (seeking && takeOver && !sameAsActive) {
+                Log.i(TAG, "seek satisfied — another laptop connected")
+                // Tell the laptop we just left, while its link is still up.
+                // Ordering matters: this runs BEFORE stopSeeking() teardown so
+                // the old session is still registered and can carry the frame.
+                // Best-effort — if it has already dropped, that laptop falls
+                // back to noticing on next contact, which is what happened
+                // before this frame existed.
+                previousPeer?.let { old ->
+                    val successor = try {
+                        peerStore.load(peerPub)?.peerName.orEmpty()
+                    } catch (_: Exception) { "" }
+                    val sent = server.sendPeerHandoffEncrypted(
+                        old, FrameSub.HANDOFF_RELEASE, successor,
+                    )
+                    Log.i(TAG, "RELEASE to previous laptop sent=$sent")
+                }
+                stopSeeking()
+            }
             val bleWriter: suspend (com.vortex.a3.core.earbuds.AudioOpFrame) -> Result<Unit> = { f ->
                 val ok = server.sendAudioOpEncrypted(peerPub, f.toJsonBytes())
                 if (ok) Result.success(Unit)
@@ -742,8 +899,18 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
             // known snapshot) instead of waiting ~1.5s for the laptop's
             // first state heartbeat. Without this the laptop UI flips to
             // "connected" visibly earlier than the phone after a reconnect.
-            latestPeerState?.let { st ->
-                VortexService.peerStateBus.tryEmit(peerPub.toHex() to st)
+            //
+            // Owner only, for two reasons. The home screen picks the laptop to
+            // show by FRESHEST traffic, so nudging a laptop that does not own
+            // the session would put it straight back at the top of that
+            // ordering — the dance, re-entered by another door. And
+            // `latestPeerState` is the OWNER's snapshot: attributing it to a
+            // different laptop would draw that one's card with someone else's
+            // battery.
+            if (takeOver) {
+                latestPeerState?.let { st ->
+                    VortexService.peerStateBus.tryEmit(peerPub.toHex() to st)
+                }
             }
         }
 
@@ -762,22 +929,137 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
                 android.os.SystemClock.elapsedRealtime() - srv.lastDisconnectAtMs <
                 FAST_ADV_WINDOW_MS
         }
-        val firstPeer = peerStore.list().firstOrNull()
-        if (firstPeer != null) {
-            adv.startTrustedPresence(
-                prs = firstPeer.prs,
+        // The laptop handed ownership to another phone (design doc §D4). Stop
+        // presenting ourselves as its active peer and go back on air so a
+        // laptop that DOES want us can find us — otherwise we would sit
+        // silently attached to a laptop that has moved on, invisible to
+        // everything else until the link happened to drop.
+        server.onPeerHandoffReceived = { peerPub, kind, successorName ->
+            if (kind == FrameSub.HANDOFF_RELEASE) {
+                val who = if (successorName.isBlank()) "another phone" else successorName
+                Log.i(TAG, "peer released us (now with $who) — resuming presence")
+                if (activePeerPub?.contentEquals(peerPub) == true) {
+                    activePeerPub = null
+                    activeSeenAtMs = 0L
+                }
+                // A seek in flight is moot: the laptop already chose someone.
+                stopSeeking()
+                // Presence resumes on the next phase evaluation; kick it so we
+                // are discoverable now rather than up to ACTIVE_RECHECK_MS later.
+                advertiser?.kickRotation()
+            } else {
+                // BUSY / CLAIM are defined in the contract but nothing sends
+                // them yet; log so an unexpected one is visible rather than
+                // silently dropped.
+                Log.i(TAG, "PEER_HANDOFF kind=0x${"%02x".format(kind)} — no handler")
+            }
+        }
+
+        // Advertising is suspended while a session is live — the session IS the
+        // presence proof, and beaconing on top of it is the single largest
+        // avoidable battery cost here (design doc §D5).
+        adv.linkedProvider = provider@{
+            val srv = gattServer ?: return@provider false
+            // SUBSCRIBED, not merely ACL-connected. BlueZ owns the ACL link, so
+            // it outlives the laptop app: after a restart the phone saw a
+            // "connection" with no session behind it, stayed silent, and became
+            // unreachable — the laptop had nothing to find and the phone had no
+            // reason to advertise. Observed live: file offers sat retrying with
+            // "BLE link down?" while the phone never advertised.
+            srv.hasAudioSignalSubscriber()
+        }
+        // Which peers' tokens we may advertise. Re-read every round rather
+        // than captured once, so pairing a new laptop or forgetting one takes
+        // effect without restarting the loop.
+        //
+        // While SEEKING we exclude the peer we are currently linked to: the
+        // user pressed Switch precisely because they want a different laptop,
+        // and spending dwell slots on the current one would only slow the
+        // others down.
+        adv.presencePeersProvider = provider@{
+            val all = try { peerStore.list() } catch (e: Exception) {
+                Log.w(TAG, "presence peers: peer store unavailable: ${e.message}")
+                return@provider emptyList()
+            }
+            if (!adv.seeking) return@provider all.map { it.prs }
+            // Targeted seek: advertise only the chosen laptop's token. One
+            // token means no dwell sharing, so it is seen as fast as the
+            // single-peer case.
+            seekTarget?.let { target ->
+                return@provider all.filter { it.peerStaticPub.contentEquals(target) }
+                    .map { it.prs }
+            }
+            // Suppress a token only for a peer holding a LIVE GATT link: that
+            // session IS the presence proof, so beaconing at it is waste.
+            //
+            // Keyed on the link, NOT on ownership. They are no longer the same
+            // thing — a laptop can own the session over Wi-Fi with no BLE link
+            // at all, and suppressing its token then would leave it unable to
+            // find us on the one transport that still works.
+            val linked = server.linkedPeerPubs()
+            all.filter { p -> linked.none { it.contentEquals(p.peerStaticPub) } }
+                .map { it.prs }
+        }
+        if (peerStore.list().isNotEmpty()) {
+            adv.startPresenceLoop(
                 scope = scope,
                 rotationWindowSec = 60L,
-                isConnected = { gattServer?.hasActiveConnection() == true },
                 onError = { reason -> Log.w(TAG, "presence adv error: $reason") },
             )
-            Log.i(TAG, "trusted-presence advertising started (have ${peerStore.list().size} peer(s))")
+            Log.i(TAG, "presence loop started (have ${peerStore.list().size} peer(s))")
         } else {
             Log.i(TAG, "no trust — service idle, awaiting pairing")
         }
         advertiser = adv
         return true
     }
+
+    /**
+     * Open a seek window: advertise to the other remembered laptops while
+     * staying connected to the current one. See [VortexService.startSeeking].
+     */
+    fun startSeeking(target: ByteArray? = null): Boolean {
+        val adv = advertiser ?: return false
+        // Nothing to switch to — refuse rather than burn the radio on a window
+        // that cannot possibly succeed.
+        val peerCount = try { peerStore.list().size } catch (_: Exception) { 0 }
+        if (peerCount < 2) {
+            Log.i(TAG, "seek refused: only $peerCount remembered laptop(s)")
+            return false
+        }
+        seekJob?.cancel()
+        seekTarget = target?.copyOf()
+        adv.seeking = true
+        // Re-advertise immediately with the seek peer set instead of waiting
+        // out the current dwell / rotation sleep.
+        adv.kickRotation()
+        Log.i(TAG, "seek window opened ($peerCount peers, excluding the current one)")
+        seekJob = scope.launch {
+            kotlinx.coroutines.delay(SEEK_WINDOW_MS)
+            // Timed out with nobody else picking us up. Close quietly: the
+            // current laptop was never dropped, so there is nothing to undo.
+            if (adv.seeking) {
+                Log.i(TAG, "seek window expired")
+                stopSeeking()
+            }
+        }
+        return true
+    }
+
+    fun stopSeeking() {
+        seekJob?.cancel()
+        seekJob = null
+        val adv = advertiser ?: return
+        if (!adv.seeking) return
+        adv.seeking = false
+        seekTarget = null
+        // Back to the phase machine's verdict: silent if still linked,
+        // presence otherwise.
+        adv.kickRotation()
+        Log.i(TAG, "seek window closed")
+    }
+
+    fun isSeeking(): Boolean = advertiser?.seeking == true
 
     /**
      * Re-create the BLE stack after the BT adapter has come back ON. Tears
@@ -997,6 +1279,10 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         // measured at five seconds on the first real attempt. The BLE write is
         // ours to make and lands in a couple of hundred milliseconds.
         VortexService.appStateNudge = { pushStateViaBle() }
+        // BLE started first, so the serve function already exists; install it
+        // now that there is a LAN server to hang it on.
+        lan.fsServe = fsServeFn
+        lan.onFsReply = fsReplyFn
     }
 
     /**
@@ -1072,9 +1358,33 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
 
     companion object {
         internal const val TAG = "VortexStack"
+
+        /**
+         * How long a disconnected owner keeps the session before another
+         * laptop may take it.
+         *
+         * Long enough to ride out a BLE flap — which is the difference between
+         * "my laptop blinked" and "I walked away" — and short enough that
+         * arriving at the other desk does not feel stuck. Tapping the device
+         * in the UI bypasses the wait entirely, because an explicit choice
+         * should never queue behind a timer.
+         */
+        internal const val OWNERSHIP_GRACE_MS = 20_000L
         /** How long after losing the laptop link the phone keeps
          *  advertising in LOW_LATENCY (reconnect-seeking) mode. */
         internal const val FAST_ADV_WINDOW_MS = 10 * 60_000L
+
+        /** How long a "switch laptop" seek window stays open. Matches the
+         *  laptop's SWITCH_WINDOW_SECS so both ends give up together —
+         *  long enough to walk to another machine and wake it, short
+         *  enough that an unattended press stops advertising-on-top-of-a-
+         *  live-link before it costs real battery. */
+        internal const val SEEK_WINDOW_MS = 45_000L
+
+        /** Minimum gap between WIFI_DIRECT_OFFERs. Each one costs the laptop a
+         *  Wi-Fi disconnect/reconnect (single adapter), so they must not track
+         *  the file count. Well inside the 60 s idle teardown. */
+        internal const val WIFI_DIRECT_OFFER_MIN_GAP_MS = 30_000L
 
         /** How long an AUDIO_SIGNAL subscription must stay up before the
          *  companion mirror burst (contacts/recents/SMS, ~37 chunks) fires.

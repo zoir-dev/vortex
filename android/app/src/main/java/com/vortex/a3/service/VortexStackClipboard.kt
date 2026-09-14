@@ -84,15 +84,22 @@ internal fun VortexStack.startClipboardOutbound() {
     scope.launch {
         VortexService.clipboardFileBus.collect { file ->
             if (!com.vortex.a3.core.clipboard.ClipboardSyncSetting.isEnabled()) return@collect
-            if (file.bytes.isEmpty()) return@collect
-            val token = com.vortex.a3.core.clipboard.ClipboardBlobStore.stash(file.bytes)
+            // A grant, not the bytes: the laptop pulls the file in ranges
+            // through the filesystem protocol, so nothing is buffered here and
+            // the old 64 MB cap is gone with it.
+            val token = com.vortex.a3.core.fs.ShareGrants.grant(
+                file.uri,
+                file.name,
+                file.mime,
+                file.size,
+            )
             val o = org.json.JSONObject()
             o.put("token", token)
-            o.put("bytes", file.bytes.size)
+            o.put("bytes", file.size)
             o.put("name", file.name)
             o.put("mime", file.mime)
             val offer = o.toString().toByteArray(Charsets.UTF_8)
-            Log.i(VortexStack.TAG, "clipboard file offered to laptop ('${file.name}', ${file.bytes.size} bytes, token=$token)")
+            Log.i(VortexStack.TAG, "clipboard file offered to laptop ('${file.name}', ${file.size} bytes, token=$token)")
             // Tracked until the laptop has actually FETCHED the bytes: the OFFER
             // is a fire-and-forget BLE notify that goes nowhere on a dead link,
             // and even a delivered one can sit unfetched. Retries, warms the LAN
@@ -100,7 +107,7 @@ internal fun VortexStack.startClipboardOutbound() {
             offerFileToLaptop(token, file.name, offer)
             // Big file → bring up Wi-Fi Direct for a high-speed direct pull. Small
             // files stay on the router path (the ~6s Wi-Fi switch isn't worth it).
-            if (file.bytes.size >= 4 * 1024 * 1024) maybeStartWifiDirect()
+            if (file.size >= 4 * 1024 * 1024) maybeStartWifiDirect()
         }
     }
 }
@@ -130,18 +137,25 @@ internal fun VortexStack.startClipboardOutbound() {
  */
 internal fun VortexStack.offerCapturedMedia(media: com.vortex.a3.core.media.CapturedMedia) {
     scope.launch {
-        val file = com.vortex.a3.core.clipboard.ClipboardFileReader.read(ctx, media.uri)
+        val file = com.vortex.a3.core.clipboard.ClipboardFileReader.readOrNull(ctx, media.uri)
         if (file == null) {
             Log.w(VortexStack.TAG, "${media.kind.name.lowercase()} _id=${media.id} unreadable or over the cap; not sent")
             return@launch
         }
         val name = media.name.ifBlank { file.name }
-        val token = com.vortex.a3.core.clipboard.ClipboardBlobStore.stashLazy(file.bytes) {
-            com.vortex.a3.core.clipboard.ClipboardFileReader.read(ctx, media.uri)?.bytes
-        }
+        // A grant, not the bytes — same as the share path above. A captured
+        // video is routinely hundreds of megabytes, and stashing one in the
+        // blob store is the allocation this branch exists to remove: the
+        // laptop pulls it in ranges through the filesystem protocol instead.
+        val token = com.vortex.a3.core.fs.ShareGrants.grant(
+            file.uri,
+            name,
+            file.mime,
+            file.size,
+        )
         val o = org.json.JSONObject()
         o.put("token", token)
-        o.put("bytes", file.bytes.size)
+        o.put("bytes", file.size)
         o.put("name", name)
         o.put("mime", file.mime)
         // Tells the laptop which subfolder and which notification, and that
@@ -152,7 +166,7 @@ internal fun VortexStack.offerCapturedMedia(media: com.vortex.a3.core.media.Capt
         // passed on (see CaptureLedger). Recorded at the offer, not at the
         // fetch: the laptop files its copy under the same token either way.
         com.vortex.a3.core.media.CaptureLedger.record(token, media.collection, media.uri)
-        Log.i(VortexStack.TAG, "${media.kind.name.lowercase()} offered to laptop ('$name', ${file.bytes.size} bytes, token=$token)")
+        Log.i(VortexStack.TAG, "${media.kind.name.lowercase()} offered to laptop ('$name', ${file.size} bytes, token=$token)")
         offerFileToLaptop(token, name, offer, quiet = true)
     }
 }

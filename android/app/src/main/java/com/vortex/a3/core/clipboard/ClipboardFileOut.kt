@@ -5,66 +5,96 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
 
-/** A file the phone is sending to the laptop (bytes + display name + MIME). */
-data class ClipboardOutgoingFile(val bytes: ByteArray, val name: String, val mime: String)
+/** A file the phone is sending to the laptop. */
+data class ClipboardOutgoingFile(
+    /** What to read when the laptop pulls it. Held as a URI, never as bytes:
+     *  the file is streamed in ranges on demand, so its size no longer has to
+     *  fit in the heap. */
+    val uri: Uri,
+    val name: String,
+    val mime: String,
+    /** Best known size, or -1 when the provider will not say. Advisory only —
+     *  the open is what decides. */
+    val size: Long,
+)
 
 /**
- * Reads an arbitrary clipboard / shared `content://` URI into a
- * [ClipboardOutgoingFile] for phone→laptop FILE sync. Used by both the Quick
- * Settings quick-send and the share-sheet target. Returns null if it isn't
- * readable or exceeds the LAN size cap.
+ * Describes an arbitrary clipboard / shared `content://` URI for phone→laptop
+ * FILE sync. Used by both the Quick Settings quick-send and the share-sheet
+ * target.
+ *
+ * It no longer READS the file. The old version buffered the whole thing to
+ * compute a content hash for the token and to hand the bytes to the offer path,
+ * which is what made an 835 MB share allocate 876 MB against a 256 MB heap
+ * growth limit and throw `OutOfMemoryError` — an `Error`, so the surrounding
+ * `catch (Exception)` missed it and the process died, taking the BLE/LAN
+ * service with it. The 64 MB cap existed to keep that from happening.
+ *
+ * Now the laptop pulls the file through the ranged-read protocol
+ * ([com.vortex.a3.core.fs.FsServer]), one bounded chunk at a time, so nothing
+ * on either side holds more than a chunk and the cap is gone.
  */
 object ClipboardFileReader {
-    /** Mirrors the Rust `clipboard_mirror::MAX_FILE_BYTES`. */
-    const val MAX_FILE_BYTES = 64L * 1024 * 1024
 
     private const val TAG = "ClipboardFileOut"
 
-    fun read(context: Context, uri: Uri): ClipboardOutgoingFile? {
-        return try {
-            readInner(context, uri)
-        } catch (e: Exception) {
-            Log.w(TAG, "file read failed: ${e.message}")
-            null
-        }
+    /** Outcome of a describe, so the caller can tell the user something true
+     *  instead of a generic "couldn't read the shared file". */
+    sealed class Outcome {
+        data class Ok(val file: ClipboardOutgoingFile) : Outcome()
+        /** Unreadable or empty. There is no longer a "too large". */
+        data class Unreadable(val why: String) : Outcome()
     }
 
-    private fun readInner(context: Context, uri: Uri): ClipboardOutgoingFile? {
+    /**
+     * Describe [uri] without reading it, or explain why it cannot be sent.
+     *
+     * The only I/O here is opening the stream briefly to prove it is readable.
+     * Discovering at pull time that a file was never readable would mean the
+     * user sees a share succeed and a transfer fail minutes later, so the cheap
+     * check is worth one open.
+     */
+    /** The file, or null if it could not be read or was over the cap.
+     *
+     *  For callers with nowhere to put the reason — a MediaStore auto-send, a
+     *  file-browser fetch. Anything facing the user should call [read] and say
+     *  which of the two it was: "too large" and "unreadable" are different
+     *  problems and only one of them is the user's to fix. */
+    fun readOrNull(context: Context, uri: Uri): ClipboardOutgoingFile? =
+        (read(context, uri) as? Outcome.Ok)?.file
+
+    fun read(context: Context, uri: Uri): Outcome {
         val cr = context.contentResolver
         val mime = cr.getType(uri) ?: "application/octet-stream"
         val name = displayName(context, uri) ?: "file"
-        // Ask how big it is BEFORE reading it. `readBytes()` pulls the whole
-        // file into the service's heap, so checking the cap afterwards means
-        // the one thing the cap exists to prevent — a file far too large to
-        // hold — has already happened. Harmless while this only ever saw
-        // screenshots; a phone video is hundreds of megabytes.
-        val declared = declaredSize(context, uri)
-        if (declared != null && declared > MAX_FILE_BYTES) {
-            Log.i(TAG, "file too large ($declared bytes) — not sent")
-            return null
-        }
-        val bytes = cr.openInputStream(uri)?.use { it.readBytes() }
-        return when {
-            bytes == null -> null
-            bytes.isEmpty() -> null
-            // Backstop: SIZE is provider-supplied and may be absent or wrong.
-            bytes.size > MAX_FILE_BYTES -> {
-                Log.i(TAG, "file too large (${bytes.size} bytes) — not sent")
-                null
-            }
-            else -> ClipboardOutgoingFile(bytes, name, mime)
+        val size = reportedSize(context, uri)
+
+        return try {
+            val readable = cr.openFileDescriptor(uri, "r")?.use { pfd ->
+                // A zero-length file is not worth a transfer, and an empty
+                // provider read is the usual symptom of a URI we cannot really
+                // open. `statSize` is -1 when the provider will not say, which
+                // is not itself a failure.
+                val st = try { pfd.statSize } catch (_: Exception) { -1L }
+                st != 0L
+            } ?: return Outcome.Unreadable("no file descriptor")
+            if (!readable) return Outcome.Unreadable("empty file")
+            Outcome.Ok(ClipboardOutgoingFile(uri, name, mime, size))
+        } catch (e: Exception) {
+            Log.w(TAG, "file not readable: ${e.message}")
+            Outcome.Unreadable(e.message ?: "read failed")
         }
     }
 
-    /** The provider's own SIZE for [uri], or null when it doesn't report one. */
-    private fun declaredSize(context: Context, uri: Uri): Long? = try {
+    /** `OpenableColumns.SIZE`, or -1 when the provider does not report one. */
+    private fun reportedSize(context: Context, uri: Uri): Long = try {
         context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
             ?.use { c ->
                 val idx = c.getColumnIndex(OpenableColumns.SIZE)
-                if (c.moveToFirst() && idx >= 0 && !c.isNull(idx)) c.getLong(idx) else null
-            }
+                if (c.moveToFirst() && idx >= 0 && !c.isNull(idx)) c.getLong(idx) else -1L
+            } ?: -1L
     } catch (_: Exception) {
-        null
+        -1L
     }
 
     private fun displayName(context: Context, uri: Uri): String? = try {

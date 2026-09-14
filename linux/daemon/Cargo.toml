@@ -55,15 +55,73 @@ serde_json = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 uuid = "1"
 thiserror = "1"
-bluer = { version = "0.17", features = ["bluetoothd"] }
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "signal"] }
+# The feature list must name everything we actually use. It used to stop at
+# "signal" and still built, because bluer/secret-service/zbus pulled the rest in
+# and Cargo unified the features — so moving those behind a target gate (below)
+# turned ~100 "module `sync` is private" errors loose on the Windows target.
+# Nothing here is platform-bound; the omission just wasn't visible with one OS.
+tokio = { version = "1", features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "signal",
+    "sync",      # mpsc/oneshot/Mutex/Notify/OnceCell, ~14 modules
+    "net",       # the LAN TCP transport
+    "io-util",   # AsyncReadExt/AsyncWriteExt over that transport
+    "process",   # spawning helpers (pactl, loginctl, xdg-user-dir)
+] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 humantime = "2"
 rand = "0.8"
-secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
 mdns-sd = "0.13"
+
+# ── platform-bound dependencies ───────────────────────────────────────────
+# Everything below is one OS's API surface and must stay behind
+# `core::platform`. Target-gating them is what lets `cargo check --target
+# x86_64-pc-windows-msvc` resolve at all: BlueZ, Secret Service and D-Bus have
+# no Windows build, and pulling them unconditionally fails during resolution
+# rather than in code you can cfg away.
+[target.'cfg(target_os = "windows")'.dependencies]
+# WinRT + Win32, feature-gated per namespace so we pull metadata for what we
+# actually call. BLE central lives in Devices_Bluetooth*; Devices_Enumeration is
+# how you find already-paired devices; Storage_Streams is the buffer type every
+# GATT read/write goes through; Win32_UI_Shell is SHGetKnownFolderPath and
+# Win32_System_Com is the CoTaskMemFree that pairs with it.
+windows = { version = "0.62", features = [
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Enumeration",
+    "Foundation",
+    "Foundation_Collections",
+    "Storage_Streams",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    "Win32_System_Com",
+    # The AUMID shortcut that makes toasts visible at all: a PROPVARIANT in the
+    # shortcut's property store (StructuredStorage) keyed by a PROPERTYKEY
+    # (PropertiesSystem). See `notify::register_aumid_shortcut`.
+    "Win32_System_Com_StructuredStorage",
+    # PROPVARIANT is gated on the Variant namespace even though we only need its
+    # VT_LPWSTR tag.
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Shutdown",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
 # Re-use the zbus that secret-service already pulls in for direct
 # MPRIS calls (call-handoff media pause/resume).
 zbus = { version = "5", default-features = false, features = ["tokio"] }

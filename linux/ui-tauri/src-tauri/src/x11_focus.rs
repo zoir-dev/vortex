@@ -24,6 +24,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// `cache` holds the resolved X id between calls: the tree walk costs a
 /// round-trip PER window, which is both slow and pointless for a window we only
 /// ever hide (close is `hide()` + `prevent_close()`, so the id outlives it).
+/// Nothing to force where there is no X server: the window manager's own focus
+/// rules apply, and Tauri's `set_focus()` is honoured. The X11 version exists
+/// because Mutter grants focus and then takes it back a beat later.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn raise_and_focus(
+    matches: fn(&str) -> bool,
+    cache: &'static AtomicU32,
+    tag: &'static str,
+) {
+    let _ = (matches, cache, tag);
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn raise_and_focus(
     matches: fn(&str) -> bool,
     cache: &'static AtomicU32,

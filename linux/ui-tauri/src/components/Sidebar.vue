@@ -16,6 +16,12 @@ import {
   Settings,
   Users,
 } from "lucide-vue-next";
+// The logo asset is kept at 128px on purpose. It is drawn at 30px here and
+// at most 56px anywhere else, and the webview has no compositing (see the
+// WEBKIT_DISABLE_DMABUF_RENDERER note in src-tauri/src/main.rs), so every
+// repaint anywhere in the window re-samples this image. At the original
+// 512px that single rescale cost ~60% of a core while the connection dot
+// was pulsing; at 128px it is ~16x less work and the same pixels on screen.
 import logo from "@/assets/vortex_logo.png";
 import { unreadConversations } from "@/composables/useMessages";
 

@@ -24,7 +24,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * So every offer is tracked until the laptop has actually FETCHED it: retried
  * while it can't be delivered, watched for a pull once it has been, and
  * surfaced as a toast when it ends up nowhere. The stashed blob is untouched
- * either way — [com.vortex.a3.core.clipboard.ClipboardBlobStore] keeps it
+ * either way — [com.vortex.a3.core.fs.ShareGrants] keeps it
  * addressable, so a later re-share of the same file is free.
  */
 
@@ -197,9 +197,9 @@ internal fun VortexStack.noteFileServed(token: String) {
     val done = pendingOffers.remove(token) ?: return
     Log.i(VortexStack.TAG, "file '${done.name}' fetched by the laptop")
     // The one unambiguous "it worked" moment on this device: the laptop has the
-    // bytes. Per file rather than per batch, so a slow batch shows progress as
-    // it goes instead of one summary at the end.
-    if (!done.quiet) toastOffer("File sent: ${done.name}")
+    // bytes. Feeds the batch's progress notification and releases the next
+    // queued file — a toast per file meant 150 toasts for a 150-file share.
+    shareQueue.noteServed(done.name)
     // SLIDING deadline, like the daemon's bulk-sync idle budget: the laptop
     // pulls one file per heartbeat round, so a big batch's last offer can
     // legitimately wait many minutes for its turn. A fetch anywhere in the

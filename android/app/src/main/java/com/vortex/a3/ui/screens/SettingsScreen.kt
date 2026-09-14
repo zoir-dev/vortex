@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -29,6 +30,7 @@ import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Movie
+import androidx.compose.material.icons.outlined.Storage
 import androidx.compose.material.icons.outlined.Headset
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.LightMode
@@ -100,10 +102,22 @@ fun SettingsScreen(
     onPickSharedFolder: () -> Unit,
     screenControlOn: Boolean,
     onScreenControlClick: () -> Unit,
+    allFilesOn: Boolean,
+    onAllFilesClick: () -> Unit,
     onBack: () -> Unit,
 ) {
     Column(
-        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            // targetSdk 36 makes edge-to-edge mandatory: the app draws behind
+            // the status bar whether it asks to or not, so this header sat in
+            // the same band as the clock, where the system consumes the touch.
+            // The back arrow rendered fine and simply did not respond, which
+            // reads as a broken button rather than a mispositioned one.
+            // Background BEFORE padding, so the status bar still sits on our
+            // colour instead of a bare strip.
+            .systemBarsPadding(),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
@@ -301,6 +315,20 @@ fun SettingsScreen(
                     else "Off — tap to enable in Accessibility",
                     status = if (screenControlOn) "On" else "Off",
                     onClick = onScreenControlClick,
+                )
+                ActionRow(
+                    icon = Icons.Outlined.Storage,
+                    title = "Allow access to any files",
+                    // Says what it costs before it is granted, and what it
+                    // replaces once it is: with all-files on, the picked
+                    // folders are superseded rather than added to, and showing
+                    // the same file under two paths would be worse than saying
+                    // so here.
+                    hint = if (allFilesOn)
+                        "On — the laptop can browse all of your storage, read-only"
+                    else "Off — instead of picking folders, share everything (asks Android)",
+                    status = if (allFilesOn) "On" else "Off",
+                    onClick = onAllFilesClick,
                 )
             }
         }

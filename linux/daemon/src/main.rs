@@ -22,9 +22,11 @@ use vortex_l3_daemon::core::pairing::handshake::{
 };
 use vortex_l3_daemon::core::pairing::backoff::{BackoffState, NextAction};
 use vortex_l3_daemon::core::pairing::reconnect::run_ik_initiator;
+use vortex_l3_daemon::core::platform::linux::LinuxGattLink;
 use vortex_l3_daemon::core::storage::{
     load_or_generate,
-    peers::{PeerStore, SecretServicePeerStore, TrustedPeer},
+    peers::{PeerStore, TrustedPeer},
+    peers_secret_service::SecretServicePeerStore,
     secret_service::SecretServiceIdentityStore,
     IdentityStore, InMemoryIdentityStore,
 };
@@ -246,10 +248,11 @@ async fn cmd_pair(
     adapter.set_powered(true).await?;
     let client = VortexClient::connect(&adapter, addr).await?;
     info!(%addr, "connected; running pairing");
+    let link = LinuxGattLink::from_client(adapter.clone(), &client);
 
     let local_name = read_local_hostname();
     let outcome = run_pairing_initiator(
-        &client,
+        &link,
         &identity.static_priv.0,
         std::time::Duration::from_secs(60),
         |sas: &str| {
@@ -364,12 +367,13 @@ async fn cmd_reconnect(
     }
 
     let client = VortexClient::connect(&adapter, addr).await?;
+    let link = LinuxGattLink::from_client(adapter.clone(), &client);
 
     let local_counter = peer_store
         .load_counter(&peer.peer_static_pub)
         .unwrap_or(0);
     let outcome = run_ik_initiator(
-        &client,
+        &link,
         &identity.static_priv.0,
         &peer.peer_static_pub,
         &peer.prs,
@@ -537,8 +541,9 @@ async fn cmd_auto_reconnect(
                 let local_counter = peer_store
                     .load_counter(&peer.peer_static_pub)
                     .unwrap_or(0);
+                let link = LinuxGattLink::from_client(adapter.clone(), &client);
                 match run_ik_initiator(
-                    &client,
+                    &link,
                     &identity.static_priv.0,
                     &peer.peer_static_pub,
                     &peer.prs,
@@ -627,8 +632,9 @@ async fn cmd_handshake(addr: bluer::Address) -> Result<(), Box<dyn std::error::E
     info!(adapter = %adapter.name(), %addr, "connecting for XX handshake");
 
     let client = VortexClient::connect(&adapter, addr).await?;
+    let link = LinuxGattLink::from_client(adapter.clone(), &client);
     let outcome = run_xx_initiator(
-        &client,
+        &link,
         &identity.static_priv.0,
         std::time::Duration::from_secs(15),
     )

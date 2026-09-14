@@ -15,8 +15,8 @@
       {
         "label": "main",
         "title": "Vortex",
-        "width": 760,
-        "height": 880,
+        "width": 920,
+        "height": 860,
         "minWidth": 560,
         "minHeight": 600,
         "center": true,
@@ -41,7 +41,8 @@
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
-      "icons/128x128@2x.png"
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
     ],
     "linux": {
       "rpm": {

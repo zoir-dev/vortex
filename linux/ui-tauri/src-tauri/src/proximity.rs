@@ -401,7 +401,7 @@ async fn desktop_notify(title: &str, text: &str) {
     >(serde_json::json!({ "app": "Vortex", "title": title, "text": text })) else {
         return;
     };
-    let _ = vortex_l3_daemon::core::notification_display::show(&n, 0).await;
+    let _ = crate::notify::show_mirror(&n, 0).await;
 }
 
 /// Spawn the proximity watcher: a 2s sampling loop (woken instantly by
@@ -441,7 +441,7 @@ pub(crate) fn spawn_proximity_watch(
                     .unwrap_or(0);
                 let link_live = !ble_writers.lock().await.is_empty();
                 let last_presence_ms =
-                    crate::ble::LAST_PRESENCE_MS.load(Ordering::Relaxed);
+                    crate::presence::LAST_PRESENCE_MS.load(Ordering::Relaxed);
                 let adapter_on = adapter.is_powered().await.unwrap_or(false);
                 let locked = session_lock::locked_hint().await;
                 // Idle time only matters for the lock decision; skip the
@@ -467,7 +467,7 @@ pub(crate) fn spawn_proximity_watch(
                         // The phone answering on the LAN is presence too. The
                         // window matches the pill sweeper's "we are in contact"
                         // threshold.
-                        peer_contact_fresh: crate::ble::peer_contact_age_ms() < AWAY_GRACE_MS,
+                        peer_contact_fresh: crate::presence::peer_contact_age_ms() < AWAY_GRACE_MS,
                         // Only costs a D-Bus round-trip when a lock is possible.
                         media_active: auto_lock_on
                             && vortex_l3_daemon::core::media_runtime::any_player_playing().await,
@@ -487,7 +487,7 @@ pub(crate) fn spawn_proximity_watch(
                         // last heartbeat seconds before the session died)
                         // must not veto the fast path.
                         let presence_before =
-                            crate::ble::LAST_PRESENCE_MS.load(Ordering::Relaxed);
+                            crate::presence::LAST_PRESENCE_MS.load(Ordering::Relaxed);
                         let found = crate::ble::find_trusted_presence_peer(
                             &adapter,
                             &peer_store,
@@ -495,7 +495,7 @@ pub(crate) fn spawn_proximity_watch(
                         )
                         .await
                         .is_some()
-                            || crate::ble::LAST_PRESENCE_MS.load(Ordering::Relaxed)
+                            || crate::presence::LAST_PRESENCE_MS.load(Ordering::Relaxed)
                                 > presence_before;
                         if found {
                             tracing::info!(

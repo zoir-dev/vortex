@@ -435,10 +435,11 @@ impl AppState {
     pub fn now_laptop() -> Self {
         let battery = crate::core::status::read_local_battery().0;
         let charging = crate::core::status::read_local_charging();
-        let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // Via the seam: this used to read `/proc` directly, so off Linux every
+        // heartbeat reported `None` and the phone displayed the laptop as
+        // "null" — overwriting the name it had just learned from the pairing
+        // APPROVE frame, which comes from the same function.
+        let name = crate::core::platform::host_name();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

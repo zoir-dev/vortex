@@ -93,13 +93,25 @@ class CallLogProvider(
         }
     }
 
+    /**
+     * The most recent [LIMIT] calls, newest-first.
+     *
+     * The row cap is [queryCallLog]'s Kotlin `cap`, NOT a SQL `LIMIT` appended
+     * to the sort order: the call-log provider validates `sortOrder` and throws
+     * `IllegalArgumentException("Invalid token LIMIT")` (seen on Android 16 /
+     * OnePlus), which made every read fail — silently here, and as
+     * `call_log_history: "error"` on the laptop's bulk-sync. Don't re-add it.
+     */
     private fun readCallLog(): List<CallLogEntry> =
-        queryCallLog(null, null, "${CallLog.Calls.DATE} DESC LIMIT $LIMIT", LIMIT)
+        queryCallLog(null, null, "${CallLog.Calls.DATE} DESC", LIMIT)
 
     /**
      * Read calls NEWER than [sinceMs] (oldest-first, up to [limit]) for the
      * laptop's LAN bulk-sync history backfill — the watermark twin of
      * [com.vortex.a3.core.sms.SmsProvider.readHistorySince].
+     *
+     * [limit] is enforced in Kotlin, not as a SQL `LIMIT` in the sort order —
+     * same provider rejection as [readCallLog].
      */
     fun readHistorySince(sinceMs: Long, limit: Int): List<CallLogEntry> {
         if (!hasPermission()) return emptyList()
@@ -107,7 +119,7 @@ class CallLogProvider(
         return queryCallLog(
             "${CallLog.Calls.DATE} > ?",
             arrayOf(sinceMs.toString()),
-            "${CallLog.Calls.DATE} ASC LIMIT $cap",
+            "${CallLog.Calls.DATE} ASC",
             cap,
         )
     }
@@ -141,7 +153,7 @@ class CallLogProvider(
             val dateIdx = c.getColumnIndex(CallLog.Calls.DATE)
             val durIdx = c.getColumnIndex(CallLog.Calls.DURATION)
             while (c.moveToNext()) {
-                if (out.size >= cap) break // guard if the SQL LIMIT is ignored
+                if (out.size >= cap) break // sole row limit: see readCallLog
                 val id = if (idIdx >= 0) c.getString(idIdx).orEmpty() else ""
                 out.add(
                     CallLogEntry(

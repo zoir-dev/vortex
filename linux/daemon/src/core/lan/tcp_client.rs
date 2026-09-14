@@ -189,7 +189,7 @@ pub(crate) fn build_ik_initiator(
     // achieves the same goal — wrong PRS yields different MixHash and
     // breaks AEAD verification on msg1.
     let params: NoiseParams = NOISE_IK.parse()?;
-    let prologue = crate::core::pairing::reconnect::prologue_with_prs(prs);
+    let prologue = crate::core::crypto::noise::prologue_with_prs(prs);
     Builder::new(params)
         .local_private_key(static_priv)?
         .remote_public_key(peer_static_pub)?

@@ -14,7 +14,6 @@ use tokio::sync::Mutex;
 
 use vortex_l3_daemon::core::call_event::{action, CallControl, CallEvent};
 use vortex_l3_daemon::core::live_activity::LiveActivity;
-use vortex_l3_daemon::core::notification_display;
 
 /// Call-mirror channel handle, published once so the LAN heartbeat (and the
 /// BLE STATE consumer) can feed a peer AppState's `call` into the same call
@@ -504,7 +503,7 @@ pub(crate) async fn spawn_consumer(
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                if crate::ble::peer_contact_age_ms() <= BANNER_STALE_MS {
+                if crate::presence::peer_contact_age_ms() <= BANNER_STALE_MS {
                     continue;
                 }
                 let id = {
@@ -522,7 +521,7 @@ pub(crate) async fn spawn_consumer(
                          its buttons could not have worked",
                         BANNER_STALE_MS / 1000
                     );
-                    let _ = notification_display::close(id).await;
+                    let _ = crate::notify::close(id).await;
                 }
             }
         });
@@ -538,7 +537,7 @@ pub(crate) async fn spawn_consumer(
                 // A call frame is proof of live phone contact (the LAN heartbeat
                 // is pinned to 2s while a call is mirrored) → gates the
                 // disconnect-clear of mirror pills.
-                crate::ble::touch_peer_contact();
+                crate::presence::touch_peer_contact();
                 // Dedup the SAME (id, phase) arriving over both transports (BLE
                 // CALL frame + AppState `call` re-sent every heartbeat). First
                 // one wins; the rest are no-ops. An empty id (the LAN-synthesized
@@ -657,7 +656,7 @@ pub(crate) async fn spawn_consumer(
                             ("call:decline".to_string(), "Decline".to_string()),
                         ];
                         let prev = state.lock().await.banner_id;
-                        match notification_display::show_call_banner(
+                        match crate::notify::show_banner(
                             &title, &body, &ev.app_id, &actions, prev, true,
                         )
                         .await
@@ -691,7 +690,7 @@ pub(crate) async fn spawn_consumer(
                             s.banner_id
                         };
                         if id != 0 {
-                            let _ = notification_display::close(id).await;
+                            let _ = crate::notify::close(id).await;
                             state.lock().await.banner_id = 0;
                         }
                         let caller = if !ev.name.is_empty() {
@@ -791,7 +790,7 @@ pub(crate) async fn spawn_consumer(
                                 if tick_gen2.load(Ordering::SeqCst) != my_gen {
                                     break; // call ended / re-answered → stop
                                 }
-                                if crate::ble::peer_contact_age_ms() > CONTACT_LOST_MS {
+                                if crate::presence::peer_contact_age_ms() > CONTACT_LOST_MS {
                                     tracing::info!(
                                         "call pill keep-alive: no contact with the phone for over {}s \
                                          — letting the pill expire",
@@ -838,7 +837,7 @@ pub(crate) async fn spawn_consumer(
                             id
                         };
                         if id != 0 {
-                            let _ = notification_display::close(id).await;
+                            let _ = crate::notify::close(id).await;
                         }
                         // The banner was still up (never answered) and the
                         // call was incoming → MISSED: leave a notification
@@ -852,7 +851,7 @@ pub(crate) async fn spawn_consumer(
                             };
                             let actions =
                                 vec![(format!("call:redial:{}", ev.number), "Call back".to_string())];
-                            match notification_display::show_call_banner(
+                            match crate::notify::show_banner(
                                 &title,
                                 "Missed call",
                                 &ev.app_id,
@@ -899,7 +898,7 @@ pub(crate) async fn spawn_consumer(
         let state = state.clone();
         let writer = call_writer.clone();
         let (act_tx, mut act_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
-        tokio::spawn(notification_display::watch_actions(act_tx));
+        crate::notify::watch_actions(act_tx);
         tokio::spawn(async move {
             while let Some((_id, key)) = act_rx.recv().await {
                 let Some(verb) = key.strip_prefix("call:") else {
@@ -946,7 +945,7 @@ pub(crate) async fn spawn_consumer(
         let state = state.clone();
         let writer = call_writer.clone();
         let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
-        tokio::spawn(notification_display::watch_closed(closed_tx));
+        crate::notify::watch_closed(closed_tx);
         tokio::spawn(async move {
             while let Some((id, reason)) = closed_rx.recv().await {
                 // reason 2 = dismissed by the user; 3 = our own close() on
@@ -974,7 +973,7 @@ pub(crate) async fn spawn_consumer(
                     ("call:accept".to_string(), "Accept".to_string()),
                     ("call:decline".to_string(), "Decline".to_string()),
                 ];
-                match notification_display::show_call_banner(&title, &body, &app_id, &actions, 0, false).await {
+                match crate::notify::show_banner(&title, &body, &app_id, &actions, 0, false).await {
                     Ok(new_id) => {
                         let mut s = state.lock().await;
                         if !s.call_id.is_empty() {

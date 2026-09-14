@@ -11,7 +11,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -63,6 +62,16 @@ class MainActivity : ComponentActivity() {
      *  can correlate both transports as the same device. Computed
      *  once when the LanServer enters PairingWindow mode. */
     internal var pairingInstanceId: ByteArray? = null
+
+    /** Drives a user-opened "pair another laptop" window: the advertise +
+     *  bounded-close sequence in [startPairingWindow]. Cancelled when the
+     *  window is closed early (user Cancel, or a successful pair). */
+    internal var pairingWindowJob: kotlinx.coroutines.Job? = null
+
+    /** Set when [onAddPairClicked] had to ask for permissions first, so the
+     *  grant callback opens a pairing window instead of falling through to
+     *  the default (trusted-presence) advertising mode. */
+    internal var pendingPairingWindow = false
 
     internal val state = MutableStateFlow<AdvertiseState>(AdvertiseState.Idle)
     internal val identityState = MutableStateFlow<IdentityRecord?>(null)
@@ -167,6 +176,12 @@ class MainActivity : ComponentActivity() {
      *  back on. */
     internal val bluetoothOff = MutableStateFlow(false)
 
+    /** True while a "switch laptop" seek window is open. Mirrored from the
+     *  service (which owns the window and its expiry) by the same 3 s
+     *  ticker that refreshes staleness, so a window that times out on its
+     *  own stops showing as busy without needing a callback. */
+    internal val seekingLaptop = MutableStateFlow(false)
+
     /** True while [btStateReceiver] is registered, so onPause unregisters
      *  exactly once (double-unregister throws). */
     private var btReceiverRegistered = false
@@ -198,6 +213,8 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { granted ->
         val denied = granted.filterValues { !it }.keys
+        val wantWindow = pendingPairingWindow
+        pendingPairingWindow = false
         // Only a denied BLUETOOTH permission can stop us: without the radio
         // there is nothing to advertise on. Declining SMS or call-log access
         // costs the user those features, not the ability to pair — which is
@@ -210,7 +227,9 @@ class MainActivity : ComponentActivity() {
                     "pairing on without optional permissions: ${denied.joinToString()}",
                 )
             }
-            startAdvertising()
+            // "Add pair" asked for these; honour that instead of
+            // startAdvertising(), which would pick trusted-presence.
+            if (wantWindow) startPairingWindow() else startAdvertising()
         } else {
             state.value = AdvertiseState.Error("permissions denied: ${blocking.joinToString()}")
         }
@@ -223,6 +242,80 @@ class MainActivity : ComponentActivity() {
     internal val essentialPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { /* no-op */ }
+
+    /**
+     * Folder picker for filesystem sharing (design doc §5).
+     *
+     * SAF trees rather than `MANAGE_EXTERNAL_STORAGE`: pairing a laptop proves
+     * identity, not authorisation, and it should not follow that the laptop can
+     * read the whole phone. The user picks exactly what is shared, and the
+     * grant Android persists IS the allowlist the server enforces — there is no
+     * second list of ours that could drift from it.
+     */
+    internal val sharedFolderLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult // user backed out
+        if (com.vortex.a3.core.fs.FsRoots(this).grant(uri)) {
+            android.widget.Toast.makeText(
+                this,
+                "Shared with your laptop, read-only",
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
+    /**
+     * Open Android's all-files-access screen.
+     *
+     * Only reachable from the "Allow access to any files" setting — never on
+     * the first-run path. It is a special access, granted on a system screen we
+     * cannot skip, and the honest default is the folder picker: pairing a
+     * laptop should not quietly come to mean handing over the whole phone
+     * (design doc §5).
+     *
+     * Toggling off is Android's job too, on the same screen, so there is one
+     * place that decides and nothing of ours to keep in step.
+     */
+    internal fun openAllFilesAccess() {
+        val intents = listOf(
+            // App-specific screen first: it lands on our entry with the toggle
+            // right there.
+            android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                android.net.Uri.parse("package:$packageName"),
+            ),
+            // Some OEM ROMs (MIUI among them) do not implement the per-app
+            // screen and throw; the global list is the documented fallback.
+            android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION,
+            ),
+        )
+        for (i in intents) {
+            try {
+                startActivity(i)
+                return
+            } catch (_: Exception) {
+                // Try the next one.
+            }
+        }
+        android.widget.Toast.makeText(
+            this,
+            "This phone has no all-files access screen",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    /** Open the folder picker. Adding is the only action here: revoking is
+     *  Android's own "remove permission" in app settings, and duplicating it
+     *  would give two places that must agree about what is shared. */
+    internal fun pickSharedFolder() {
+        try {
+            sharedFolderLauncher.launch(null)
+        } catch (e: Exception) {
+            android.util.Log.w("VortexFs", "no document picker available: ${e.message}")
+        }
+    }
 
     /** Dedicated READ_PHONE_STATE request used on the trusted-launch path
      *  (which starts the service directly, bypassing the BLE permission
@@ -249,20 +342,6 @@ class MainActivity : ComponentActivity() {
     /** The folder picker behind "let the laptop browse a folder". The grant is
      *  persisted on the way back so it survives a restart; a cancelled pick
      *  returns null and simply changes nothing. */
-    private val folderPickLauncher = registerForActivityResult(
-        ActivityResultContracts.OpenDocumentTree(),
-    ) { uri ->
-        if (uri != null) com.vortex.a3.core.files.PhoneFiles.persistGrant(this, uri)
-    }
-
-    internal fun pickSharedFolder() {
-        try {
-            folderPickLauncher.launch(null)
-        } catch (e: Exception) {
-            android.util.Log.w("PhoneFiles", "no folder picker available: ${e.message}")
-        }
-    }
-
     internal fun requestMediaPermission() {
         val missing = com.vortex.a3.core.media.mediaReadPermissions().filter {
             androidx.core.content.ContextCompat.checkSelfPermission(this, it) !=
@@ -274,11 +353,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Dev-only: keep the screen on so the lab tester can read the
-        // generated identity. Production removes this.
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        window.addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
-        window.addFlags(WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD)
+        // No KEEP_SCREEN_ON / TURN_SCREEN_ON / DISMISS_KEYGUARD here. They were
+        // lab scaffolding — "keep the screen on so the tester can read the
+        // generated identity" — and left the phone unable to sleep for as long
+        // as Vortex was in front, with the keyguard flag quietly waiving a
+        // swipe lock screen whenever this activity came up. Nothing in the app
+        // depends on them: the phone-to-laptop mirror holds its own
+        // SCREEN_DIM_WAKE_LOCK inside ScreenMirrorService (it has to, since it
+        // keeps capturing with the activity gone), LaptopMirrorActivity sets
+        // its own FLAG_KEEP_SCREEN_ON while you watch the laptop, and
+        // RingActivity wakes the screen with setShowWhenLocked/setTurnScreenOn.
+        // If a screen ever genuinely needs to stay lit — the pairing SAS, say —
+        // scope the flag to that screen, not to the whole activity.
         uiSettings.load()                               // saved locale + theme
         val identity = identityStore.loadOrGenerate(Platform.Android)
         identityState.value = identity
@@ -345,6 +431,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             while (isActive) {
                 nowTickState.value = System.currentTimeMillis()
+                // The service owns the seek window and its 45 s expiry, so mirror
+                // it rather than tracking a second copy here — otherwise a window
+                // that times out on its own would keep showing as busy.
+                seekingLaptop.value = VortexService.isSeeking()
                 delay(3_000)
             }
         }
@@ -416,11 +506,16 @@ class MainActivity : ComponentActivity() {
         showNotifAccessDialog = showNotifAccessDialog,
         showAutostartDialog = showAutostartDialog,
         bluetoothOff = bluetoothOff,
+        seekingLaptop = seekingLaptop,
     )
 
     /** Bundle the activity's callbacks for the root composable. */
     private fun buildActions(): VortexActions = VortexActions(
         onForgetPeer = ::onForgetPeerClicked,
+        onAddPair = ::onAddPairClicked,
+        onCancelAddPair = ::endPairingWindow,
+        onSwitchLaptop = ::onSwitchLaptopClicked,
+        onSwitchToPeer = ::onSwitchToPeerClicked,
         onOpenAutostart = ::onOpenAutostartSettings,
         onDismissAutostartHint = ::dismissAutostartHint,
         onRequestBatteryWhitelist = ::onRequestBatteryWhitelist,
@@ -436,6 +531,7 @@ class MainActivity : ComponentActivity() {
         onOpenScreenControl = ::onOpenAccessibilitySettings,
         onRequestMediaPermission = ::requestMediaPermission,
         onPickSharedFolder = ::pickSharedFolder,
+        onOpenAllFilesAccess = ::openAllFilesAccess,
         onEnableBluetooth = ::onEnableBluetooth,
         isAggressiveOem = isAggressiveOemRom(),
         isIgnoringBatteryOptimizations = ::isIgnoringBatteryOptimizations,

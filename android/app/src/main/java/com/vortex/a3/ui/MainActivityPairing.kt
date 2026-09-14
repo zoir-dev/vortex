@@ -78,6 +78,11 @@ internal fun MainActivity.wirePairingOrchestrator(identity: IdentityRecord) {
                     } catch (e: Exception) {
                         android.util.Log.w("Pairing", "createBond: ${e.message}")
                     }
+                    // Remember the laptop's BD_ADDR so Forget can clear any BT
+                    // bond for it later (see PeerStore.loadPeerBtAddr). The
+                    // central's address here is the laptop's public static
+                    // address, so it stays valid for the life of the pairing.
+                    peerStore.savePeerBtAddr(outcome.peerStaticPub, outcome.device.address)
                     refreshPeerList()
                     state.value = AdvertiseState.TrustedPresence
                     // Hand off to the background service: stop our
@@ -126,6 +131,155 @@ internal fun MainActivity.startPairingWindowLanIfUntrusted(identity: IdentityRec
     lanServer = LanServer(applicationContext, identity, peerStore).also {
         it.start(LanServerMode.PairingWindow(instanceId))
     }
+}
+
+/**
+ * How long a user-opened "pair another laptop" window stays open before
+ * presence advertising is restored.
+ *
+ * Bounded on purpose: the window *preempts* the trusted-presence beacon, so
+ * an indefinitely-open one would leave this phone invisible to the laptop it
+ * is already paired with (and, worse, would read as "away" to that laptop's
+ * proximity auto-lock).
+ */
+internal const val PAIRING_WINDOW_MS = 120_000L
+
+/**
+ * Open a pairing window even though trust already exists — the phone-side
+ * counterpart of the laptop's "Add phone".
+ *
+ * Until now pairable mode was reachable only with an EMPTY peer list
+ * (`onResume`'s auto-start and `selectLaunchMode`), so a phone that had ever
+ * paired could not be offered to a second laptop without forgetting the
+ * first. That is the single-peer trap this unblocks.
+ *
+ * Why it has to preempt rather than run alongside presence: `Advertiser`
+ * holds one advertising set and `startWith` refuses while another is active,
+ * and once trust exists VortexService owns the radio, the GATT server and the
+ * LAN listener (an Activity-local LanServer would race it for port 51820).
+ * So the window stops the service, advertises pairable from the Activity, and
+ * hands the radio back when it closes.
+ */
+internal fun MainActivity.onAddPairClicked() {
+    val needed = requiredPermissions().filter {
+        ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+    }
+    if (needed.isEmpty()) {
+        startPairingWindow()
+    } else {
+        // Route the post-grant callback to the window instead of the default
+        // advertising mode, which would pick trusted-presence and silently do
+        // the opposite of what the user asked for.
+        pendingPairingWindow = true
+        permissionLauncher.launch(needed.toTypedArray())
+    }
+}
+
+internal fun MainActivity.startPairingWindow() {
+    val identity = identityState.value ?: run {
+        state.value = AdvertiseState.Error("identity not ready")
+        return
+    }
+    pairingWindowJob?.cancel()
+    state.value = AdvertiseState.Starting
+    // Release the radio, GATT server and LAN listener from the service first.
+    VortexService.stop(applicationContext)
+    pairingWindowJob = lifecycleScope.launch {
+        // The service tears down asynchronously; advertising before its
+        // BluetoothGattServer.close() lands makes our own start() fail with a
+        // busy adapter. Same reasoning as the 600 ms hand-off delay used when
+        // pairing completes, in the other direction.
+        delay(600)
+        val instanceId = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }
+        pairingInstanceId = instanceId
+        // mDNS instance must match the BLE payload_8 (spec §5.4) so a
+        // discoverer correlates the two transports.
+        lanServer = LanServer(applicationContext, identity, peerStore).also {
+            it.start(LanServerMode.PairingWindow(instanceId))
+        }
+        if (!gattServer.start()) {
+            state.value = AdvertiseState.Error("failed to start GATT server")
+            endPairingWindow()
+            return@launch
+        }
+        advertiser.startPairableAdvertiseWith(instanceId) { result ->
+            state.value = when (result) {
+                is Advertiser.StartResult.Started -> AdvertiseState.Active(result.payload)
+                is Advertiser.StartResult.Failed -> AdvertiseState.Error(result.reason)
+            }
+        }
+        delay(PAIRING_WINDOW_MS)
+        // Still pairable → nobody paired; close up and go back to presence.
+        // A successful pair already restarted the service via BothApproved,
+        // which leaves state at TrustedPresence, so this is a no-op then.
+        if (state.value is AdvertiseState.Active || state.value is AdvertiseState.Starting) {
+            endPairingWindow()
+        }
+    }
+}
+
+/** Close the window and give the radio back to the service. */
+internal fun MainActivity.endPairingWindow() {
+    pairingWindowJob?.cancel()
+    pairingWindowJob = null
+    advertiser.stopAll()
+    gattServer.stop()
+    lanServer?.stop()
+    lanServer = null
+    if (peerStore.list().isNotEmpty()) {
+        VortexService.start(applicationContext)
+        state.value = AdvertiseState.TrustedPresence
+    } else {
+        state.value = AdvertiseState.Idle
+    }
+}
+
+/**
+ * "Switch laptop": look for another remembered laptop while staying connected
+ * to the current one.
+ *
+ * Seek before release (design doc §D3) — nothing is dropped here. The service
+ * holds the current link for the whole window and only the arrival of a
+ * different laptop ends it, so a cancelled or fruitless seek leaves the phone
+ * exactly where it was. Pressing again while a window is open closes it, which
+ * doubles as Cancel without spending card space on a second control.
+ */
+internal fun MainActivity.onSwitchLaptopClicked() {
+    if (VortexService.isSeeking()) {
+        VortexService.stopSeeking()
+        seekingLaptop.value = false
+        return
+    }
+    val started = VortexService.startSeeking()
+    seekingLaptop.value = started
+    if (!started) {
+        // Refused: no stack running, or fewer than two remembered laptops. The
+        // card only offers the action with 2+, so this is the service-down case.
+        android.util.Log.i("VortexSwitch", "seek not started (service down?)")
+    }
+}
+
+/**
+ * Switch to one specific remembered laptop.
+ *
+ * Unlike [onSwitchLaptopClicked] this names the destination, so the seek
+ * advertises only that peer's token rather than cycling every remembered one —
+ * found as fast as the single-peer case, and less time on air.
+ */
+internal fun MainActivity.onSwitchToPeerClicked(peer: TrustedPeer) {
+    if (VortexService.isSeeking()) {
+        // Already looking; a second tap would only change the target
+        // mid-flight. Treat it as cancel, matching the header action.
+        VortexService.stopSeeking()
+        seekingLaptop.value = false
+        return
+    }
+    val started = VortexService.startSeeking(peer.peerStaticPub)
+    seekingLaptop.value = started
+    android.util.Log.i(
+        "VortexSwitch",
+        "targeted seek for '${peer.peerName ?: "laptop"}' started=$started",
+    )
 }
 
 internal fun MainActivity.onApproveClicked(outcome: PairingOrchestrator.HandshakeOutcome) {
@@ -187,6 +341,20 @@ internal fun MainActivity.onForgetPeerClicked(peer: TrustedPeer) {
         // be offline forever.
         kotlinx.coroutines.delay(1_500)
         VortexService.pendingRevokes.remove(hex)
+        // Drop any BT bond for this laptop BEFORE forgetting, while its
+        // address is still on file. Vortex never creates these bonds (Linux
+        // deliberately skips Device::pair()), but one added via the desktop's
+        // Bluetooth panel or left by an older build survives the peer-store
+        // wipe — and a bond the laptop no longer holds makes the next pairing
+        // fail during encryption with `timeout: service discovery`, which is
+        // the "retry several times until it works" symptom. Android also
+        // hides profile-less LE bonds from Settings, so this is the only way
+        // for the user to clear one.
+        peerStore.loadPeerBtAddr(peer.peerStaticPub)?.let { mac ->
+            val btAdapter =
+                getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
+            btAdapter?.let { com.vortex.a3.core.ble.BondCleaner.removeBond(it, mac) }
+        }
         peerStore.forget(peer.peerStaticPub)
         refreshPeerList()
         if (peerStore.list().isEmpty()) {
@@ -200,7 +368,12 @@ internal fun MainActivity.onForgetAllClicked() {
     // Legacy entrypoint — kept around for any future Settings page
     // 'Danger zone' but no longer wired into the home screen.
     VortexService.stop(applicationContext)
+    val btAdapter = getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
     for (peer in peerStore.list()) {
+        // Same bond cleanup as the single-peer path — see onForgetPeerClicked.
+        peerStore.loadPeerBtAddr(peer.peerStaticPub)?.let { mac ->
+            btAdapter?.let { com.vortex.a3.core.ble.BondCleaner.removeBond(it, mac) }
+        }
         peerStore.forget(peer.peerStaticPub)
     }
     refreshPeerList()

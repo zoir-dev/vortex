@@ -27,11 +27,28 @@ const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const SIZE_CHECK_EVERY: u64 = 512;
 
 pub fn log_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
-    base.unwrap_or_else(std::env::temp_dir).join("vortex")
+    // XDG state is the right home for a log on Linux — not cache, which a
+    // cleaner may delete, and deleting the log of the run that just failed is
+    // the opposite of useful.
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+        base.unwrap_or_else(std::env::temp_dir).join("vortex")
+    }
+    // Elsewhere, through the seam. Neither `XDG_STATE_HOME` nor `HOME` is set
+    // on Windows, so this fell all the way through to the temp directory —
+    // where a disk cleanup is entitled to remove exactly the evidence a first
+    // run on an untested platform exists to leave. The seam answers
+    // `%LOCALAPPDATA%\Vortex`, beside the app's other state.
+    #[cfg(not(target_os = "linux"))]
+    {
+        vortex_l3_daemon::core::platform::paths()
+            .logs()
+            .unwrap_or_else(|| std::env::temp_dir().join("vortex"))
+    }
 }
 
 pub fn log_path() -> PathBuf {

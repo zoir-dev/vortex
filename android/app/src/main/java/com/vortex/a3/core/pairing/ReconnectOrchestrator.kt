@@ -228,6 +228,18 @@ class ReconnectOrchestrator(
         Log.i(TAG, "   peer_static_pub = ${peerStaticPub.toHexPrefix()}")
         Log.i(TAG, "   transcript_hash = ${transcript.toHexPrefix()}")
 
+        // IK proved this address really is this peer, so it is safe to record
+        // (before IK we would only be trusting a presence-token match). This
+        // also backfills pairings made before the address was persisted at
+        // pair time, so Forget can clean their bonds without re-pairing.
+        runCatching { peerStore.savePeerBtAddr(peerStaticPub, device.address) }
+            .onSuccess {
+                // Prefix only, per the redaction rule above: enough to confirm
+                // which laptop was recorded, not enough to correlate.
+                Log.i(TAG, "   peer_bt_addr    = ${device.address.take(8)}…")
+            }
+            .onFailure { Log.w(TAG, "could not persist peer BT addr: ${it.message}") }
+
         states[device.address] = IkState.Established(peerStaticPub, transcript)
         // CopyOnWriteArrayList — iteration is lock-free over a snapshot,
         // safe to interleave with add()/forgetDevice() on other threads.

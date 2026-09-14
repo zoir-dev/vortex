@@ -36,20 +36,16 @@ pub(crate) static RESYNC_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RESYNC_FRAMES_SKIPPED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static REHANDSHAKE_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-use futures::{pin_mut, StreamExt};
 use snow::TransportState;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
-use bluer::gatt::WriteOp;
 
-use super::client::VortexClient;
+use super::AUDIO_SIGNAL_UUID;
+use crate::core::platform::{AudioHandoff, GattLink};
 use super::frame::{ty, Frame};
 use crate::core::appstate::AppState;
 use crate::core::audio_op::{AudioOp, AudioOpFrame};
-use crate::core::audio_orchestrator::SwitchOrchestrator;
-use crate::core::media_runtime::{pause_playing_for_call, MediaStateStore};
 
 /// Run the AUDIO_SIGNAL listener loop until the BLE notification stream
 /// closes (peer drops, adapter goes down, etc).
@@ -59,11 +55,13 @@ use crate::core::media_runtime::{pause_playing_for_call, MediaStateStore};
 /// the session is unsafe to continue (replayed nonces are NOT errors —
 /// the orchestrator silently drops them, same as the LAN path).
 pub async fn run_listener(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     peer_pub: [u8; 32],
-    orchestrator: Arc<SwitchOrchestrator>,
-    media_store: MediaStateStore,
+    // The local audio stack, for the one frame type that needs it. `None` on a
+    // platform with no audio backend: AUDIO_OP frames are then dropped and the
+    // other eighteen types carry on.
+    audio: Option<Arc<dyn AudioHandoff>>,
     // Additive state-push channel: a STATE frame (battery/charging) is
     // decoded to an `AppState` and forwarded here as (peer_pub, state).
     // The UI layer turns it into the same peer-state update a LAN
@@ -127,21 +125,29 @@ pub async fn run_listener(
     // from phone" pill. `None` drops them. Never touches the audio handoff.
     handoff_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::core::handoff::HandoffEvent>>,
     // Generic additive-frame channel: any allowed frame WITHOUT a dedicated
-    // handler above is forwarded raw as (frame_ty, decrypted_payload) here, so
-    // a new feature (e.g. notes) routes it entirely in its OWN module — no
-    // per-feature code in this transport file. `None` drops them.
-    raw_frame_tx: Option<tokio::sync::mpsc::UnboundedSender<(u8, Vec<u8>)>>,
+    // handler above is forwarded raw as (peer_pub, frame_ty,
+    // decrypted_payload) here, so a new feature (e.g. notes, peer handoff)
+    // routes it entirely in its OWN module — no per-feature code in this
+    // transport file. `None` drops them.
+    //
+    // The peer identity is part of the tuple because a frame's meaning can
+    // depend on WHO sent it: `PEER_HANDOFF` says "you are no longer my active
+    // peer", which is unactionable without knowing whose statement it is.
+    // Inferring it from "whoever is active right now" would be a guess.
+    raw_frame_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<crate::core::ble::frame::RawFrame>,
+    >,
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
-    let notifies = char
-        .notify()
-        .await
-        .map_err(|e| format!("subscribe AUDIO_SIGNAL: {e}"))?;
-    pin_mut!(notifies);
-    info!(addr = %client.address, "BLE audio-signal listener up");
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
+    // The seam delivers frames on a channel rather than as a Stream. Same
+    // ordering guarantee, which is what matters here: this cipher stream is
+    // nonce-sequenced, so a reordered frame would look exactly like a dropped
+    // one and burn a resync.
+    let (tx, mut notifies) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    link.subscribe(AUDIO_SIGNAL_UUID.as_u128(), tx).await?;
+    info!(addr = %link.peer(), "BLE audio-signal listener up");
     // Reconcile on (re)connect: ask the phone to re-send any active notification
     // we don't already have. Covers notifications posted while we were
     // disconnected (their notify had no subscriber) — the consumer carries our
@@ -185,8 +191,8 @@ pub async fn run_listener(
     loop {
         let raw: Vec<u8> = match reassembled.pop_front() {
             Some(inner) => inner,
-            None => match notifies.next().await {
-                Some(r) => r.to_vec(),
+            None => match notifies.recv().await {
+                Some(r) => r,
                 None => break,
             },
         };
@@ -227,6 +233,11 @@ pub async fn run_listener(
             && frame.ty != ty::WIFI_DIRECT_OFFER
             && frame.ty != ty::HANDOFF
             && frame.ty != ty::NOTES_SYNC
+            && frame.ty != ty::PEER_HANDOFF
+            && frame.ty != ty::FS_REQ
+            && frame.ty != ty::FS_META
+            && frame.ty != ty::FS_DATA
+            && frame.ty != ty::FS_ERR
         {
             warn!(
                 "audio-signal unexpected frame ty=0x{:02x}; ignoring",
@@ -586,7 +597,12 @@ pub async fn run_listener(
         // forward it raw to its own module. No feature logic in this file.
         if frame.ty != ty::AUDIO_OP {
             if let Some(tx) = raw_frame_tx.as_ref() {
-                let _ = tx.send((frame.ty, plain[..n].to_vec()));
+                let _ = tx.send(crate::core::ble::frame::RawFrame {
+                    peer_pub,
+                    ty: frame.ty,
+                    sub: frame.sub,
+                    payload: plain[..n].to_vec(),
+                });
             }
             continue;
         }
@@ -608,25 +624,22 @@ pub async fn run_listener(
         // leaving `pause_playing_for_call` with nothing to track on a
         // later resume. Doing it here, in parallel with the dispatch,
         // captures the playing set while it's still actually playing.
+        let Some(audio) = audio.as_ref() else {
+            debug!("no audio backend on this platform; dropping AUDIO_OP");
+            continue;
+        };
         if matches!(af.op, AudioOp::Request) {
-            let store = media_store.clone();
-            tokio::spawn(async move {
-                let paused = pause_playing_for_call(&store).await;
-                if !paused.is_empty() {
-                    info!(?paused, "BLE fast-path: paused MPRIS for call");
-                }
-            });
+            let audio = Arc::clone(audio);
+            tokio::spawn(async move { audio.pause_for_call().await });
         }
 
         // Dispatch on a fresh task so a slow responder can't stall the
         // notification stream. Same shape as audio_lan_session.rs uses.
-        let orch = orchestrator.clone();
+        let audio = Arc::clone(audio);
         let peer_copy = peer_pub;
-        tokio::spawn(async move {
-            let _ = orch.on_incoming(peer_copy, af).await;
-        });
+        tokio::spawn(async move { audio.on_incoming(peer_copy, af).await });
     }
-    info!(addr = %client.address, "BLE audio-signal listener: stream closed");
+    info!(addr = %link.peer(), "BLE audio-signal listener: stream closed");
     Ok(())
 }
 
@@ -644,14 +657,13 @@ pub async fn run_listener(
 /// dispatches into `SwitchOrchestrator.onIncoming` — same dispatch
 /// path as the LAN session.
 pub async fn write_audio_op(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     frame: AudioOpFrame,
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
     let json = frame
         .to_json()
         .map_err(|e| format!("AudioOpFrame to_json: {e}"))?;
@@ -659,7 +671,7 @@ pub async fn write_audio_op(
     // ciphertext buffer accordingly and truncate to the bytes
     // actually written.
     let mut ct = vec![0u8; json.len() + 16];
-    // Hold the lock across char.write — see write_state for why (nonce/wire
+    // Hold the lock across the write — see write_state for why (nonce/wire
     // lockstep; otherwise concurrent writers desync the phone's recv cipher).
     let mut t = transport.lock().await;
     let n = t
@@ -667,7 +679,13 @@ pub async fn write_audio_op(
         .map_err(|e| format!("audio-signal write_message: {e}"))?;
     ct.truncate(n);
     let wire = Frame::new(ty::AUDIO_OP, 0, ct).encode();
-    char.write(&wire)
+    // The ONE unacknowledged writer: `with_response = false`, i.e. an ATT Write
+    // Command. Audio-op opcodes are tiny and latency-critical (they carry the
+    // ~200 ms call handoff), so they stay under the Command size cap and skip
+    // the ACK that [`write_framed`] needs for everything larger. Previously
+    // this was bluer's bare `char.write()`, whose default IS a Command — the
+    // choice was implicit in the method name, so it is spelled out here.
+    link.write(AUDIO_SIGNAL_UUID.as_u128(), &wire, false)
         .await
         .map_err(|e| format!("BLE write to AUDIO_SIGNAL: {e}"))?;
     drop(t);
@@ -689,9 +707,8 @@ pub async fn write_audio_op(
 /// silently-dropped Command desynced it → "AEAD open failed" → session churn).
 /// AUDIO_SIGNAL advertises PROPERTY_WRITE, so a Request is valid. Used for every
 /// laptop→phone frame except the tiny latency-critical audio-op opcodes.
-async fn write_framed(char: &Characteristic, wire: &[u8]) -> bluer::Result<()> {
-    let req = CharacteristicWriteRequest { op_type: WriteOp::Request, ..Default::default() };
-    char.write_ext(wire, &req).await
+async fn write_framed(link: &dyn GattLink, wire: &[u8]) -> Result<(), String> {
+    link.write(AUDIO_SIGNAL_UUID.as_u128(), wire, true).await
 }
 
 /// Push an `AppState` (battery/charging) to the peer over the AUDIO_SIGNAL
@@ -701,14 +718,13 @@ async fn write_framed(char: &Characteristic, wire: &[u8]) -> bluer::Result<()> {
 /// laptop's power-watcher to push instantly over BLE instead of waiting
 /// for the LAN heartbeat.
 pub async fn write_state(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     state: &AppState,
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
     let json = serde_json::to_vec(state).map_err(|e| format!("AppState to_json: {e}"))?;
     let mut ct = vec![0u8; json.len() + 16];
     // Hold the transport lock ACROSS the BLE write: the AEAD nonce bump and the
@@ -723,7 +739,7 @@ pub async fn write_state(
         .map_err(|e| format!("state write_message: {e}"))?;
     ct.truncate(n);
     let wire = Frame::new(ty::STATE, 0, ct).encode();
-    write_framed(char, &wire)
+    write_framed(link, &wire)
         .await
         .map_err(|e| format!("BLE write STATE to AUDIO_SIGNAL: {e}"))?;
     drop(t);
@@ -737,14 +753,13 @@ pub async fn write_state(
 /// notification display, never to the audio orchestrator. Content is not
 /// logged.
 pub async fn write_notification(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     notif: &crate::core::notif_mirror::NotificationMirror,
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
     let json = serde_json::to_vec(notif).map_err(|e| format!("notif to_json: {e}"))?;
     let mut ct = vec![0u8; json.len() + 16];
     // Hold the lock across char.write — see write_state (nonce/wire lockstep).
@@ -754,7 +769,7 @@ pub async fn write_notification(
         .map_err(|e| format!("notif write_message: {e}"))?;
     ct.truncate(n);
     let wire = Frame::new(ty::NOTIFICATION, 0, ct).encode();
-    write_framed(char, &wire)
+    write_framed(link, &wire)
         .await
         .map_err(|e| format!("BLE write NOTIFICATION to AUDIO_SIGNAL: {e}"))?;
     debug!(app = %notif.app, "→ BLE notification push (laptop→phone)");
@@ -767,23 +782,23 @@ pub async fn write_notification(
 /// feature knowledge — a feature module (e.g. notes) supplies its own frame
 /// type + payload, keeping all of its logic in its own file.
 pub async fn write_sealed(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     ty: u8,
+    sub: u8,
     payload: &[u8],
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
     let mut ct = vec![0u8; payload.len() + 16];
     let mut t = transport.lock().await;
     let n = t
         .write_message(payload, &mut ct)
         .map_err(|e| format!("sealed write_message: {e}"))?;
     ct.truncate(n);
-    let wire = Frame::new(ty, 0, ct).encode();
-    write_framed(char, &wire)
+    let wire = Frame::new(ty, sub, ct).encode();
+    write_framed(link, &wire)
         .await
         .map_err(|e| format!("BLE write 0x{ty:02x} to AUDIO_SIGNAL: {e}"))?;
     Ok(())
@@ -794,14 +809,13 @@ pub async fn write_sealed(
 /// writers; the phone routes CLIPBOARD frames to its system clipboard.
 /// Content is not logged (only length).
 pub async fn write_clipboard(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     clip: &crate::core::clipboard_mirror::ClipboardMirror,
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
     // Long text would overflow a single BLE frame → chunk it over CLIPBOARD_TEXT
     // (same `[total][idx][data]` wire + 12ms pacing as the image sender). Short
     // text keeps the fast single-frame CLIPBOARD path.
@@ -826,7 +840,7 @@ pub async fn write_clipboard(
                     .map_err(|e| format!("clipboard-text write_message: {e}"))?;
                 ct.truncate(n);
                 let wire = Frame::new(ty::CLIPBOARD_TEXT, 0, ct).encode();
-                write_framed(char, &wire)
+                write_framed(link, &wire)
                     .await
                     .map_err(|e| format!("BLE write CLIPBOARD_TEXT to AUDIO_SIGNAL: {e}"))?;
             }
@@ -849,7 +863,7 @@ pub async fn write_clipboard(
         .map_err(|e| format!("clipboard write_message: {e}"))?;
     ct.truncate(n);
     let wire = Frame::new(ty::CLIPBOARD, 0, ct).encode();
-    write_framed(char, &wire)
+    write_framed(link, &wire)
         .await
         .map_err(|e| format!("BLE write CLIPBOARD to AUDIO_SIGNAL: {e}"))?;
     debug!(chars = clip.text.chars().count(), "→ BLE clipboard push (laptop→phone)");
@@ -860,14 +874,13 @@ pub async fn write_clipboard(
 /// CLIPBOARD_IMAGE chunk frames. Each chunk is AEAD-sealed and paced so the
 /// BLE notify queue doesn't overflow (same discipline as the icon sender).
 pub async fn write_clipboard_image(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     png: &[u8],
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
     let chunks = crate::core::clipboard_mirror::build_image_chunks(png);
     let total = chunks.len();
     for payload in chunks {
@@ -886,7 +899,7 @@ pub async fn write_clipboard_image(
                 .map_err(|e| format!("clipboard-image write_message: {e}"))?;
             ct.truncate(n);
             let wire = Frame::new(ty::CLIPBOARD_IMAGE, 0, ct).encode();
-            write_framed(char, &wire)
+            write_framed(link, &wire)
                 .await
                 .map_err(|e| format!("BLE write CLIPBOARD_IMAGE to AUDIO_SIGNAL: {e}"))?;
         }
@@ -901,14 +914,13 @@ pub async fn write_clipboard_image(
 /// CALL_CONTROL frame (0x38). Same lock-across-write nonce discipline as the
 /// other writers; routed separately from the audio handoff.
 pub async fn write_call_control(
-    client: &VortexClient,
+    link: &dyn GattLink,
     transport: Arc<Mutex<TransportState>>,
     ctrl: &crate::core::call_event::CallControl,
 ) -> Result<(), String> {
-    let char = client
-        .audio_signal
-        .as_ref()
-        .ok_or_else(|| "peer has no AUDIO_SIGNAL characteristic".to_string())?;
+    if !link.has(AUDIO_SIGNAL_UUID.as_u128()) {
+        return Err("peer has no AUDIO_SIGNAL characteristic".to_string());
+    }
     let json = ctrl.to_json();
     let mut ct = vec![0u8; json.len() + 16];
     let mut t = transport.lock().await;
@@ -917,9 +929,191 @@ pub async fn write_call_control(
         .map_err(|e| format!("call-control write_message: {e}"))?;
     ct.truncate(n);
     let wire = Frame::new(ty::CALL_CONTROL, 0, ct).encode();
-    write_framed(char, &wire)
+    write_framed(link, &wire)
         .await
         .map_err(|e| format!("BLE write CALL_CONTROL to AUDIO_SIGNAL: {e}"))?;
     debug!(action = %ctrl.action, "→ BLE call-control push (laptop→phone)");
     Ok(())
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::core::crypto::noise::{NOISE_IK, PROLOGUE_IK};
+    use crate::core::platform::FakeGattLink;
+    use snow::Builder;
+
+    /// A matched pair of transport states, as an IK handshake leaves them.
+    ///
+    /// The receive path is nonce-sequenced, so testing it needs a real cipher
+    /// pair rather than a stub: the whole point of the resync logic is what
+    /// happens to a REAL nonce sequence when a frame goes missing.
+    fn transport_pair() -> (TransportState, TransportState) {
+        let init_priv = [0x11u8; 32];
+        let resp_priv = [0x22u8; 32];
+        let resp_pub = {
+            let d = x25519_dalek::StaticSecret::from(resp_priv);
+            *x25519_dalek::PublicKey::from(&d).as_bytes()
+        };
+        let params: snow::params::NoiseParams = NOISE_IK.parse().unwrap();
+        let mut init = Builder::new(params.clone())
+            .local_private_key(&init_priv)
+            .unwrap()
+            .remote_public_key(&resp_pub)
+            .unwrap()
+            .prologue(PROLOGUE_IK)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut resp = Builder::new(params)
+            .local_private_key(&resp_priv)
+            .unwrap()
+            .prologue(PROLOGUE_IK)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut b1 = vec![0u8; 1024];
+        let mut b2 = vec![0u8; 1024];
+        let n = init.write_message(&[], &mut b1).unwrap();
+        resp.read_message(&b1[..n], &mut b2).unwrap();
+        let n = resp.write_message(&[], &mut b2).unwrap();
+        init.read_message(&b2[..n], &mut b1).unwrap();
+        (
+            init.into_transport_mode().unwrap(),
+            resp.into_transport_mode().unwrap(),
+        )
+    }
+
+    /// Seal `payload` as the phone would, with the phone's send cipher.
+    fn phone_frame(phone: &mut TransportState, ty_byte: u8, payload: &[u8]) -> Vec<u8> {
+        let mut ct = vec![0u8; payload.len() + 16];
+        let n = phone.write_message(payload, &mut ct).unwrap();
+        ct.truncate(n);
+        Frame::new(ty_byte, 0, ct).encode()
+    }
+
+    /// Spawn the listener with only a raw-frame channel wired, and return it.
+    fn spawn_listener(
+        link: Arc<FakeGattLink>,
+        laptop: TransportState,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<crate::core::ble::frame::RawFrame>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        // Per-peer: the listener stamps every raw frame with the peer it came
+        // from, so a multi-peer consumer knows whose statement it is. The
+        // listener below is given the all-zero key, so that is what arrives.
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::core::ble::frame::RawFrame>();
+        let handle = tokio::spawn(async move {
+            run_listener(
+                &*link,
+                Arc::new(Mutex::new(laptop)),
+                [0u8; 32],
+                None, // no audio backend: exactly the Windows shape
+                // 13 feature channels we don't need here, then the raw one.
+                None, None, None, None, None, None, None, None, None, None, None,
+                None, None,
+                Some(raw_tx),
+            )
+            .await
+        });
+        (raw_rx, handle)
+    }
+
+    /// The dropped-notify recovery, driven deliberately rather than observed in
+    /// the wild.
+    ///
+    /// A BLE notify lost in flight desyncs the receive nonce, and every frame
+    /// after it fails to decrypt — permanently, unless the reader walks forward
+    /// to find the nonce that authenticates. This is the code that saved a
+    /// dropped file offer in production; now it has a test that skips a frame
+    /// on purpose and asserts the NEXT one still arrives.
+    #[tokio::test]
+    async fn a_dropped_frame_resyncs_instead_of_wedging_the_stream() {
+        let link = Arc::new(FakeGattLink::new(vec![AUDIO_SIGNAL_UUID.as_u128()]));
+        let (laptop, mut phone) = transport_pair();
+        let before = RESYNC_EVENTS.load(Ordering::Relaxed);
+        let (mut raw_rx, handle) = spawn_listener(Arc::clone(&link), laptop);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Frame 1 arrives normally.
+        link.push_notification(
+            AUDIO_SIGNAL_UUID.as_u128(),
+            phone_frame(&mut phone, ty::NOTES_SYNC, b"first"),
+        );
+        let got = raw_rx.recv().await.unwrap();
+        assert_eq!(
+            (got.peer_pub, got.ty, got.payload),
+            ([0u8; 32], ty::NOTES_SYNC, b"first".to_vec())
+        );
+
+        // Frame 2 is sealed and then THROWN AWAY — the link lost it. The phone's
+        // send nonce has advanced; the laptop's receive nonce has not.
+        let _lost = phone_frame(&mut phone, ty::NOTES_SYNC, b"lost");
+
+        // Frame 3 must still be delivered, by skipping the burnt nonce.
+        link.push_notification(
+            AUDIO_SIGNAL_UUID.as_u128(),
+            phone_frame(&mut phone, ty::NOTES_SYNC, b"third"),
+        );
+        let got = tokio::time::timeout(Duration::from_secs(2), raw_rx.recv())
+            .await
+            .expect("must not hang")
+            .expect("must not close");
+        assert_eq!((got.ty, got.payload), (ty::NOTES_SYNC, b"third".to_vec()));
+        assert!(
+            RESYNC_EVENTS.load(Ordering::Relaxed) > before,
+            "the recovery must be counted, not silent"
+        );
+
+        handle.abort();
+    }
+
+    /// A frame type outside the allow-list is dropped without being opened, so
+    /// an unexpected type can never consume a nonce or reach a feature channel.
+    #[tokio::test]
+    async fn an_unlisted_frame_type_is_ignored() {
+        let link = Arc::new(FakeGattLink::new(vec![AUDIO_SIGNAL_UUID.as_u128()]));
+        let (laptop, mut phone) = transport_pair();
+        let (mut raw_rx, handle) = spawn_listener(Arc::clone(&link), laptop);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // PAIRING_HANDSHAKE has no business on this characteristic.
+        link.push_notification(
+            AUDIO_SIGNAL_UUID.as_u128(),
+            phone_frame(&mut phone, ty::PAIRING_HANDSHAKE, b"nope"),
+        );
+        // …and a legitimate frame right after still lands, because the rejected
+        // one never touched the cipher.
+        link.push_notification(
+            AUDIO_SIGNAL_UUID.as_u128(),
+            phone_frame(&mut phone, ty::NOTES_SYNC, b"ok"),
+        );
+        let got = raw_rx.recv().await.unwrap();
+        assert_eq!(
+            (got.peer_pub, got.ty, got.payload),
+            ([0u8; 32], ty::NOTES_SYNC, b"ok".to_vec())
+        );
+        handle.abort();
+    }
+
+    /// A peer without the characteristic is refused up front rather than
+    /// failing later on the first write.
+    #[tokio::test]
+    async fn a_peer_without_the_characteristic_is_refused() {
+        let link = FakeGattLink::new(vec![]);
+        let (laptop, _phone) = transport_pair();
+        let err = run_listener(
+            &link,
+            Arc::new(Mutex::new(laptop)),
+            [0u8; 32],
+            None,
+            None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None,
+        )
+        .await
+        .expect_err("no AUDIO_SIGNAL characteristic");
+        assert!(err.contains("AUDIO_SIGNAL"), "{err}");
+    }
 }

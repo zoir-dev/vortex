@@ -14,6 +14,9 @@ use vortex_l3_daemon::core::storage::peers::PeerStore;
 // Channel protocol — identical in spirit to bin/ui.rs.
 // --------------------------------------------------------------------------
 
+// `Debug` so the non-Linux dispatcher can name a command it has no handler
+// for; a bare "unsupported" warn repeated every poll says nothing useful.
+#[derive(Debug)]
 pub(crate) enum UiCmd {
     Scan,
     Pair(String),
@@ -41,6 +44,19 @@ pub(crate) enum UiCmd {
     StartMirror { width: u32, height: u32, fps: u32, bitrate: u32 },
     /// Stop the active screen-mirror session.
     StopMirror,
+    /// "Switch device" on the connected card: keep the current phone, and
+    /// start looking for another *already-trusted* one.
+    ///
+    /// Deliberately not a release — the link is held until a replacement is
+    /// confirmed, so the reconnect loop has nothing to race back into and the
+    /// laptop can never end up connected to nothing (design doc §D3).
+    SwitchPeer,
+    /// Close the switch window without changing anything (user cancelled, or
+    /// it expired).
+    CancelSwitch,
+    /// Adopt this trusted peer (hex `peer_static_pub`) as the active one —
+    /// either the single candidate found, or the user's pick from several.
+    ActivatePeer(String),
 }
 
 /// Identity surface visible to the Vue layer. We deliberately keep
@@ -67,6 +83,10 @@ pub(crate) struct TrustedPeerDto {
     peer_static_pub: String,
     paired_at: u64,
     peer_name: Option<String>,
+    /// True for the peer that currently owns the session. With several
+    /// trusted phones the UI has to distinguish "remembered" from "the one
+    /// whose SMS and notifications you are looking at" — see `arbiter`.
+    active: bool,
 }
 
 /// Per-peer AppState snapshot pushed to the UI so it can render
@@ -155,6 +175,16 @@ fn peer_state_cache() -> &'static std::sync::Mutex<std::collections::HashMap<Str
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Which desktop this build is running on: `"linux"`, `"windows"`, ….
+///
+/// The frontend is ONE bundle on every platform — the same HTML and the same
+/// `invoke()` calls ship everywhere — so it cannot know this at build time. Ask
+/// it, and a Windows machine stops labelling its own card "Linux laptop".
+#[tauri::command]
+pub(crate) fn host_platform() -> &'static str {
+    std::env::consts::OS
+}
+
 /// Tauri command: pull the latest per-peer state over the invoke-response
 /// channel. The UI polls this every ~15s as a backstop to the pushed
 /// `vortex:peer_state` events — if those stop arriving, the poll keeps the
@@ -172,7 +202,7 @@ pub(crate) fn get_peer_states() -> Vec<PeerStateDto> {
     // connected. Tying the freshness to peer-contact makes the indicator track
     // the live LINK, not the last state change; a genuine disconnect stops the
     // beat, contact goes stale, and the card falls to Offline as before.
-    let in_contact = crate::ble::peer_contact_age_ms() < CONTACT_FRESH_MS;
+    let in_contact = crate::presence::peer_contact_age_ms() < CONTACT_FRESH_MS;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -217,6 +247,9 @@ pub(crate) struct CmdChannel(pub(crate) Sender<UiCmd>);
 /// tagged JSON shape the Vue side expects (`{ kind: "...", ... }`).
 /// Keeping the wire format Vue-side-friendly here means the UI never
 /// has to deal with serde-tagged variant decoding manually.
+/// Only meaningful where the earbuds hand-off exists — the DTO describes that
+/// state machine, and its type is the machine's own enum.
+#[cfg(target_os = "linux")]
 pub(crate) fn switch_state_dto(
     s: &vortex_l3_daemon::core::audio_orchestrator::SwitchState,
 ) -> serde_json::Value {
@@ -256,6 +289,7 @@ pub(crate) async fn emit_peers(app: &AppHandle, store: Arc<dyn PeerStore>) {
             let dtos: Vec<TrustedPeerDto> = list
                 .into_iter()
                 .map(|p| TrustedPeerDto {
+                    active: crate::arbiter::is_active(&p.peer_static_pub),
                     peer_static_pub: hex::encode(p.peer_static_pub),
                     paired_at: p.paired_at,
                     peer_name: p.peer_name,

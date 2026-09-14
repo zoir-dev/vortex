@@ -12,6 +12,7 @@
   "device": {
     "this": "This device",
     "linux": "Linux laptop",
+    "windows": "Windows laptop",
     "android": "Android phone",
     "earbuds": "Earbuds",
     "paired_badge": "{count} paired",
@@ -68,7 +69,24 @@
     "offline": "Offline",
     "forget_title": "Forget device",
     "forget_body": "Stop trusting {name}? You'll need to re-pair to connect again.",
-    "forget_confirm": "Forget"
+    "forget_confirm": "Forget",
+    "switch_tip": "Switch to another paired phone",
+    "browse_tip": "Browse the phone\u2019s files",
+    "switch_scanning": "Looking for your other phones…",
+    "switch_pick": "Switch to which phone?",
+    "switch_none": "No other paired phone nearby.",
+    "switch_cancel": "Cancel",
+    "other_title": "Also paired",
+    "other_hint": "Click to switch",
+    "add_pair": "Pair another phone",
+    "add_pair_hint": "Put the other phone in pairing mode, then start the scan here.",
+    "seen": "seen {ago}",
+    "paired_ago": "paired {ago}",
+    "never": "not connected",
+    "just_now": "just now",
+    "mins": "{n} min ago",
+    "hours": "{n} h ago",
+    "days": "{n} d ago"
   },
   "discover": {
     "looking": "Looking for nearby devices…",

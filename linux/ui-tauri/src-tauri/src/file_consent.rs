@@ -22,7 +22,6 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-use vortex_l3_daemon::core::notification_display;
 
 /// Auto-accept incoming file batches instead of asking. OFF unless the user
 /// turns it on: this removes a consent gate, so it can only ever be a
@@ -36,8 +35,27 @@ static AUTO_ACCEPT_LOADED: OnceLock<()> = OnceLock::new();
 /// restart would leave the user believing files are still gated when they are
 /// not, or waiting for a prompt that no longer comes.
 fn auto_accept_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/share/vortex/file_auto_accept"))
+    // Linux keeps its existing location. Moving it to the seam's `config()`
+    // (`~/.config/vortex`) would read as "auto-accept was never enabled" on
+    // every machine that already has this set — silently re-gating a user's
+    // choice, which is the mirror image of the hazard in the doc comment above.
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".local/share/vortex/file_auto_accept"))
+    }
+    // Everywhere else, through the seam. `$HOME` is a Unix variable that Windows
+    // does not set, so this resolved to `None` there: the value could not be
+    // read and `set_file_auto_accept` failed outright with "no HOME". The toggle
+    // was unusable — and it is the only way round a platform whose consent
+    // banner cannot be shown at all (see `notify`), so it has to work there
+    // most of all.
+    #[cfg(not(target_os = "linux"))]
+    Some(
+        vortex_l3_daemon::core::platform::paths()
+            .config()?
+            .join("file_auto_accept"),
+    )
 }
 
 /// The current setting, loading the persisted value on first use. Anything
@@ -120,7 +138,7 @@ pub(crate) async fn notify_received(path: PathBuf, kind: &str) {
         ("fc:copy".to_string(), "Copy".to_string()),
         ("fc:open".to_string(), "Open".to_string()),
     ];
-    match notification_display::show_call_banner(title, &body, "vortex", &actions, 0, false).await {
+    match crate::notify::show_banner(title, &body, "vortex", &actions, 0, true).await {
         Ok(id) => {
             if let Ok(mut g) = RECEIVED.lock() {
                 g.push((id, path));
@@ -174,7 +192,7 @@ async fn act_on_received(id: u32, key: &str) {
         }
         _ => {}
     }
-    let _ = notification_display::close(id).await;
+    let _ = crate::notify::close(id).await;
 }
 
 fn fmt_bytes(n: u64) -> String {
@@ -222,7 +240,7 @@ pub(crate) async fn request(label: &str, count: usize, total: u64, kind: &str) -
         ("fc:accept".to_string(), "Accept".to_string()),
         ("fc:decline".to_string(), "Decline".to_string()),
     ];
-    let id = match notification_display::show_call_banner(&title, &body, "vortex", &actions, 0, true).await
+    let id = match crate::notify::show_banner(&title, &body, "vortex", &actions, 0, true).await
     {
         Ok(id) => id,
         Err(e) => {
@@ -241,14 +259,14 @@ pub(crate) async fn request(label: &str, count: usize, total: u64, kind: &str) -
     if let Ok(mut g) = registry().lock() {
         g.remove(&id);
     }
-    let _ = notification_display::close(id).await;
+    let _ = crate::notify::close(id).await;
     decision
 }
 
 /// Spawn-once router: forward `fc:*` ActionInvoked clicks to their waiter.
 pub(crate) async fn watch() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, String)>();
-    tokio::spawn(notification_display::watch_actions(tx));
+    crate::notify::watch_actions(tx);
     while let Some((id, key)) = rx.recv().await {
         let accept = match key.as_str() {
             "fc:accept" => true,

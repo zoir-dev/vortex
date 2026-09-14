@@ -8,7 +8,9 @@
 
 use tauri::AppHandle;
 
-use crate::{app_state_to_dto, MEDIA_WATCH};
+use crate::app_state_to_dto;
+#[cfg(target_os = "linux")]
+use crate::MEDIA_WATCH;
 
 
 /// Last call id seen via the AppState `call` field, so a transition to
@@ -54,9 +56,16 @@ pub(crate) fn dispatch_lock_command(state: &vortex_l3_daemon::core::appstate::Ap
     }
     LAST_LOCK_SEQ.store(seq, Ordering::Relaxed);
     tokio::spawn(async move {
+        use vortex_l3_daemon::core::platform::session;
         let res = match cmd.as_str() {
-            "lock" => vortex_l3_daemon::core::session_lock::lock().await,
-            "unlock" => vortex_l3_daemon::core::session_lock::unlock().await,
+            "lock" => session().lock().await,
+            // Refuse before trying where the platform cannot do it at all
+            // (Windows has no programmatic unlock by design), so the log says
+            // why instead of surfacing a generic API failure.
+            "unlock" if !session().can_unlock() => {
+                Err("this platform cannot unlock a session programmatically".to_string())
+            }
+            "unlock" => session().unlock().await,
             other => Err(format!("unknown lock command {other:?}")),
         };
         match res {
@@ -65,6 +74,9 @@ pub(crate) fn dispatch_lock_command(state: &vortex_l3_daemon::core::appstate::Ap
                 tracing::warn!(%cmd, seq, "remote lock command failed: {e}");
                 // The phone's unlock button hits the same polkit gate as
                 // proximity unlock; tell the user rather than dropping it.
+                // polkit is a Linux notion; elsewhere a failed unlock has no
+                // "denied by policy" case to distinguish.
+                #[cfg(target_os = "linux")]
                 if vortex_l3_daemon::core::session_lock::is_unlock_denied(&e) {
                     crate::proximity::warn_unlock_denied_once().await;
                 }
@@ -157,16 +169,17 @@ pub(crate) fn spawn_state_consumer(
                     // session per state push would leak D-Bus connections) —
                     // used to resolve the LOCAL earbuds for the tray's buds
                     // row when the laptop owns them.
+                    #[cfg(target_os = "linux")]
                     let adapter = match bluer::Session::new().await {
                         Ok(s) => s.default_adapter().await.ok(),
                         Err(_) => None,
                     };
                     while let Some((peer_pub, state)) = ble_state_rx.recv().await {
                         // An inbound BLE frame proves the phone is in range.
-                        crate::ble::touch_presence();
+                        crate::presence::touch_presence();
                         // …and that we're in live contact (any-transport) — gates
                         // the disconnect-clear of mirror pills.
-                        crate::ble::touch_peer_contact();
+                        crate::presence::touch_peer_contact();
                         // The phone's self-reported Wi-Fi IP → cached-peer-IP
                         // fast path. THE fix for "mirror dials a dead address":
                         // while BLE is up the phone answers no mDNS, so this
@@ -198,7 +211,8 @@ pub(crate) fn spawn_state_consumer(
                         dispatch_appstate_call(&state.call);
                         // Browsing-handoff backstop: the page the phone is on,
                         // carried in this STATE frame (when the BLE HANDOFF frame
-                        // didn't get through). Consumer dedups by URL.
+                        // didn't get through). Re-delivered on every heartbeat, so
+                        // a Share carried here is opened once (deduped by id).
                         crate::handoff::dispatch_appstate_handoff(&state.handoff);
                         // Laptop→phone screen mirror over the BLE STATE path too.
                         crate::laptop_cast::dispatch_request(state.laptop_mirror_req, state.laptop_mirror_extend);
@@ -224,11 +238,19 @@ pub(crate) fn spawn_state_consumer(
                         // Auto-pin the peer's earbuds locally so the card shows
                         // on this device too (no-op unless they're connected,
                         // carry an address, and we have none saved).
+                        //
+                        // Both of these are the audio hand-off, which only
+                        // exists on Linux: without a local audio backend there
+                        // are no earbuds to pin and no MPRIS watcher whose
+                        // setting could be adopted. The peer's value still
+                        // arrives and is still shown; it just isn't applied.
+                        #[cfg(target_os = "linux")]
                         crate::earbuds::persist_peer_earbuds(&state);
                         // Shared smart-switch setting, LWW — adopt here too so a
                         // phone toggle pushed over BLE (~200 ms) takes effect
                         // immediately instead of waiting for the next LAN
                         // heartbeat (the consumer below only runs on a LAN pull).
+                        #[cfg(target_os = "linux")]
                         if let Some(mw) = MEDIA_WATCH.get() {
                             if mw.apply_setting(state.smart_switch_enabled, state.smart_switch_changed_at) {
                                 tracing::info!(
@@ -245,6 +267,11 @@ pub(crate) fn spawn_state_consumer(
                         // heartbeat never completes, so the tray sat at
                         // "Buds --" forever even while the buds were live on
                         // the laptop.
+                        // No local audio device to scan for, so the tray's
+                        // buds row shows only what the PEER reports.
+                        #[cfg(not(target_os = "linux"))]
+                        let local_earbuds = None;
+                        #[cfg(target_os = "linux")]
                         let local_earbuds = match &adapter {
                             Some(a) => {
                                 vortex_l3_daemon::core::earbuds::scan_local_earbuds(a).await

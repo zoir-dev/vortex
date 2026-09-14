@@ -169,10 +169,36 @@ class GattServer(
     @Volatile var onCallControlReceived: (peerStaticPub: ByteArray, jsonBytes: ByteArray) -> Unit =
         { _, _ -> }
 
+    /**
+     * Invoked when the laptop WRITES a PEER_HANDOFF frame: it has handed
+     * session ownership to a different phone, so we are no longer its active
+     * peer. `kind` is the [FrameSub] code, `successorName` the display name of
+     * whoever took over (empty when unknown — the kind carries the meaning).
+     */
+    @Volatile var onPeerHandoffReceived: (
+        peerStaticPub: ByteArray,
+        kind: Byte,
+        successorName: String,
+    ) -> Unit = { _, _, _ -> }
+
     /** Invoked when the laptop WRITES a NOTES_SYNC chunk (`[total][idx][data]`):
      *  reassembled + LWW-merged into the local notes store. */
     @Volatile var onNotesSyncReceived: (peerStaticPub: ByteArray, chunk: ByteArray) -> Unit =
         { _, _ -> }
+
+    /** Invoked when the laptop WRITES an FS_REQ (0x50): a filesystem op against
+     *  the folders this phone shares. `op` is the frame's `sub` byte — unlike
+     *  every other frame here the type alone does not say what was asked, so it
+     *  has to travel through. The handler must not block: it runs on the GATT
+     *  callback thread, and a document provider can stall for seconds. */
+    @Volatile var onFsRequest: (peerStaticPub: ByteArray, op: Byte, payload: ByteArray) -> Unit =
+        { _, _, _ -> }
+
+    /** Invoked for a reply to a request WE sent: FS_META / FS_DATA / FS_ERR.
+     *  Replies carry no `sub` — the frame type says which of the three it is
+     *  and the request id inside correlates it. */
+    @Volatile var onFsReply: (peerStaticPub: ByteArray, frameType: Byte, payload: ByteArray) -> Unit =
+        { _, _, _ -> }
 
     /** Invoked when a device (the laptop) ENABLES notifications on the
      *  AUDIO_SIGNAL characteristic — i.e. the BLE notify path just became
@@ -362,7 +388,16 @@ class GattServer(
      *  Called under `synchronized(cipher)` from [sealAndNotify], so a
      *  fragment burst can't interleave with another sealed frame. */
     fun sendAudioSignal(device: BluetoothDevice, frame: Frame): Boolean {
-        val budget = ((deviceMtu[device.address] ?: 23) - 3).coerceAtLeast(1)
+        // ATT_MTU-3 is the transport limit, but NOT the only one: the GATT
+        // attribute value itself caps at 512 bytes, and
+        // `notifyCharacteristicChanged` THROWS above that rather than
+        // truncating. On a 517 MTU the two disagree — budget 514 > 512 — so
+        // every fragment we built at full budget crashed the app from a worker
+        // thread. Observed live the first time a frame needed fragmenting on a
+        // 517-MTU link (an FS directory listing); any notification over the
+        // budget would have done it.
+        val budget = minOf((deviceMtu[device.address] ?: 23) - 3, ATT_MAX_VALUE_LEN)
+            .coerceAtLeast(1)
         val encoded = frame.encode()
         if (encoded.size <= budget) {
             return notifyTo(device, frame, audioSignalChar, audioSignalSubscribers)
@@ -424,6 +459,15 @@ class GattServer(
         Log.i(TAG, "registered audio session for peer=${peerHex.take(8)}… device=${device.address}")
     }
 
+    /** Which peer a connected device authenticated as, or null if IK has not
+     *  completed on it.
+     *
+     *  The disconnect hook hands back a [BluetoothDevice], and the caller
+     *  usually needs the identity behind it — an address is an RPA and means
+     *  nothing on its own. */
+    fun peerPubFor(device: BluetoothDevice): ByteArray? =
+        deviceToPeerPub[device.address]?.copyOf()
+
     /** Drop the audio session for a peer (call on un-trust). Safe to
      *  call repeatedly — the maps tolerate missing keys. */
     fun forgetAudioSession(peerStaticPub: ByteArray) {
@@ -473,6 +517,10 @@ class GattServer(
         logTag: String,
         logSuccess: Boolean = false,
         verbose: Boolean = false,
+        // Almost every frame type is self-describing and leaves this 0. FS_REQ
+        // is the exception: its op lives here, so the payload cannot be read
+        // without it.
+        sub: Byte = 0x00,
     ): Boolean {
         val peerHex = peerStaticPub.toHex()
         val device = peerToDevice[peerHex] ?: run {
@@ -501,7 +549,7 @@ class GattServer(
                 Log.e(TAG, "$logTag: AEAD seal failed", e)
                 return false
             }
-            sendAudioSignal(device, Frame(frameType, 0x00, ct.copyOf(n)))
+            sendAudioSignal(device, Frame(frameType, sub, ct.copyOf(n)))
         }
         if (notifyOk) {
             if (logSuccess) Log.i(TAG, "$logTag: notified ${device.address}")
@@ -528,6 +576,41 @@ class GattServer(
      *  full item set. Bidirectional LWW sync; see NoteSync. */
     fun sendNotesSyncEncrypted(peerStaticPub: ByteArray, chunkPayload: ByteArray): Boolean =
         sealAndNotify(peerStaticPub, FrameType.NOTES_SYNC, chunkPayload, "sendNotesSync")
+
+    /** One filesystem REQUEST to the laptop (FS_REQ 0x50), for browsing the
+     *  laptop's files from the phone. The op rides in the frame's `sub`. */
+    fun sendFsRequest(peerStaticPub: ByteArray, op: Byte, payload: ByteArray): Boolean =
+        sealAndNotify(peerStaticPub, FrameType.FS_REQ, payload, "sendFsRequest", sub = op)
+
+    /** One filesystem reply — FS_META (0x51), FS_DATA (0x52) or FS_ERR (0x53).
+     *  Replies carry no `sub`: the frame type says which of the three this is,
+     *  and the request id inside the payload correlates it. */
+    fun sendFsReply(peerStaticPub: ByteArray, frameType: Byte, payload: ByteArray): Boolean =
+        sealAndNotify(peerStaticPub, frameType, payload, "sendFsReply")
+
+    /**
+     * Session-ownership handoff (PEER_HANDOFF 0x4F) — tell [peerStaticPub] it is
+     * no longer our active peer, so its UI stops claiming a live link instead of
+     * finding out on next contact (design doc §D4).
+     *
+     * [kind] is a [FrameSub] HANDOFF_* code, carried as the FIRST PAYLOAD BYTE
+     * rather than in Frame.sub: the laptop's generic sealed-frame writer only
+     * takes a frame type, so both sides agreed on this placement.
+     * [successorName] is advisory, for the receiver's UI ("moved to <name>").
+     */
+    fun sendPeerHandoffEncrypted(
+        peerStaticPub: ByteArray,
+        kind: Byte,
+        successorName: String = "",
+    ): Boolean {
+        val name = successorName.toByteArray(Charsets.UTF_8)
+        val body = ByteArray(name.size + 1)
+        body[0] = kind
+        name.copyInto(body, 1)
+        return sealAndNotify(
+            peerStaticPub, FrameType.PEER_HANDOFF, body, "sendPeerHandoff", logSuccess = true,
+        )
+    }
 
     /** Clipboard sync (CLIPBOARD 0x40) → peer's system clipboard. */
     fun sendClipboardEncrypted(peerStaticPub: ByteArray, clipJson: ByteArray): Boolean =
@@ -683,6 +766,16 @@ class GattServer(
             } catch (e: SecurityException) {
                 Log.w(TAG, "notify threw for ${device.address}: ${e.message}")
                 false
+            } catch (e: RuntimeException) {
+                // Anything else the stack throws — an oversized value, a stale
+                // server handle — must become a failed send, not a dead app.
+                // This runs on a coroutine worker, where an escaping exception
+                // takes the whole process down, and every caller here already
+                // handles false. A 517-byte MTU once did exactly that: the
+                // fragment budget was MTU-3 while GATT caps an attribute value
+                // at 512, and the stack threw rather than truncating.
+                Log.w(TAG, "notify failed for ${device.address}: ${e.message}")
+                false
             }
             if (!queued) {
                 gate.pending = false
@@ -730,6 +823,29 @@ class GattServer(
         private set
 
     fun hasActiveConnection(): Boolean = connectedAddrs.isNotEmpty()
+
+    /** The peers holding a live GATT link right now, by static public key.
+     *
+     *  Only peers that have completed IK appear — an address alone is an RPA
+     *  and proves nothing about identity. Used by the presence loop to decide
+     *  whose token there is no point beaconing at: a live session IS the
+     *  presence proof, so advertising at it is pure radio waste. */
+    fun linkedPeerPubs(): List<ByteArray> =
+        connectedAddrs.mapNotNull { addr -> deviceToPeerPub[addr]?.copyOf() }
+
+    /**
+     * True when a peer has SUBSCRIBED to AUDIO_SIGNAL, i.e. the notify path is
+     * actually deliverable.
+     *
+     * Distinct from [hasActiveConnection], which only says some central holds
+     * an ACL link. Those come apart in practice: BlueZ owns the ACL, so it
+     * survives the laptop app being restarted or killed, leaving a connection
+     * with no Vortex session behind it. Treating that as "connected" made the
+     * phone suppress its presence advertising while being unreachable — the
+     * laptop could not find it to re-establish, and neither side broke the tie.
+     */
+    fun hasAudioSignalSubscriber(): Boolean =
+        synchronized(audioSignalSubscribers) { audioSignalSubscribers.isNotEmpty() }
 
     private val callback = object : BluetoothGattServerCallback() {
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
@@ -787,6 +903,18 @@ class GattServer(
                 // state is preserved; reconnect state is dead either way.)
                 pairingOrchestrator?.forgetDeviceOnDisconnect(device)
                 reconnectOrchestrator?.forgetDevice(device)
+                // A CCCD subscription dies with the link: the central never gets
+                // to write 0x0000 on its way out. Leaving the device in these
+                // sets is not merely untidy — `linkedProvider` is keyed on
+                // [hasAudioSignalSubscriber], so a phantom subscriber makes the
+                // presence loop suspend advertising FOREVER. The phone then
+                // cannot be found by the very laptop it is waiting for, and
+                // only an app restart (which calls stop()) breaks the tie.
+                // Observed live: laptop app restarted at 20:08, phone silent
+                // for the next ten hours while LAN heartbeats kept flowing.
+                pairingSubscribers.remove(device)
+                reconnectSubscribers.remove(device)
+                audioSignalSubscribers.remove(device)
                 try { onPeerDisconnected(device) } catch (e: Exception) {
                     Log.w(TAG, "onPeerDisconnected hook threw: ${e.message}")
                 }
@@ -942,6 +1070,14 @@ class GattServer(
                         Log.w(TAG, "AudioSignal WRITE: no recv cipher for $addr; drop")
                         return
                     }
+                    // Allowlist of frame types this characteristic accepts.
+                    // It must list every type with a dispatch arm below: a type
+                    // missing here is rejected before dispatch, so its handler
+                    // is dead code that looks wired. PEER_HANDOFF was exactly
+                    // that — the laptop sends it through this path
+                    // (cmd_pairing), the arm below handles it, and this guard
+                    // silently dropped every one, so a displaced phone never
+                    // learned it had lost ownership.
                     if (frame.type != FrameType.AUDIO_OP &&
                         frame.type != FrameType.NOTIFICATION &&
                         frame.type != FrameType.STATE &&
@@ -949,7 +1085,12 @@ class GattServer(
                         frame.type != FrameType.CLIPBOARD &&
                         frame.type != FrameType.CLIPBOARD_IMAGE &&
                         frame.type != FrameType.CLIPBOARD_TEXT &&
-                        frame.type != FrameType.NOTES_SYNC
+                        frame.type != FrameType.NOTES_SYNC &&
+                        frame.type != FrameType.PEER_HANDOFF &&
+                        frame.type != FrameType.FS_REQ &&
+                        frame.type != FrameType.FS_META &&
+                        frame.type != FrameType.FS_DATA &&
+                        frame.type != FrameType.FS_ERR
                     ) {
                         Log.w(TAG, "AudioSignal WRITE: unexpected frame type ${frame.type}")
                         return
@@ -1079,6 +1220,46 @@ class GattServer(
                                 Log.w(TAG, "onNotesSyncReceived threw: ${e.message}")
                             }
                         }
+                        FrameType.FS_META, FrameType.FS_DATA, FrameType.FS_ERR -> {
+                            // A reply to something we asked the laptop for.
+                            try {
+                                onFsReply(peerPub, frame.type, jsonBytes)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "onFsReply threw: ${e.message}")
+                            }
+                        }
+                        FrameType.FS_REQ -> {
+                            // Laptop→phone filesystem op. The op rides in the
+                            // frame's `sub`, so pass it on: FS_REQ is the one
+                            // inbound type whose payload cannot be interpreted
+                            // without it. Paths are not logged — they are the
+                            // user's folder names.
+                            try {
+                                onFsRequest(peerPub, frame.sub, jsonBytes)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "onFsRequest threw: ${e.message}")
+                            }
+                        }
+                        FrameType.PEER_HANDOFF -> {
+                            // The kind rides as the first payload byte rather
+                            // than Frame.sub: the laptop's generic sealed-frame
+                            // writer only takes a frame type, so both sides
+                            // agree to carry it here. An empty payload is
+                            // malformed — ignore rather than guess a kind.
+                            if (jsonBytes.isEmpty()) {
+                                Log.w(TAG, "PEER_HANDOFF with empty payload — ignored")
+                            } else {
+                                val kind = jsonBytes[0]
+                                val name = runCatching {
+                                    String(jsonBytes, 1, jsonBytes.size - 1, Charsets.UTF_8)
+                                }.getOrDefault("")
+                                try {
+                                    onPeerHandoffReceived(peerPub, kind, name)
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "onPeerHandoffReceived threw: ${e.message}")
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1131,6 +1312,10 @@ class GattServer(
 
     companion object {
         private const val TAG = "VortexGattSrv"
+
+        /** GATT caps an attribute value at 512 bytes regardless of the
+         *  negotiated MTU, and the notify call throws above it. */
+        private const val ATT_MAX_VALUE_LEN = 512
         /** How far to skip the recv nonce forward when an AUDIO_SIGNAL open
          *  fails, to resync past dropped BLE writes without a re-handshake
          *  (mirrors the laptop daemon's NONCE_RESYNC_WINDOW). */

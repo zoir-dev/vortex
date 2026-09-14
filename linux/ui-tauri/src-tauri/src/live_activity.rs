@@ -178,8 +178,14 @@ pub(crate) async fn spawn_consumer(
                 let app = app.clone();
                 // Publish live activities on D-Bus for the OPTIONAL GNOME extension.
                 // The extension calls back via CallAction for in-call-pill buttons.
+                // The GNOME shell extension's D-Bus service. `None` elsewhere,
+                // which is also what a Linux desktop without the extension
+                // gets — the tray fallback below draws the cards instead.
+                #[cfg(target_os = "linux")]
                 let live_dbus_tx =
                     vortex_l3_daemon::core::live_activity_dbus::start(call_action_tx).await.ok();
+                #[cfg(not(target_os = "linux"))]
+                let live_dbus_tx: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
                 // If that extension is enabled it draws the cards, so suppress the
                 // tray fallback (avoid showing both). Checked once at startup.
                 let ext_enabled = vortex_extension_enabled();
@@ -211,7 +217,7 @@ pub(crate) async fn spawn_consumer(
                             // heartbeat (handoff, 25s) so a normal inter-beat gap
                             // is never mistaken for a disconnect.
                             let disconnected =
-                                crate::ble::peer_contact_age_ms() > DISCONNECT_CLEAR_MS;
+                                crate::presence::peer_contact_age_ms() > DISCONNECT_CLEAR_MS;
                             let stale: Vec<String> = {
                                 let m = live_last.lock().await;
                                 m.iter()
