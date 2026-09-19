@@ -88,6 +88,82 @@
     cursor: text;
   }
 
+  /* Measurement mode — only ever on for the instant `lib/fitWindow.ts` reads
+     the layout, never during normal rendering.
+
+     The window has to open wide enough that nothing wraps, which means knowing
+     how wide the UI would be if it could not wrap. Normal rendering cannot
+     answer that: wrapped text reports "fits" at every width, which is how the
+     window stayed too narrow. Forcing nowrap and letting the root size to its
+     content makes the layout state its real width, we read it once, and the
+     class comes straight back off.
+
+     Doing it this way rather than pinning controls to nowrap permanently also
+     keeps the failure mode kind: if the window cannot be made wide enough (a
+     small display), text wraps as it always did instead of hanging out of its
+     card.
+
+     `.selectable-text` is exempt: message bodies and other prose are meant to
+     wrap, and measuring them unwrapped would ask for a window as wide as the
+     longest message ever received. */
+  /* CONTROLS only — never prose.
+
+     A button that wraps looks broken, so buttons are what the window must be
+     wide enough for. Paragraphs are the opposite: they are supposed to wrap,
+     and measuring them unwrapped asks for a window as wide as the longest
+     sentence in the app. Measured live with prose included: the Settings page
+     reported 2845px, nearly the whole screen, because one setting hint became
+     a single line. */
+  html.vx-measuring button,
+  html.vx-measuring label,
+  html.vx-measuring [role="button"],
+  html.vx-measuring [role="tab"] {
+    white-space: nowrap !important;
+    overflow-wrap: normal !important;
+    word-break: normal !important;
+    hyphens: none !important;
+  }
+
+  /* Grid tracks have to be freed too.
+
+     Tailwind's `grid-cols-N` is `repeat(N, minmax(0, 1fr))`, and that `0`
+     minimum is the grid's version of `min-w-0`: the tracks may shrink to
+     nothing and will never grow to fit their contents, so the grid never asks
+     the page for more room no matter how wide its cards want to be. Element-
+     level `min-width` cannot help — a track sizing function is not an element.
+
+     Restated with a `max-content` minimum, each track asks for the width its
+     content needs while the column COUNT is preserved, so the measurement
+     reflects the layout the user will actually see. Enumerated rather than
+     matched with a wildcard because the count cannot be recovered from a
+     selector, and because there are only two of them in the app. */
+  html.vx-measuring .grid-cols-2 {
+    grid-template-columns: repeat(2, minmax(max-content, 1fr)) !important;
+  }
+
+  html.vx-measuring .grid-cols-7 {
+    grid-template-columns: repeat(7, minmax(max-content, 1fr)) !important;
+  }
+
+  html.vx-measuring * {
+    /* Let the layout push outwards instead of absorbing the pressure.
+
+       These three are what normally stop content from widening anything, and
+       each has to go or the measurement just reads the viewport back (observed:
+       want_w came back as exactly the current window width every time).
+
+       `min-width: auto` undoes Tailwind's `min-w-0`, which exists precisely so
+       a flex item MAY shrink below its content — sensible in normal rendering,
+       fatal to a measurement. `flex-basis: auto` undoes `flex-1`'s `0%` basis
+       so items size to their content, and `flex-shrink: 0` stops them being
+       compressed back. `overflow: visible` keeps a scroll container from
+       hiding the very content being measured. */
+    overflow: visible !important;
+    min-width: auto !important;
+    flex-basis: auto !important;
+    flex-shrink: 0 !important;
+  }
+
   * {
     @apply border-border;
   }

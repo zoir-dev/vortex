@@ -263,6 +263,36 @@
             </intent-filter>
         </activity>
 
+        <!-- "Vortex" in the text-selection toolbar, beside Copy and Share:
+             select text anywhere, tap it, and the text is on the laptop's
+             clipboard. One tap, no share sheet, no app picker.
+
+             The system passes the selection in EXTRA_PROCESS_TEXT, so unlike
+             every other inbound path this one needs no clipboard read at all —
+             which matters because a background read is refused outright (see
+             ClipboardAccess) and even the tile has to bounce through a
+             foreground trampoline to get focus first.
+
+             android:label is what the toolbar shows, NOT app_name: the strip
+             is tight on space and truncates, so it is deliberately one word. -->
+        <activity
+            android:name=".core.clipboard.ProcessTextActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:label="@string/process_text_label"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Vortex.ClipboardOverlay">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <!-- text/plain only: the toolbar deals in selected text, and a
+                     wildcard here would offer Vortex for selections it cannot
+                     actually send. -->
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
         <!-- Quick Settings tile: tap to send this phone's clipboard to the
              laptop (the user gesture Android's read restriction requires). -->
         <service

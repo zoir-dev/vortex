@@ -456,7 +456,15 @@ class GattServer(
         audioRecvCiphers[device.address] = recvCipher
         audioRecvNonce[device.address] = 0L // fresh handshake → nonce starts at 0
         deviceToPeerPub[device.address] = peerStaticPub.copyOf()
-        Log.i(TAG, "registered audio session for peer=${peerHex.take(8)}… device=${device.address}")
+        // Worded for someone grepping logcat, not for the call site: this is the
+        // moment BLE becomes usable — IK done, ciphers installed, frames can
+        // flow. Its ABSENCE is the interesting signal (see the teardown branch
+        // of onConnectionStateChange), so the two lines are phrased as a pair.
+        sessionUpAddrs.add(device.address)
+        Log.i(
+            TAG,
+            "BLE session established with peer=${peerHex.take(8)}… device=${device.address}",
+        )
     }
 
     /** Which peer a connected device authenticated as, or null if IK has not
@@ -818,6 +826,21 @@ class GattServer(
     private val connectedAddrs =
         java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    /** When each live link came up, so a disconnect can report how long it
+     *  lasted. Only read for logging — see the teardown branch of
+     *  [onConnectionStateChange] for why that number is worth having. */
+    private val connectedSinceMs: ConcurrentHashMap<String, Long> = ConcurrentHashMap()
+
+    /** Addresses that reached a session ON THE CURRENT LINK.
+     *
+     *  Deliberately not [deviceToPeerPub], which answers a different question.
+     *  That map survives a disconnect on purpose (the address is the laptop's
+     *  public one, so it stays meaningful), which makes it useless for "did
+     *  THIS link get anywhere" — after one good session it reads non-null
+     *  forever and every later failure looks like a success. Cleared on
+     *  connect, set by [registerAudioSession], read once on teardown. */
+    private val sessionUpAddrs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     @Volatile
     var lastDisconnectAtMs: Long = android.os.SystemClock.elapsedRealtime()
         private set
@@ -880,9 +903,35 @@ class GattServer(
             Log.i(TAG, "GATT $state device=${device?.address ?: "?"} status=$status")
             if (newState == BluetoothProfile.STATE_CONNECTED && device != null) {
                 connectedAddrs.add(device.address)
+                connectedSinceMs[device.address] = android.os.SystemClock.elapsedRealtime()
+                sessionUpAddrs.remove(device.address) // fresh link, nothing proven yet
             }
             if (newState == BluetoothProfile.STATE_DISCONNECTED && device != null) {
                 connectedAddrs.remove(device.address)
+                // A link that never became a session is the failure worth
+                // shouting about, because it is otherwise INVISIBLE: the LAN
+                // transport carries everything, the UI still shows the laptop
+                // as connected, and the only trace is a "BLE session
+                // established" line that never arrives — which nobody notices,
+                // because you cannot grep for a line that is not there.
+                //
+                // That is not hypothetical. A one-sided LE bond made every
+                // connect die about 200 ms in, before a single ATT exchange,
+                // and it stayed hidden long enough for the phone's own counter
+                // to read "Bond loss detected, count: 1031". The lifetime is
+                // the tell: a handshake needs seconds, so anything sub-second
+                // means the link was torn down before Vortex got a word in.
+                val heldMs = connectedSinceMs.remove(device.address)
+                    ?.let { android.os.SystemClock.elapsedRealtime() - it }
+                if (!sessionUpAddrs.remove(device.address)) {
+                    Log.w(
+                        TAG,
+                        "BLE link to ${device.address} dropped after ${heldMs ?: -1}ms " +
+                            "WITHOUT establishing a session — no IK completed. " +
+                            "Sub-second here means something outside Vortex killed the " +
+                            "link (check for bond/encryption failures in the BT stack log)",
+                    )
+                }
                 if (connectedAddrs.isEmpty()) {
                     lastDisconnectAtMs = android.os.SystemClock.elapsedRealtime()
                 }

@@ -68,6 +68,14 @@ pub struct LanReconnectOutcome {
     /// ours to remove, while deleting the phone's own original would need a
     /// system consent dialog there for every file.
     pub deleted: Vec<String>,
+    /// Clipboard text the phone copied but could not deliver over BLE, from
+    /// the done frame's `clipboard` object.
+    ///
+    /// Phone→laptop clipboard text has no transport but the BLE notify, so a
+    /// laptop whose GATT link never connects silently loses every copy while
+    /// this exchange succeeds every few seconds. Carried here so the link that
+    /// works is the one that delivers, exactly as for [`offers`].
+    pub clipboard: Option<crate::core::clipboard_mirror::ClipboardMirror>,
 }
 
 /// Pull the done frame's `offers` array out as real offers.
@@ -101,6 +109,45 @@ fn parse_deleted(json: &[u8]) -> Vec<String> {
         return Vec::new();
     };
     arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect()
+}
+
+/// Pull the done frame's `clipboard` object out as text the phone copied.
+///
+/// The phone's clipboard text is normally a BLE notify. When the GATT link is
+/// down that notify fails and the text is gone, so the phone hands it to this
+/// exchange instead — the same escape hatch `offers` uses, for the one payload
+/// that had no fallback at all.
+fn parse_clipboard(json: &[u8]) -> Option<crate::core::clipboard_mirror::ClipboardMirror> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let clip = v.get("clipboard")?;
+    let parsed: crate::core::clipboard_mirror::ClipboardMirror =
+        serde_json::from_value(clip.clone()).ok()?;
+    if parsed.text.is_empty() {
+        return None;
+    }
+    Some(parsed)
+}
+
+/// The done frame with any clipboard body replaced by its length.
+///
+/// The frame is logged verbatim, and clipboard content must never reach the
+/// log (the BLE path logs `chars = …` for exactly this reason). Everything
+/// else in the frame is dataset names and tokens, which are worth keeping.
+fn redact_done_frame(json: &[u8]) -> String {
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return String::from_utf8_lossy(json).into_owned();
+    };
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(clip) = obj.get_mut("clipboard") {
+            let chars = clip
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|t| t.chars().count())
+                .unwrap_or(0);
+            *clip = serde_json::json!({ "text": format!("<{chars} chars>") });
+        }
+    }
+    v.to_string()
 }
 
 /// The bulk-sync done frame's per-dataset outcome map.
@@ -375,6 +422,7 @@ pub async fn run_lan_reconnect(
     let mut bulk_status: Option<BulkStatus> = None;
     let mut offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
+    let mut clipboard: Option<crate::core::clipboard_mirror::ClipboardMirror> = None;
     if let (Some(req), Some(_)) = (bulk_request, peer_state.as_ref()) {
         match exchange_bulk(&mut stream, &mut transport, req, wait_per_step).await {
             Ok(ex) => {
@@ -382,6 +430,7 @@ pub async fn run_lan_reconnect(
                 bulk_status = ex.status;
                 offers = ex.offers;
                 deleted = ex.deleted;
+                clipboard = ex.clipboard;
             }
             Err(e) => tracing::warn!("bulk-sync exchange failed: {e}"),
         }
@@ -412,6 +461,7 @@ pub async fn run_lan_reconnect(
         bulk_status,
         offers,
         deleted,
+        clipboard,
     })
 }
 
@@ -533,6 +583,8 @@ struct BulkExchange {
     offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer>,
     /// Capture tokens whose originals are gone from the phone.
     deleted: Vec<String>,
+    /// Clipboard text the phone could not push over BLE, if any.
+    clipboard: Option<crate::core::clipboard_mirror::ClipboardMirror>,
 }
 
 /// Send the bulk-sync request and collect the chunked dataset frames the
@@ -557,6 +609,7 @@ async fn exchange_bulk(
     let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut status: Option<BulkStatus> = None;
     let mut offers: Vec<crate::core::clipboard_mirror::ClipboardImageOffer> = Vec::new();
+    let mut clipboard: Option<crate::core::clipboard_mirror::ClipboardMirror> = None;
     let mut deleted: Vec<String> = Vec::new();
     let mut listing = crate::core::phone_files::ListingAssembler::default();
     let mut contacts = crate::core::contacts::ContactsAssembler::default();
@@ -599,7 +652,7 @@ async fn exchange_bulk(
         pt.truncate(n);
         match frame.ty {
             ty::BULK_SYNC if frame.sub == 0x02 => {
-                info!("← bulk-sync done: {}", String::from_utf8_lossy(&pt));
+                info!("← bulk-sync done: {}", redact_done_frame(&pt));
                 status = BulkStatus::parse(&pt);
                 if status.is_none() {
                     tracing::warn!("bulk-sync: done frame is not a JSON object; no status");
@@ -611,6 +664,10 @@ async fn exchange_bulk(
                 deleted = parse_deleted(&pt);
                 if !deleted.is_empty() {
                     info!("← {} capture(s) deleted on the phone", deleted.len());
+                }
+                clipboard = parse_clipboard(&pt);
+                if let Some(c) = clipboard.as_ref() {
+                    info!(chars = c.text.chars().count(), "← LAN clipboard sync");
                 }
                 break;
             }
@@ -743,13 +800,13 @@ async fn exchange_bulk(
             }
         }
     }
-    Ok(BulkExchange { datasets: out, status, offers, deleted })
+    Ok(BulkExchange { datasets: out, status, offers, deleted, clipboard })
 }
 
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_deleted, parse_offers, BulkStatus};
+    use super::{parse_clipboard, parse_deleted, parse_offers, redact_done_frame, BulkStatus};
 
     /// The done frame carries offers beside the per-dataset outcomes, and the
     /// status map must not choke on the array sitting next to its strings.
@@ -765,6 +822,43 @@ mod tests {
         // The status map still reads its own fields and ignores the array.
         let s = BulkStatus::parse(body).unwrap();
         assert_eq!(s.get("contacts"), Some("match"));
+    }
+
+    /// Clipboard text rides the done frame beside everything else, and the
+    /// three readers must each ignore the others. This is the phone's only
+    /// way to deliver a copy when the BLE link never connects.
+    #[test]
+    fn clipboard_rides_the_done_frame_beside_the_rest() {
+        let body = br#"{"contacts":"match","deleted":["x"],
+            "offers":[{"token":"t","name":"a.jpg","bytes":1,"mime":"image/jpeg","kind":"photo"}],
+            "clipboard":{"text":"hello laptop","ts":1700000000000}}"#;
+        let clip = parse_clipboard(body).expect("clipboard parsed");
+        assert_eq!(clip.text, "hello laptop");
+        // The neighbours still read their own fields.
+        assert_eq!(BulkStatus::parse(body).unwrap().get("contacts"), Some("match"));
+        assert_eq!(parse_offers(body).len(), 1);
+        assert_eq!(parse_deleted(body), vec!["x".to_string()]);
+    }
+
+    /// A frame with no clipboard, or an empty one, yields nothing — an empty
+    /// string must not clear the laptop's clipboard.
+    #[test]
+    fn absent_or_empty_clipboard_is_not_delivered() {
+        assert!(parse_clipboard(br#"{"contacts":"match"}"#).is_none());
+        assert!(parse_clipboard(br#"{"clipboard":{"text":"","ts":1}}"#).is_none());
+        assert!(parse_clipboard(br#"not json"#).is_none());
+    }
+
+    /// The done frame is logged verbatim, so the clipboard body must be
+    /// replaced by its length before it ever reaches the log.
+    #[test]
+    fn done_frame_log_never_carries_clipboard_text() {
+        let body = br#"{"contacts":"match","clipboard":{"text":"hunter2 is secret","ts":1}}"#;
+        let logged = redact_done_frame(body);
+        assert!(!logged.contains("hunter2"), "clipboard text leaked into the log: {logged}");
+        assert!(logged.contains("17 chars"), "length should survive: {logged}");
+        // Everything else is still there to read.
+        assert!(logged.contains("contacts"));
     }
 
     /// Deletions ride the same frame as the offers and the status map, and

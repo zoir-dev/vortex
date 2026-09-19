@@ -447,6 +447,75 @@ pub(crate) async fn find_trusted_presence_peer(
     res
 }
 
+/// Power the adapter off and back on, to clear a wedged discovery state.
+///
+/// BlueZ can latch `Discovering = true` with no client behind it. In
+/// `stop_discovery_complete()` a failed `MGMT_OP_STOP_DISCOVERY` removes the
+/// client from `discovery_list` but returns before clearing `discovering` /
+/// `discovery_enable`, so afterwards every `StopDiscovery` is refused with "no
+/// discovery started" and every `StartDiscovery` takes the "queue up a stop"
+/// branch — sent with a NULL callback, so its failure is never seen. The
+/// adapter then reports discovering forever and no scan reaches the kernel,
+/// which starves every connect (bluez/bluez#807, open as of 5.87).
+///
+/// Nothing else clears it. `StopDiscovery` cannot reach the clearing code,
+/// `discovering_callback()` only resyncs on a kernel transition that will not
+/// happen by itself, and the mgmt-level `stop-find` needs CAP_NET_ADMIN, which
+/// a desktop app does not have. The one unconditional reset is in BlueZ's
+/// `adapter_stop()` — the power-down path — and `Powered` is a plain D-Bus
+/// property we can set unprivileged.
+///
+/// Destructive by nature: powering the adapter down drops every link it holds,
+/// the user's audio included. That is exactly why the BLE loop will not do this
+/// on its own and it is offered as a button instead.
+#[tauri::command]
+pub(crate) async fn reset_bluetooth_adapter() -> Result<(), String> {
+    let session = bluer::Session::new()
+        .await
+        .map_err(|e| format!("bluetooth service unavailable: {e}"))?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(|e| format!("no bluetooth adapter: {e}"))?;
+
+    adapter
+        .set_powered(false)
+        .await
+        .map_err(|e| format!("could not power the adapter down: {e}"))?;
+    // BlueZ tears the adapter down asynchronously; powering back up too early
+    // races `adapter_stop()` and can leave the state we came here to clear.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    adapter
+        .set_powered(true)
+        .await
+        .map_err(|e| format!("could not power the adapter back up: {e}"))?;
+
+    // The link is gone with the adapter; say so rather than let the UI keep
+    // showing a session that died under it.
+    note_link_up(false);
+    tracing::info!("bluetooth adapter reset (power off/on) to clear wedged discovery");
+    Ok(())
+}
+
+/// Whether a BLE audio-signal session is live right now.
+///
+/// The writers map is the real source of truth, but it lives inside the BLE
+/// loop and is reached only by the tasks handed a clone. The peer-state DTO is
+/// built far from there and needs the same answer, so this mirrors it as a
+/// plain flag — the shape `ble_portable::link_is_up` already uses on Windows,
+/// so one accessor can serve both platforms.
+static LINK_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while the laptop holds a BLE session to a phone.
+pub(crate) fn link_is_up() -> bool {
+    LINK_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record link up/down alongside the writers-map insert/remove.
+pub(crate) fn note_link_up(up: bool) {
+    LINK_UP.store(up, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Set when BlueZ rejects advertisement-monitor registration (old daemon /
 /// controller without passive-scan support) so we stop re-trying it and log
 /// the downgrade exactly once.
@@ -1184,6 +1253,7 @@ pub(crate) async fn run_ble_persistent_loop(
             let mut m = ble_audio_writers.lock().await;
             m.insert(peer.peer_static_pub, writer_fn);
         }
+        note_link_up(true);
         // Wake the proximity watcher NOW — link-up is its eager-unlock
         // trigger; waiting out its 2s sampling tick is wasted unlock time.
         crate::proximity::nudge().notify_one();
@@ -1523,6 +1593,9 @@ pub(crate) async fn run_ble_persistent_loop(
         {
             let mut m = ble_audio_writers.lock().await;
             m.remove(&peer.peer_static_pub);
+            // Only dark once NOTHING is linked: a two-phone laptop tearing one
+            // session down still has BLE.
+            note_link_up(!m.is_empty());
         }
         // Drop the session device's BlueZ entry: its cached advertisement
         // (token valid for up to ±2 buckets ≈ 3 min) would otherwise

@@ -104,6 +104,14 @@ pub(crate) struct PeerStateDto {
     earbuds: Option<EarbudsDto>,
     charging: bool,
     ts: u64,
+    /// Whether a BLE session to the phone is live *right now*.
+    ///
+    /// `ts` freshness only proves SOME transport is working, and LAN alone is
+    /// enough to keep it fresh — so a phone can look perfectly connected while
+    /// every BLE-only feature (notification mirror, conversation pages) is
+    /// silently dead. The UI colours its dot on this so that state is one
+    /// glance rather than a log dig.
+    ble_linked: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -145,6 +153,7 @@ pub(crate) fn app_state_to_dto(peer_pub_hex: String, s: AppState) -> PeerStateDt
             connected: e.connected,
         }),
         charging: s.charging,
+        ble_linked: crate::ble_link_up(),
         // Stamp OUR receive time, not the phone's `s.ts`. The UI's "online"
         // check is `laptop_now - ts < 180s`; trusting the phone's clock made a
         // connected phone read "offline" whenever its clock lagged ours (or it

@@ -2,6 +2,9 @@
 <resources>
     <string name="app_name">Vortex</string>
     <string name="clipboard_tile_label">Vortex Clipboard</string>
+    <!-- Shown in the text-selection toolbar next to Copy/Share, where space is
+         very tight and the label is often truncated — keep it to one word. -->
+    <string name="process_text_label">Vortex</string>
     <string name="screen_control_service_desc">Lets your paired laptop control this phone (tap, swipe, Back/Home) while screen mirroring. No data is collected.</string>
     <string name="open_on_phone_title">Open on this phone</string>
     <string name="open_on_phone_channel">Open on phone</string>

@@ -91,7 +91,8 @@ them as if they were one device:
 
 **Requirements:** Android 10+ phone · Linux with BlueZ (Ubuntu/Debian, Fedora,
 Arch, openSUSE) · Bluetooth (BLE) on both devices. Build tools (Rust/Node) are
-installed by the script itself.
+installed by the script itself. A Windows build is available too, cross-built
+from Linux — see [step 7](#7-laptop-windows--experimental).
 
 ### 1. Laptop (Linux)
 
@@ -219,6 +220,46 @@ virtual one. Turning on **Settings → Physical keyboard → Show virtual keyboa
 lets Vortex keep one keyboard for the whole session, so you see the notification
 once instead of on every crossing. The notification itself can also be switched
 off: long-press it → turn off that category. Nothing else uses it.
+
+### 7. Laptop (Windows) — experimental
+
+There is no Windows installer yet. The app is **cross-built from Linux**: if
+you already build the Linux app on this machine, one more script produces the
+Windows `.exe` from the same checkout.
+
+```bash
+./install_windows.sh                 # toolchain + vortex-ui-tauri.exe
+./install_windows.sh --installer     # also an NSIS setup.exe
+```
+
+It installs what is missing (clang/lld/llvm, the `x86_64-pc-windows-msvc` Rust
+target, `cargo-xwin`, node) and builds. The first run additionally downloads
+Microsoft's CRT and Windows SDK — a few hundred MB, once, into
+`~/.cache/cargo-xwin`; `cargo-xwin` accepts Microsoft's licence for that
+download on your behalf, so build on Windows instead if you would rather not.
+The result lands in
+`linux/ui-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/`.
+
+Copy the `.exe` to the Windows machine and run it — there is nothing to
+install, it sits in the tray like the Linux build, and pairing is the same BLE
+flow from the same phone app.
+
+**What works:** pairing, reconnect, notification mirroring, clipboard, file
+transfer, Universal Control.
+
+**What does not:** screen mirror/cast, the continuity camera and the earbuds
+hand-off. Those are GStreamer/GTK/PulseAudio/BlueZ and have no Windows
+implementation, so they are compiled out rather than shipped broken.
+
+**Two things to expect on first run.** The binary is unsigned, so SmartScreen
+warns — *More info → Run anyway*. And on Windows 10 the window can open blank:
+that is a missing **WebView2 runtime** (Windows 11 ships it). Install
+Microsoft's Evergreen WebView2 Runtime and relaunch.
+
+> ⚠ **Experimental, and less tested than Linux.** The BLE layer here is a
+> separate implementation against a platform seam (WinRT rather than BlueZ),
+> and it has had far less real-world use. Treat it as a preview and please
+> report what breaks.
 
 ## 🔐 Security
 

@@ -344,6 +344,9 @@ pub(crate) fn spawn_clipboard_sync(
     // Phone → laptop: a received CLIPBOARD frame → set our system clipboard
     // + add to history (so phone copies show up in Super+V).
     let (recv_tx, mut recv_rx) = tokio::sync::mpsc::unbounded_channel::<ClipboardMirror>();
+    // Publish it for non-BLE transports (the LAN heartbeat's done-frame
+    // fallback), which have no other way to reach this consumer.
+    let _ = CLIPBOARD_RECV_SINK.set(recv_tx.clone());
     {
         let app = app.clone();
         tokio::spawn(async move {
@@ -791,6 +794,25 @@ static OFFER_SINK: OnceLock<tokio::sync::mpsc::UnboundedSender<Offer>> = OnceLoc
 /// (before wiring) or it has stopped.
 pub(crate) fn submit_offer(offer: Offer) -> bool {
     OFFER_SINK.get().map(|tx| tx.send(offer).is_ok()).unwrap_or(false)
+}
+
+/// The incoming-clipboard consumer's sender, so a transport that isn't BLE can
+/// hand it text.
+///
+/// Same reasoning as [`OFFER_SINK`]: the BLE listener gets its own clone at
+/// wiring time, and the LAN heartbeat runs far from that but must reach the
+/// same consumer — so the loop guard, the tidy pass and the clipboard history
+/// all behave identically no matter which link carried the text.
+static CLIPBOARD_RECV_SINK: OnceLock<
+    tokio::sync::mpsc::UnboundedSender<vortex_l3_daemon::core::clipboard_mirror::ClipboardMirror>,
+> = OnceLock::new();
+
+/// Hand received clipboard text to the consumer. `false` when there is no
+/// consumer yet (before wiring) or it has stopped.
+pub(crate) fn submit_clipboard(
+    clip: vortex_l3_daemon::core::clipboard_mirror::ClipboardMirror,
+) -> bool {
+    CLIPBOARD_RECV_SINK.get().map(|tx| tx.send(clip).is_ok()).unwrap_or(false)
 }
 
 pub(crate) fn spawn_image_offer_consumer() -> tokio::sync::mpsc::UnboundedSender<Offer> {

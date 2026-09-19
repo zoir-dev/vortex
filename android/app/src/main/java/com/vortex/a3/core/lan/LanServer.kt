@@ -177,6 +177,18 @@ class LanServer(
     var pendingOffersProvider: () -> List<ByteArray> = { emptyList() }
 
     /**
+     * Clipboard text the BLE notify could not deliver, for the same ride-along
+     * as [pendingOffersProvider].
+     *
+     * Phone→laptop clipboard text is a BLE notify and nothing else, so a
+     * laptop whose GATT link never connects loses every copy the user makes
+     * while this exchange completes cleanly every few seconds. The provider
+     * hands over at most one pending text (latest wins) and clears it, so the
+     * done frame delivers it on whichever link is actually up.
+     */
+    var pendingClipboardProvider: () -> String? = { null }
+
+    /**
      * Capture tokens whose gallery rows this phone no longer has.
      *
      * Rides the same done frame as the offers, in the opposite direction: the
@@ -1007,6 +1019,24 @@ class LanServer(
                             if (deleted.isNotEmpty()) {
                                 status.put("deleted", org.json.JSONArray(deleted))
                                 Log.i(TAG, "bulk-sync: reported ${deleted.size} deleted capture(s)")
+                            }
+                            // Clipboard text BLE could not deliver. Same
+                            // reasoning as the offers above: send it on the
+                            // link that works. Length only — never the content.
+                            val clip = runCatching { pendingClipboardProvider() }
+                                .getOrElse {
+                                    Log.w(TAG, "pending-clipboard provider threw: ${it.message}")
+                                    null
+                                }
+                            if (!clip.isNullOrEmpty()) {
+                                status.put(
+                                    "clipboard",
+                                    org.json.JSONObject().apply {
+                                        put("text", clip)
+                                        put("ts", System.currentTimeMillis())
+                                    },
+                                )
+                                Log.i(TAG, "bulk-sync: carried clipboard text (${clip.length} chars)")
                             }
                             lockedSealAndWrite(
                                 FrameType.BULK_SYNC, 0x02,

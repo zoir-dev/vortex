@@ -17,6 +17,7 @@ import {
   FileDown,
   Stethoscope,
   ChevronRight,
+  Bluetooth,
 } from "lucide-vue-next";
 import { theme } from "@/lib/theme";
 import { smartSwitchEnabled, setSmartSwitch } from "@/lib/smartSwitch";
@@ -157,6 +158,30 @@ function setFileAutoAccept(v: boolean) {
   void invoke("set_file_auto_accept", { enabled: v }).catch(() => {
     fileAutoAccept.value = prev;
   });
+}
+
+/** Reset state for the adapter button: idle → busy → a short-lived result.
+ *
+ * Deliberately not a toast: the button is the thing the user just pressed, so
+ * the answer belongs on it. `null` means idle. */
+const bleResetBusy = ref(false);
+const bleResetMsg = ref<string | null>(null);
+
+async function resetBluetoothAdapter() {
+  if (bleResetBusy.value) return;
+  bleResetBusy.value = true;
+  bleResetMsg.value = null;
+  try {
+    await invoke("reset_bluetooth_adapter");
+    bleResetMsg.value = t("settings.ble_reset_done");
+  } catch {
+    bleResetMsg.value = t("settings.ble_reset_failed");
+  } finally {
+    bleResetBusy.value = false;
+    // Long enough to read, short enough that a stale "done" never sits next to
+    // a link that has since dropped again.
+    setTimeout(() => (bleResetMsg.value = null), 6000);
+  }
 }
 
 function pickLocale(code: LocaleCode) {
@@ -348,6 +373,35 @@ const pill = (active: boolean) =>
             :model-value="proximityAutoUnlock"
             @update:model-value="setProximityAutoUnlock"
           />
+        </div>
+
+        <!-- Reset the Bluetooth adapter. An ACTION row: it does something
+             once, so it is a button rather than a toggle or a link.
+
+             Here rather than automatic because powering the adapter down drops
+             every link it holds, the user's headphones included — see
+             `reset_bluetooth_adapter` for why nothing gentler exists. -->
+        <div class="mt-4 rounded-[14px] border border-border bg-card/40 overflow-hidden">
+          <div class="flex items-center gap-3.5 px-[18px] py-[15px]">
+            <span
+              class="h-9 w-9 rounded-[10px] shrink-0 grid place-items-center bg-muted/50 border border-border text-muted-foreground"
+            >
+              <Bluetooth class="h-[18px] w-[18px]" :stroke-width="1.8" />
+            </span>
+            <div class="min-w-0 flex-1">
+              <div class="text-sm font-semibold">{{ t("settings.ble_reset") }}</div>
+              <div class="text-[11.5px] text-muted-foreground mt-0.5">
+                {{ bleResetMsg ?? t("settings.ble_reset_hint") }}
+              </div>
+            </div>
+            <button
+              class="shrink-0 whitespace-nowrap rounded-[9px] border border-border px-3 py-1.5 text-[12.5px] font-medium transition-colors hover:bg-foreground/[0.04] disabled:opacity-60"
+              :disabled="bleResetBusy"
+              @click="resetBluetoothAdapter"
+            >
+              {{ bleResetBusy ? t("settings.ble_reset_busy") : t("settings.ble_reset") }}
+            </button>
+          </div>
         </div>
 
         <!-- Diagnostics: a NAVIGATION row, not a toggle, so it is built here

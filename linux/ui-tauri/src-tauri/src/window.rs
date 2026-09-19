@@ -18,6 +18,113 @@ use tauri::Manager;
 /// `hide()` + `prevent_close()`), so the id stays valid for the process.
 static MAIN_XID: AtomicU32 = AtomicU32::new(0);
 
+/// Size the main window to the content the webview just measured, then reveal it.
+///
+/// The window is built `visible: false` and stays hidden until this runs, so
+/// the user never sees the wrong size: the layout happens off-screen, gets
+/// measured, and the window is shown once at the size that fits. A fixed width
+/// in `tauri.conf.json` cannot do that — the content's real width depends on
+/// the display's scale factor, the UI font and the locale (German and Russian
+/// labels are materially wider than English), none of which are known at build
+/// time.
+///
+/// `width`/`height` are CSS pixels, which are logical pixels — the same units
+/// `LogicalSize` takes — so the scale factor needs no conversion here.
+///
+/// Clamped on both ends: never below the configured minimum (a measurement
+/// that comes back absurdly small must not produce an unusable window) and
+/// never past the monitor's usable area (a long unwrapped line must not push
+/// the window off-screen or behind the panel).
+#[tauri::command]
+pub(crate) fn fit_main_window(
+    app: tauri::AppHandle,
+    width_ratio: f64,
+    height_ratio: f64,
+    reason: Option<String>,
+    probe: Option<String>,
+) -> Result<bool, String> {
+    let Some(w) = app.get_webview_window("main") else {
+        return Err("no main window".into());
+    };
+
+    // The monitor's usable box. `monitor.size()` is PHYSICAL, so divide by the
+    // scale factor to land back in the logical units LogicalSize wants.
+    let (max_w, max_h) = match w.current_monitor() {
+        Ok(Some(m)) => {
+            let sf = m.scale_factor();
+            let sz = m.size();
+            // 0.92 rather than 1.0: leave room for the shell's panel/dock and a
+            // window border, which the monitor size does not account for.
+            (
+                (sz.width as f64 / sf) * 0.92,
+                (sz.height as f64 / sf) * 0.92,
+            )
+        }
+        // No monitor info (headless, race at startup): trust the measurement
+        // rather than refuse to size at all.
+        _ => (f64::MAX, f64::MAX),
+    };
+
+    // Mirrors tauri.conf.json's minWidth/minHeight.
+    const MIN_W: f64 = 560.0;
+    const MIN_H: f64 = 600.0;
+
+    // GROW ONLY, never shrink.
+    //
+    // The measurement is a lower bound on what the content needs, not a
+    // statement about what the window should be: a webview that reports early
+    // (or reports a viewport the compositor has not laid out yet) comes back
+    // far too small, and honouring that shrinks the window to the minimum —
+    // which is precisely the bug this guard exists to stop. It also means a
+    // window the user widened by hand is never clawed back.
+    let cur = w
+        .inner_size()
+        .ok()
+        .and_then(|sz| w.scale_factor().ok().map(|sf| (sz.width as f64 / sf, sz.height as f64 / sf)))
+        .unwrap_or((0.0, 0.0));
+
+    // The webview measured in CSS pixels, which are not this side's logical
+    // pixels on a scaled display, so it sends how much MORE room it needs
+    // rather than an absolute size. Applied to the width we actually have, the
+    // units cancel.
+    let target_w = (cur.0 * width_ratio).max(MIN_W).max(cur.0).min(max_w);
+    let target_h = (cur.1 * height_ratio).max(MIN_H).max(cur.1).min(max_h);
+
+    // Nothing to do — don't churn the window (or move it) for a no-op. Also the
+    // caller's stop condition: it re-measures until this says "no".
+    if (target_w - cur.0).abs() < 1.0 && (target_h - cur.1).abs() < 1.0 {
+        tracing::info!(
+            want_w = target_w,
+            cur_w = cur.0,
+            probe = probe.as_deref().unwrap_or(""),
+            "window fit: already wide enough"
+        );
+        return Ok(false);
+    }
+
+    let win = w.clone();
+    let _ = w.run_on_main_thread(move || {
+        let _ = win.set_size(tauri::LogicalSize::new(target_w, target_h));
+        // Re-centre: the window was centred at the old size, so growing it
+        // from the top-left would drift it off centre (and possibly off-screen).
+        let _ = win.center();
+    });
+    // Debug, not info: this fires a few times per launch while the layout
+    // converges, and says nothing a working app needs to report. It is kept
+    // because the `probe` string is what made this diagnosable at all — the
+    // measurements disagreed with each other for a long time, and reading them
+    // side by side is what settled it. `RUST_LOG=vortex_ui_tauri_lib::window=debug`.
+    tracing::debug!(
+        target_w,
+        target_h,
+        reason = reason.as_deref().unwrap_or("boot"),
+        probe = probe.as_deref().unwrap_or(""),
+        "main window grown to fit its content"
+    );
+
+    Ok(true)
+}
+
 /// Show the main window and bring it to the front. Safe from any thread.
 pub(crate) fn present_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {

@@ -71,13 +71,13 @@ internal fun MainActivity.wirePairingOrchestrator(identity: IdentityRecord) {
                             peerName = outcome.peerName,
                         )
                     )
-                    try {
-                        if (outcome.device.bondState == android.bluetooth.BluetoothDevice.BOND_NONE) {
-                            outcome.device.createBond()
-                        }
-                    } catch (e: Exception) {
-                        android.util.Log.w("Pairing", "createBond: ${e.message}")
-                    }
+                    // Deliberately NO createBond() here: the laptop skips
+                    // `Device::pair()` on purpose, so bonding would leave us
+                    // holding an LTK it has never had — which kills every later
+                    // BLE connect. VortexStack.clearStaleLaptopBonds() has the
+                    // mechanism and the measurements, and clears bonds that
+                    // arrive from elsewhere.
+
                     // Remember the laptop's BD_ADDR so Forget can clear any BT
                     // bond for it later (see PeerStore.loadPeerBtAddr). The
                     // central's address here is the laptop's public static

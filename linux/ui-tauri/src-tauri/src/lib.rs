@@ -97,6 +97,22 @@ mod fs_pull;
 mod contacts;
 mod desktop_apps;
 mod diagnostics;
+
+/// Whether a BLE session to a phone is live, on whichever loop this build runs.
+///
+/// Linux drives BLE through the BlueZ loop in `ble`; every other platform uses
+/// the portable one. Both keep the same flag, so callers that just want the
+/// answer — the peer-state DTO, the heartbeat cadence — need not know which.
+pub(crate) fn ble_link_up() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::ble::link_is_up()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::ble_portable::link_is_up()
+    }
+}
 mod dnd;
 mod first_run;
 #[cfg(target_os = "linux")]
@@ -550,6 +566,20 @@ pub fn run() {
                 let special = std::env::args()
                     .any(|a| a == "--hidden" || a == "--clipboard" || a == "--share");
                 if !special {
+                    // Shown here, at the configured size, rather than after the
+                    // webview reports its layout.
+                    //
+                    // Measuring first would be better — open once, already the
+                    // right size — but it cannot work on this stack: WebKitGTK
+                    // does not lay out an unmapped window, so everything the
+                    // page measures while hidden comes back at or near zero.
+                    // Tried it; the window opened at the 560x600 minimum.
+                    //
+                    // So the window appears at its configured size and
+                    // `fit_main_window` GROWS it afterwards if the content
+                    // turns out not to fit. That costs a visible resize on
+                    // exactly the displays that need one, and nothing at all
+                    // on the displays that do not.
                     window::present_main(app.handle());
                 }
             }
@@ -617,6 +647,11 @@ pub fn run() {
             phone_files::fetch_phone_file,
             send_to_phone::send_to_phone,
             diagnostics::diagnostics_report,
+            // Linux-only: the wedged-discovery escape hatch. Elsewhere BlueZ
+            // is not the stack, so there is nothing to reset.
+            #[cfg(target_os = "linux")]
+            ble::reset_bluetooth_adapter,
+            window::fit_main_window,
             worker::start_scan,
             worker::refresh_state,
             ipc::get_peer_states,

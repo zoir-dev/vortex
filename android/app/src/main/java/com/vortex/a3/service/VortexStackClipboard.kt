@@ -29,22 +29,49 @@ internal fun VortexStack.startClipboardOutbound() {
                 trimmed
             }
             val utf8Len = capped.toByteArray(Charsets.UTF_8).size
+            // Whether the text actually reached a peer. Every send below is a
+            // BLE notify that returns false on a down link, and the old code
+            // ignored that: it logged "sent chunked" and let the share sheet
+            // toast "Sending text to laptop…" while the bytes went nowhere.
+            var delivered = false
             if (utf8Len <= com.vortex.a3.core.clipboard.ClipboardText.MAX_SINGLE_FRAME_TEXT_BYTES) {
                 val json = clipboardJsonBytes(capped)
                 for (peer in peerStore.list()) {
-                    gattServer?.sendClipboardEncrypted(peer.peerStaticPub, json)
+                    if (gattServer?.sendClipboardEncrypted(peer.peerStaticPub, json) == true) {
+                        delivered = true
+                    }
                 }
             } else {
                 // Long text → chunk over CLIPBOARD_TEXT, paced so the BLE
                 // notify queue doesn't drop frames (same 12ms as images).
                 val chunks = com.vortex.a3.core.clipboard.ClipboardText.buildChunks(capped)
                 for (peer in peerStore.list()) {
+                    // A peer counts as delivered only if EVERY chunk got out:
+                    // a partial burst reassembles into nothing on the far side,
+                    // so it must not suppress the LAN fallback.
+                    var whole = true
                     for (chunk in chunks) {
-                        gattServer?.sendClipboardTextChunkEncrypted(peer.peerStaticPub, chunk)
+                        if (gattServer?.sendClipboardTextChunkEncrypted(peer.peerStaticPub, chunk) != true) {
+                            whole = false
+                        }
                         kotlinx.coroutines.delay(12)
                     }
+                    if (whole) delivered = true
                 }
-                Log.i(VortexStack.TAG, "clipboard: long text sent chunked ($utf8Len bytes, ${chunks.size} chunks)")
+                if (delivered) {
+                    Log.i(VortexStack.TAG, "clipboard: long text sent chunked ($utf8Len bytes, ${chunks.size} chunks)")
+                }
+            }
+            if (!delivered) {
+                // Hand it to the LAN sync rather than dropping it. The done
+                // frame goes out on every bulk-sync round, so with BLE down and
+                // the LAN session up this arrives within a heartbeat instead of
+                // never. Content is never logged — only its size.
+                com.vortex.a3.core.clipboard.ClipboardOutbox.stash(capped)
+                Log.w(
+                    VortexStack.TAG,
+                    "clipboard text couldn't go out over BLE (link down?); queued for the LAN sync ($utf8Len bytes)",
+                )
             }
         }
     }

@@ -396,7 +396,42 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
 
         feature("lanServer") { startLanServer(identity) }      // mDNS + TCP IK + AppState sync
         feature("outboxDrain") { startOutboxDrain() }
+        feature("bondHygiene") { clearStaleLaptopBonds() }      // one-sided LE bonds kill BLE
         return true
+    }
+
+    /**
+     * Drop any Bluetooth bond this phone still holds for a trusted laptop.
+     *
+     * Vortex is bondless on both sides. The laptop deliberately skips
+     * `Device::pair()` ("NOTE: no BT bond here" in `pairing.rs`), no
+     * characteristic in [com.vortex.a3.core.ble.GattServer] asks for an
+     * encrypted link, and the laptop advertises a public static address so
+     * there is no IRK worth having. A bond is therefore never an asset here.
+     *
+     * It is a liability, because it can only ever be one-sided. A stored LTK
+     * the laptop does not share can never be used: on each LE connect we try to
+     * encrypt, the central answers by pairing instead, we read that as bond loss
+     * and drop the ACL with HCI_ERR_AUTH_FAILURE about 200 ms in, before a
+     * single ATT exchange. The result is that BLE silently never works at all,
+     * while LAN carries on and hides it — the failure looks like "the laptop
+     * just never connects over Bluetooth", with nothing in our own log to say
+     * why. Live-measured 2026-09-17: every connect died that way for hours, the
+     * phone's counter reading "Bond loss detected, count: 1031".
+     *
+     * Android hides profile-less LE bonds from the Settings UI, so the user
+     * cannot clear this by hand; it has to happen here. Running it on every
+     * start (rather than only at pairing) is what heals a phone bonded by an
+     * older build, or by someone connecting from the desktop's Bluetooth panel.
+     * Cheap either way: [com.vortex.a3.core.ble.BondCleaner.removeBond] no-ops
+     * on BOND_NONE, and the address list is the trusted peers we already read.
+     */
+    private fun clearStaleLaptopBonds() {
+        val adapter = service.getSystemService(BluetoothManager::class.java)?.adapter ?: return
+        for (peer in peerStore.list()) {
+            val addr = peerStore.loadPeerBtAddr(peer.peerStaticPub) ?: continue
+            com.vortex.a3.core.ble.BondCleaner.removeBond(adapter, addr)
+        }
     }
 
     /** Send anything buffered for each trusted peer. Returns immediately when
@@ -1265,6 +1300,15 @@ class VortexStack(internal val service: Service) : VortexNotification.Host {
         lan.pendingOffersProvider = { pendingOffersForLan() }
         lan.deletedCapturesProvider = {
             com.vortex.a3.core.media.CaptureLedger.deletedTokens(ctx)
+        }
+        // Clipboard text the BLE notify could not deliver, so a laptop with a
+        // dead GATT link but a live LAN session still gets what was copied.
+        lan.pendingClipboardProvider = {
+            if (com.vortex.a3.core.clipboard.ClipboardSyncSetting.isEnabled()) {
+                com.vortex.a3.core.clipboard.ClipboardOutbox.take()
+            } else {
+                null
+            }
         }
         lanServer = lan
         // Let code with no handle on the stack ship a snapshot immediately —

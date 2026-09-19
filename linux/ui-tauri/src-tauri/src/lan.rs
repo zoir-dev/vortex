@@ -723,6 +723,38 @@ pub(crate) async fn try_lan_reconnect(
         .await
         {
             Ok(outcome) => {
+                // A completed IK proves who this is, so LAN may take ownership
+                // exactly as the BLE loop does on its own handshake.
+                //
+                // Without this, ownership had only two sources: worker startup
+                // (and only when exactly ONE peer is stored) and an explicit
+                // pair/switch. A peer paired AFTER startup therefore never
+                // became active, and on a laptop whose BLE never connects
+                // nothing else ever claimed it — leaving `arbiter::active()`
+                // None for the rest of the process.
+                //
+                // That is not cosmetic: the per-peer cache directory is keyed
+                // on the active peer, so with none, `peer_file()` returns None
+                // and every mirror cache silently fails to persist. The visible
+                // cost is the SMS history watermark, which is read back as 0
+                // forever — measured here re-pulling the same 945 KB of history
+                // on 26 of 27 consecutive rounds, and making the phone re-read
+                // 5000 messages from its provider each time.
+                //
+                // `claim` is idempotent for the current owner and refuses when
+                // another peer owns the session, so this can never steal an
+                // active BLE session; a refusal just means the cache stays
+                // pointed at the phone the user is actually looking at.
+                crate::arbiter::note_connected(&peer.peer_static_pub);
+                if let crate::arbiter::Claim::Busy { current } =
+                    crate::arbiter::claim(&peer.peer_static_pub)
+                {
+                    tracing::debug!(
+                        peer = %hex::encode(&peer.peer_static_pub[..4]),
+                        active = %hex::encode(&current[..4]),
+                        "LAN session up for a peer that does not own the session"
+                    );
+                }
                 // The handshake at this address just SUCCEEDED — that's the
                 // strongest possible "this is our phone's IP" signal, stronger
                 // than any discovery guess. Cache it whichever path picked it
@@ -754,6 +786,18 @@ pub(crate) async fn try_lan_reconnect(
                     );
                     if !crate::clipboard_sync::submit_offer(offer.clone()) {
                         tracing::warn!("offer sink is not up; LAN-announced offer dropped");
+                    }
+                }
+                // Clipboard text the phone could not push over BLE. Same sink
+                // the BLE path uses, so the loop guard and history behave the
+                // same whichever link delivered it. Length only in the log.
+                if let Some(clip) = outcome.clipboard.clone() {
+                    tracing::info!(
+                        chars = clip.text.chars().count(),
+                        "clipboard text carried over LAN"
+                    );
+                    if !crate::clipboard_sync::submit_clipboard(clip) {
+                        tracing::warn!("clipboard sink is not up; LAN-carried text dropped");
                     }
                 }
                 if outcome.peer_counter < local_counter {

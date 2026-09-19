@@ -32,6 +32,7 @@ import {
   openPairPhoneModal,
   phoneOnline,
   phoneConnecting,
+  phoneBleDown,
   primaryPeer,
   primaryPeerState,
   startMirror,
@@ -243,11 +244,18 @@ const earbudsStatus = computed(() => {
           </button>
         </div>
         <div class="flex items-center gap-2">
+          <!-- Yellow = reachable, but over Wi-Fi only. Deliberately NOT amber,
+               which already means "connecting"; this is a healthy link missing
+               one transport, not a link still being made. -->
           <span
             class="vx-dot"
-            :class="phoneOnline ? 'text-primary vx-glow vx-pulse' : phoneConnecting ? 'text-amber-400 vx-pulse' : 'text-muted-foreground'"
+            :class="phoneBleDown ? 'text-yellow-300 vx-glow vx-pulse' : phoneOnline ? 'text-primary vx-glow vx-pulse' : phoneConnecting ? 'text-amber-400 vx-pulse' : 'text-muted-foreground'"
+            :title="phoneBleDown ? t('peers.ble_down_hint') : ''"
           />
-          <span class="text-[13px] text-[hsl(var(--card-foreground)/0.82)]">
+          <span
+            class="text-[13px] text-[hsl(var(--card-foreground)/0.82)]"
+            :title="phoneBleDown ? t('peers.ble_down_hint') : ''"
+          >
             {{ phoneOnline ? t("peers.connected") : phoneConnecting ? t("peers.connecting") : t("peers.offline") }}
           </span>
           <!-- Browse the phone's files. Only while it is reachable: the mount

@@ -65,6 +65,7 @@
     "forget_all": "Hammasini unutish",
     "trusted": "ishonchli ✓",
     "connected": "Ulangan",
+    "ble_down_hint": "BLE aloqasi yo‘q — sozlamalarda adapterni qayta ishga tushiring",
     "connecting": "Ulanmoqda…",
     "offline": "Oflayn",
     "forget_title": "Qurilmani unutish",
@@ -182,7 +183,12 @@
     "sec_appearance": "Ko'rinish",
     "sec_continuity": "Uzluksizlik",
     "sec_privacy": "Maxfiylik va yaqinlik",
-    "footer": "O'z ulanishingiz orqali uchidan-uchigacha shifrlangan"
+    "footer": "O'z ulanishingiz orqali uchidan-uchigacha shifrlangan",
+    "ble_reset": "Bluetooth adapterini qayta ishga tushirish",
+    "ble_reset_hint": "Qotib qolgan Bluetooth aloqasini tuzatadi. Quloqchin va boshqa qurilmalar qisqa muddatga uziladi.",
+    "ble_reset_busy": "Qayta ishga tushirilmoqda…",
+    "ble_reset_done": "Adapter qayta ishga tushdi — ulanmoqda",
+    "ble_reset_failed": "Adapterni qayta ishga tushirib bo‘lmadi"
   },
   "nav": {
     "home": "Mening qurilmalarim",

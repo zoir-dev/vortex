@@ -350,6 +350,17 @@ export const phoneOnline = computed(() => {
 // the pair, then fall back to the honest "Offline" if the phone never checks in.
 export const justPairedAt = ref<number | null>(null);
 
+/** Online, but with no BLE session behind it.
+ *
+ * LAN alone keeps the heartbeat fresh, so [phoneOnline] stays true while the
+ * BLE-only features — the notification mirror, conversation pages — are all
+ * silently dead. Worth its own colour: without it the only way to tell is
+ * reading the log.
+ */
+export const phoneBleDown = computed(
+  () => phoneOnline.value && primaryPeerState.value?.ble_linked === false,
+);
+
 /** Bridge state right after pairing: paired, not yet seen a heartbeat, but
  *  within ~30 s of a successful pair. Flips to phoneOnline the instant the
  *  first heartbeat arrives (primaryPeerState is reactive), or to phoneOffline

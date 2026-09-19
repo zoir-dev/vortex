@@ -45,6 +45,10 @@ export interface PeerState {
   earbuds: { name: string; battery: number | null; connected: boolean } | null;
   charging: boolean;
   ts: number;
+  /** Whether a BLE session is live. `ts` freshness only proves SOME transport
+   *  works, and LAN alone keeps it fresh — so this is what separates "fully
+   *  connected" from "connected, but every BLE-only feature is dead". */
+  ble_linked: boolean;
 }
 
 export interface PairingStartedEvent {
